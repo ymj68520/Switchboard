@@ -254,6 +254,15 @@ export interface OpenQuestion {
   status: "open" | "resolved";
   resolution?: string;
   resolvedBy?: DecisionID;
+
+  /**
+   * Phase 2A.1 (Correction A): CANDIDATE resolution recorded by the planning
+   * model. Never authorizes the open → resolved transition — the question
+   * remains blocking until a Proposal containing `resolve_question` is
+   * approved and applied by a PlanCommit, which moves this value into
+   * `resolution`/`resolvedBy`.
+   */
+  proposedResolution?: { text: string; proposedAt: Timestamp };
 }
 
 /** Spec §7 — first-class conflict; blocking conflicts prevent finalization. */

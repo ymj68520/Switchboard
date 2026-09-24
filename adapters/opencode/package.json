@@ -11,6 +11,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "vitest run",
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json"

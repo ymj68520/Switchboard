@@ -16,7 +16,7 @@ import {
   ULTRA_PLAN_COMMAND_TEMPLATE,
 } from "../src/runtime/opencode-plugin.js";
 import { getUltraPlanInstance, resetUltraPlanInstance } from "../src/runtime/instance.js";
-import { evidence, fakeToolContext } from "./helpers.js";
+import { admittedStart, evidence, fakeToolContext } from "./helpers.js";
 import { EvidenceIDs } from "../src/core/ids.js";
 
 // Each test gets a fresh in-memory instance (fresh PLAN-001).
@@ -29,6 +29,7 @@ describe("/ultra-plan vertical slice", () => {
     const hooks = createUltraPlanHooks();
     const startTool = hooks.tool?.[ULTRA_PLAN_START_TOOL];
     if (!startTool) throw new Error("ultraplan_start tool not registered");
+    getUltraPlanInstance().controller.issueStartAdmission("ses_tool");
 
     const result = await startTool.execute({ goal: "Build the Switchboard router" }, fakeToolContext("ses_tool"));
     if (typeof result === "string") throw new Error("expected structured tool result");
@@ -57,9 +58,12 @@ describe("/ultra-plan vertical slice", () => {
     const hooks = createUltraPlanHooks();
     const startTool = hooks.tool?.[ULTRA_PLAN_START_TOOL];
     if (!startTool) throw new Error("ultraplan_start tool not registered");
+    const instance = getUltraPlanInstance();
     const context = fakeToolContext("ses_repeat");
 
+    instance.controller.issueStartAdmission("ses_repeat"); // first /ultra-plan
     const first = await startTool.execute({}, context);
+    instance.controller.issueStartAdmission("ses_repeat"); // second /ultra-plan
     const second = await startTool.execute({}, context);
     if (typeof first === "string" || typeof second === "string") {
       throw new Error("expected structured tool results");
@@ -120,16 +124,15 @@ describe("/ultra-plan vertical slice", () => {
 });
 
 describe("storage boundary hard edges", () => {
-  it("refuses commitTransaction in Phase 1 (committed memory stays immutable)", async () => {
+  it("refuses commitTransaction for unknown proposals (engine is real now)", async () => {
     const { store } = getUltraPlanInstance();
     await expect(
       store.commitTransaction({
         planID: PlanIDs.from(1),
         proposalID: ProposalIDs.cast("PROP-001"),
         approvalID: ApprovalIDs.cast("APPR-001"),
-        parentCommit: null,
       }),
-    ).rejects.toSatisfy((error: unknown) => isUltraPlanError(error) && error.code === "phase_boundary");
+    ).rejects.toSatisfy((error: unknown) => isUltraPlanError(error) && error.code === "run_not_found");
   });
 
   it("rejects overwriting an existing evidence revision", async () => {
@@ -150,7 +153,7 @@ describe("storage boundary hard edges", () => {
 
   it("renders deterministic status from structured state", async () => {
     const { store, controller } = getUltraPlanInstance();
-    await controller.startOrResume("ses_render");
+    await admittedStart(controller, "ses_render");
     const status = await controller.statusOf("ses_render");
     const run = await store.getRun(PlanIDs.from(1));
     expect(run).toBeDefined();
@@ -177,7 +180,8 @@ describe("tool factory wiring", () => {
   it("binds the controller into the tool", async () => {
     const { controller } = getUltraPlanInstance();
     const tool = createUltraPlanStartTool(controller);
-    expect(tool.description).toContain("one active PlanningRun");
+    expect(tool.description).toContain("Only valid when the user explicitly invoked the /ultra-plan command");
+    controller.issueStartAdmission("ses_factory");
     const result = await tool.execute({ goal: "Goal via factory" }, fakeToolContext("ses_factory"));
     if (typeof result === "string") throw new Error("expected structured tool result");
     expect(result.metadata).toMatchObject({ planID: "PLAN-001", created: true });

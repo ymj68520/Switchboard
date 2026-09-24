@@ -67,8 +67,14 @@ export function finalizationInput(
   };
 }
 
+/** Captured ToolContext.ask input (for approval-gateway assertions). */
+export type CapturedAsk = { permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown> };
+
 /** Minimal ToolContext stub standing in for the OpenCode tool host. */
-export function fakeToolContext(sessionID: string): ToolContext {
+export function fakeToolContext(
+  sessionID: string,
+  options: { ask?: (input: CapturedAsk) => Promise<void> } = {},
+): ToolContext {
   const abortController = new AbortController();
   return {
     sessionID,
@@ -78,6 +84,23 @@ export function fakeToolContext(sessionID: string): ToolContext {
     worktree: ".",
     abort: abortController.signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: async (input) => {
+      if (options.ask) await options.ask(input);
+    },
   };
+}
+
+import type { UltraPlanController } from "../src/core/controller.js";
+
+/**
+ * Simulate the user invoking /ultra-plan: issue the one-shot start admission
+ * (what the command.execute.before hook does) and then start/resume.
+ */
+export async function admittedStart(
+  controller: UltraPlanController,
+  sessionID: string,
+  goal?: string,
+) {
+  controller.issueStartAdmission(sessionID);
+  return controller.startOrResume(sessionID, goal);
 }

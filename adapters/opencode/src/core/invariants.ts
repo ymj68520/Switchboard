@@ -255,7 +255,11 @@ const COMMIT_GATED_RUN_FIELDS = [
   "headSnapshot",
 ] as const satisfies readonly (keyof PlanningRun)[];
 
-function stableStringify(value: unknown): string {
+/**
+ * Canonical serialization (sorted keys, no undefined fields). Shared with the
+ * proposal hash so approvals bind to content, not key order.
+ */
+export function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
   const entries = Object.entries(value as Record<string, unknown>)

@@ -91,3 +91,18 @@ export const FinalPlanIDs: IDFactory<"FinalPlanID"> = idFactory("FINAL");
 export const EvidenceIDs: IDFactory<"EvidenceID"> = idFactory("EVD");
 export const ObservationIDs: IDFactory<"ObservationID"> = idFactory("OBS");
 export const ContextTraceIDs: IDFactory<"ContextTraceID"> = idFactory("TRACE");
+
+/**
+ * Next free sequence number for a `PREFIX-###` id family, given the ids
+ * already in use. Deterministic (max + 1); used by the Harness when assigning
+ * artifact ids so the model never names authoritative objects.
+ */
+export function nextSequence(existing: readonly string[], prefix: string): number {
+  let max = 0;
+  for (const raw of existing) {
+    if (!raw.startsWith(`${prefix}-`)) continue;
+    const seq = Number.parseInt(raw.slice(prefix.length + 1), 10);
+    if (Number.isInteger(seq) && seq > max) max = seq;
+  }
+  return max + 1;
+}

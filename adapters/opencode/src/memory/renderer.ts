@@ -59,3 +59,13 @@ export function renderStatus(run: PlanningRun, details?: StatusDetails): string 
     `Blocking conflicts: ${blockingConflicts}`,
   ].join("\n");
 }
+
+/** Deterministic status for a session without any run. */
+export function renderNoRunStatus(sessionID: string): string {
+  return [
+    "Ultra Plan",
+    "",
+    `No PlanningRun for session ${sessionID}.`,
+    "Invoke /ultra-plan to start one.",
+  ].join("\n");
+}

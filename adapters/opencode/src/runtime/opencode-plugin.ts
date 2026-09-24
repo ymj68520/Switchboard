@@ -31,6 +31,22 @@ export const ULTRA_PLAN_COMMAND_TEMPLATE = [
   "Then output the Ultra Plan status block returned by the tool verbatim, without paraphrasing it.",
 ].join("\n");
 
+/** Tool names Ultra Plan registers (used for narrow agent-side exposure). */
+export const ULTRA_PLAN_TOOL_NAMES = [
+  "ultraplan_start",
+  "ultraplan_status",
+  "plan_memory",
+  "ultraplan_record_question",
+  "ultraplan_propose_question_resolution",
+  "ultraplan_raise_conflict",
+  "ultraplan_promote_evidence",
+  "ultraplan_prepare_proposal",
+  "ultraplan_request_user_approval",
+  "ultraplan_request_completion",
+  "ultraplan_request_reopen",
+  "ultraplan_request_synthesis",
+] as const;
+
 export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
   readonly capabilities: RuntimeCapabilities = {
     registerCommand: true,
@@ -66,6 +82,13 @@ export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
       [this.spec.agentName]: {
         mode: "primary",
         description: "Ultra Plan planning agent (frontier reasoning tier)",
+        // Defense-in-depth exposure (Phase 2A.1 §5): explicitly enable the
+        // Ultra Plan tool surface on the planning agent. OpenCode's per-agent
+        // tool maps are overrides, not allowlists, so this narrows but cannot
+        // fully hide the tools from other agents — which is exactly why the
+        // controller still requires explicit command admission for planning
+        // entry. Exposure is never the authorization mechanism.
+        tools: Object.fromEntries(ULTRA_PLAN_TOOL_NAMES.map((name) => [name, true])),
         ...(this.spec.planningModel ? { model: this.spec.planningModel } : {}),
       },
     };

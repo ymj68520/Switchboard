@@ -12,6 +12,7 @@ import {
 import { SectionIDs } from "../src/core/ids.js";
 import type { PlanningRun } from "../src/core/types.js";
 import { renderStatus } from "../src/memory/renderer.js";
+import { admittedStart } from "./helpers.js";
 import { InMemoryPlanStore } from "../src/memory/store.js";
 
 function setup(): { store: InMemoryPlanStore; controller: UltraPlanController } {
@@ -34,7 +35,7 @@ describe("PlanningRun creation", () => {
   it("creates a PlanningRun bound to the session, active and in discovery", async () => {
     const { store, controller } = setup();
 
-    const result = await controller.startOrResume("ses_a", "Build a model router");
+    const result = await admittedStart(controller, "ses_a", "Build a model router");
 
     expect(result.created).toBe(true);
     expect(result.run.id).toBe("PLAN-001");
@@ -55,8 +56,8 @@ describe("PlanningRun creation", () => {
 
   it("assigns monotonically increasing plan ids across sessions", async () => {
     const { controller } = setup();
-    const first = await controller.startOrResume("ses_a");
-    const second = await controller.startOrResume("ses_b");
+    const first = await admittedStart(controller, "ses_a");
+    const second = await admittedStart(controller, "ses_b");
     expect(first.run.id).toBe("PLAN-001");
     expect(second.run.id).toBe("PLAN-002");
   });
@@ -65,7 +66,7 @@ describe("PlanningRun creation", () => {
 describe("one active run per session", () => {
   it("prevents a second active PlanningRun for the same session (store-level)", async () => {
     const { store, controller } = setup();
-    await controller.startOrResume("ses_a");
+    await admittedStart(controller, "ses_a");
 
     const duplicate: PlanningRun = {
       id: "PLAN-002" as PlanningRun["id"],
@@ -90,8 +91,8 @@ describe("one active run per session", () => {
 
   it("resumes the existing active run instead of creating another (controller-level)", async () => {
     const { controller } = setup();
-    const first = await controller.startOrResume("ses_a");
-    const second = await controller.startOrResume("ses_a", "a changed goal must not apply");
+    const first = await admittedStart(controller, "ses_a");
+    const second = await admittedStart(controller, "ses_a", "a changed goal must not apply");
 
     expect(second.created).toBe(false);
     expect(second.run.id).toBe(first.run.id);
@@ -101,7 +102,7 @@ describe("one active run per session", () => {
 
   it("allows a new run only after the previous run completed", async () => {
     const { store, controller } = setup();
-    const started = await controller.startOrResume("ses_a");
+    const started = await admittedStart(controller, "ses_a");
 
     // Completed (and aborted) runs are terminal; the session is free again.
     let run = await runToFinal(store, started.run);
@@ -113,7 +114,7 @@ describe("one active run per session", () => {
 
     expect(await store.findActiveRunBySession("ses_a")).toBeUndefined();
 
-    const again = await controller.startOrResume("ses_a");
+    const again = await admittedStart(controller, "ses_a");
     expect(again.created).toBe(true);
     expect(again.run.id).toBe("PLAN-002");
   });
@@ -122,7 +123,7 @@ describe("one active run per session", () => {
 describe("stage transitions", () => {
   it("walks the frozen stage graph and persists revision bumps", async () => {
     const { store, controller } = setup();
-    const started = await controller.startOrResume("ses_a");
+    const started = await admittedStart(controller, "ses_a");
 
     let run = started.run;
     for (const stage of ["architecture", "detail", "synthesis", "final"] as const) {
@@ -181,7 +182,7 @@ describe("stage transitions", () => {
 describe("lifecycle transitions", () => {
   it("enters handoff_pending only from the final stage and then completes", async () => {
     const { store, controller } = setup();
-    const started = await controller.startOrResume("ses_a");
+    const started = await admittedStart(controller, "ses_a");
     const final = await runToFinal(store, started.run);
 
     // Not allowed before final:
@@ -207,7 +208,7 @@ describe("lifecycle transitions", () => {
 
   it("renders lifecycle and stage from structured state", async () => {
     const { controller } = setup();
-    const started = await controller.startOrResume("ses_golden");
+    const started = await admittedStart(controller, "ses_golden");
 
     const expected = [
       "Ultra Plan",

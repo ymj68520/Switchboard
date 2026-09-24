@@ -25,10 +25,29 @@ export interface Observation {
 }
 
 /**
- * Append-only observation ledger. Deliberately tiny: observations are
- * ephemeral working data, not committed state.
+ * Append-only observation ledger, scoped per OpenCode session. Deliberately
+ * tiny: observations are ephemeral working data, not committed state.
+ * (Phase 2A refinement: the ledger is session-keyed because evidence
+ * provenance must tie observations to the planning session that produced
+ * them. The Phase 1 shape was an unwired type shell.)
  */
 export interface ObservationLedger {
-  append(observation: Observation): Promise<void>;
-  list(): Promise<Observation[]>;
+  append(sessionID: string, observation: Observation): Promise<void>;
+  /** Observations made in the given session, in append order. */
+  list(sessionID: string): Promise<Observation[]>;
+}
+
+/** In-memory ledger; durable persistence is a later-phase concern. */
+export class InMemoryObservationLedger implements ObservationLedger {
+  private readonly bySession = new Map<string, Observation[]>();
+
+  async append(sessionID: string, observation: Observation): Promise<void> {
+    const list = this.bySession.get(sessionID) ?? [];
+    list.push(observation);
+    this.bySession.set(sessionID, list);
+  }
+
+  async list(sessionID: string): Promise<Observation[]> {
+    return [...(this.bySession.get(sessionID) ?? [])];
+  }
 }
