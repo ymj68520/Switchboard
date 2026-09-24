@@ -16,7 +16,16 @@ export type RuntimeErrorCode =
   | "INVALID_RUNTIME_COMMAND"
   | "HOOK_NOT_IMPLEMENTED"
   | "MCP_BOOTSTRAP_FAILED"
-  | "INTERNAL_ERROR";
+  | "INTERNAL_ERROR"
+  // Phase 2 — Plan Store foundation (storage/environment family, exit 5)
+  | "STORE_SCHEMA_TOO_NEW"
+  | "STORE_SCHEMA_TOO_OLD"
+  | "STORE_SCHEMA_INVALID"
+  | "STORE_CORRUPT"
+  | "STORE_OPEN_FAILED"
+  | "STORE_BUSY"
+  | "STORE_BACKUP_FAILED"
+  | "STORE_MIGRATION_FAILED";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {
@@ -31,17 +40,20 @@ export class RuntimeError extends Error {
   readonly causeText?: string;
   /** Whether the caller can realistically retry or work around the failure. */
   readonly recoverable: boolean;
+  /** Optional structured facts (e.g. supported/detected schema versions). */
+  readonly detail?: Record<string, unknown>;
 
   constructor(
     code: RuntimeErrorCode,
     message: string,
-    options?: { cause?: string; recoverable?: boolean },
+    options?: { cause?: string; recoverable?: boolean; detail?: Record<string, unknown> },
   ) {
     super(message);
     this.name = "RuntimeError";
     this.code = code;
     this.causeText = options?.cause;
     this.recoverable = options?.recoverable ?? false;
+    this.detail = options?.detail;
   }
 
   toEnvelope(): RuntimeErrorEnvelope {
@@ -49,6 +61,7 @@ export class RuntimeError extends Error {
       code: this.code,
       message: this.message,
       ...(this.causeText === undefined ? {} : { cause: this.causeText }),
+      ...(this.detail === undefined ? {} : { detail: this.detail }),
       recoverable: this.recoverable,
     };
   }

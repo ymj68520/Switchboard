@@ -125,13 +125,19 @@ export interface McpSmokeResult {
 export function runMcpSmoke(
   nodePath: string,
   bundlePath: string,
-  options: { initialize?: boolean; toolsList?: boolean; timeoutMs?: number } = {},
+  options: {
+    initialize?: boolean;
+    toolsList?: boolean;
+    timeoutMs?: number;
+    env?: NodeJS.ProcessEnv;
+  } = {},
 ): Promise<McpSmokeResult> {
-  const { initialize = true, toolsList = true, timeoutMs = 15000 } = options;
+  const { initialize = true, toolsList = true, timeoutMs = 15000, env = process.env } = options;
   return new Promise((resolve) => {
     const child = spawn(nodePath, [bundlePath, "mcp"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env,
     });
     let stdout = "";
     let stderr = "";

@@ -15,7 +15,13 @@ import {
 import { probeClaudeVersion, type ClaudeVersionResult, nodeSpawnRunner, type SpawnRunner } from "../claude/version.js";
 import { probeSqliteCapability, type SqliteCapabilityResult } from "../store/sqlite-capability.js";
 import { RUNTIME_NAME, RUNTIME_VERSION } from "../runtime/version.js";
-import { checkClaudeCapabilities, checkClaudeCli, checkNodeVersion, checkPluginData, checkPluginEnvironment, checkSqliteCapability } from "./checks.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../store/constants.js";
+import { RuntimeError, isRuntimeError } from "../runtime/errors.js";
+import {
+  inspectPlanStore,
+  type PlanStoreInspection,
+} from "../store/sqlite-store.js";
+import { checkClaudeCapabilities, checkClaudeCli, checkNodeVersion, checkPlanStore, checkPluginData, checkPluginEnvironment, checkSqliteCapability } from "./checks.js";
 import { evaluateClaudeCapabilities } from "./capabilities.js";
 import {
   deriveHostIntegration,
@@ -35,6 +41,8 @@ export interface DoctorDeps {
   /** Filesystem layer for the plugin data preflight. */
   pluginDataIo?: PluginDataIo;
   claudeSpawnRunner?: SpawnRunner;
+  /** Read-only store inspection seam (tests); errors become failed checks. */
+  inspectStore?(pluginDataRoot: string): PlanStoreInspection;
 }
 
 export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
@@ -65,6 +73,30 @@ export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
   }
   const dataCheck = checkPluginData(dataPreflight !== null, dataPreflight);
 
+  // Read-only store inspection (never creates/migrates). Inspection errors
+  // (corrupt file, unreadable header) surface as a failed check, not a crash.
+  let storeInspection: PlanStoreInspection | null = null;
+  if (dataPreflight?.status === "ok") {
+    try {
+      storeInspection = deps.inspectStore
+        ? deps.inspectStore(dataPreflight.resolvedRoot)
+        : inspectPlanStore(dataPreflight.resolvedRoot);
+    } catch (err) {
+      const error = isRuntimeError(err)
+        ? err
+        : new RuntimeError("STORE_CORRUPT", "Plan Store inspection failed", {
+            cause: err instanceof Error ? err.message : String(err),
+          });
+      storeInspection = {
+        status: error.code === "STORE_SCHEMA_TOO_NEW" ? "too_new" : "invalid",
+        supported: SUPPORTED_SCHEMA_VERSION,
+        databasePath: "",
+        problems: [error.message],
+      };
+    }
+  }
+  const planStoreCheck = checkPlanStore(storeInspection);
+
   const report: DoctorReport = {
     schema: "phase-plan.doctor-report/1",
     runtime: { name: RUNTIME_NAME, version: RUNTIME_VERSION },
@@ -77,6 +109,7 @@ export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
       claudeCapabilities: capabilitiesCheck,
       pluginEnvironment: envCheck,
       pluginData: dataCheck,
+      planStore: planStoreCheck,
     },
   };
   report.overall = deriveOverallReadiness(report);

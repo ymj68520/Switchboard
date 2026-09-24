@@ -41,6 +41,14 @@ const EXIT_CODE_BY_ERROR: Readonly<Record<RuntimeErrorCode, ExitCode>> = {
   HOOK_NOT_IMPLEMENTED: EXIT_CODES.invocation,
   MCP_BOOTSTRAP_FAILED: EXIT_CODES.internal,
   INTERNAL_ERROR: EXIT_CODES.internal,
+  STORE_SCHEMA_TOO_NEW: EXIT_CODES.storageEnvironment,
+  STORE_SCHEMA_TOO_OLD: EXIT_CODES.storageEnvironment,
+  STORE_SCHEMA_INVALID: EXIT_CODES.storageEnvironment,
+  STORE_CORRUPT: EXIT_CODES.storageEnvironment,
+  STORE_OPEN_FAILED: EXIT_CODES.storageEnvironment,
+  STORE_BUSY: EXIT_CODES.storageEnvironment,
+  STORE_BACKUP_FAILED: EXIT_CODES.storageEnvironment,
+  STORE_MIGRATION_FAILED: EXIT_CODES.storageEnvironment,
 };
 
 export function exitCodeForError(code: RuntimeErrorCode): ExitCode {

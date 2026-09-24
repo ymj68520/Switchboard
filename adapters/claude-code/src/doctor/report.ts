@@ -28,6 +28,7 @@ export interface DoctorReport {
     claudeCapabilities: CheckOutcome;
     pluginEnvironment: CheckOutcome;
     pluginData: CheckOutcome;
+    planStore: CheckOutcome;
   };
 }
 
@@ -42,6 +43,7 @@ export const CHECK_ORDER: readonly (keyof DoctorReport["checks"])[] = [
   "claudeCapabilities",
   "pluginEnvironment",
   "pluginData",
+  "planStore",
 ];
 
 export function deriveOverallReadiness(report: DoctorReport): OverallReadiness {
@@ -54,12 +56,16 @@ export function deriveOverallReadiness(report: DoctorReport): OverallReadiness {
 }
 
 export function deriveHostIntegration(report: DoctorReport): HostIntegrationStatus {
-  const { claudeCli, claudeCapabilities, pluginEnvironment, pluginData } = report.checks;
-  const blocking = [claudeCli, claudeCapabilities, pluginData].some(
+  const { claudeCli, claudeCapabilities, pluginData, planStore } = report.checks;
+  const blocking = [claudeCli, claudeCapabilities, pluginData, planStore].some(
     (check) => check.required && check.status !== "PASS",
   );
   if (blocking) return "NOT_READY";
-  return pluginEnvironment.status === "NOT_ACTIVE" ? "NOT_ACTIVE" : "ACTIVE";
+  return pluginEnvironmentStatus(report);
+}
+
+function pluginEnvironmentStatus(report: DoctorReport): HostIntegrationStatus {
+  return report.checks.pluginEnvironment.status === "NOT_ACTIVE" ? "NOT_ACTIVE" : "ACTIVE";
 }
 
 export function doctorExitCode(report: DoctorReport): ExitCode {
@@ -90,6 +96,7 @@ export function renderHumanReport(report: DoctorReport): string {
   lines.push(...renderCheck(checks.claudeCapabilities));
   lines.push(...renderCheck(checks.pluginEnvironment));
   lines.push(...renderCheck(checks.pluginData));
+  lines.push(...renderCheck(checks.planStore));
   lines.push("");
   lines.push(`Overall runtime: ${report.overall === "READY" ? "READY" : "NOT READY"}`);
   lines.push(

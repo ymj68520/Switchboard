@@ -17,6 +17,9 @@ import { createLogger, resolveLogLevel, type Logger } from "./logger.js";
 import { runDoctor } from "../doctor/doctor.js";
 import { doctorExitCode, renderHumanReport, renderJsonReport } from "../doctor/report.js";
 import { startMcpServer } from "../mcp/bootstrap.js";
+import { preflightPluginData } from "../claude/environment.js";
+import { initializePlanStore, type PlanStore, type PlanStoreOptions } from "../store/sqlite-store.js";
+import { resolveStorePaths } from "../store/paths.js";
 
 /** Hook events the frozen architecture relies on (dispatch reserved). */
 export const KNOWN_HOOK_EVENTS = [
@@ -170,7 +173,18 @@ export interface DispatchDeps {
   doctor?: typeof runDoctor;
   startMcp?: typeof startMcpServer;
   nodeVersion?(): string;
+  /** Test seam for the MCP bootstrap store initialization. */
+  initializeStore?(options: PlanStoreOptions): Promise<PlanStore>;
+  /** Test seam for the plugin-data filesystem preflight. */
+  preflightPluginData?: typeof preflightPluginData;
 }
+
+/** Default store bootstrap for the MCP runtime (initialize → ready). */
+async function defaultInitializeStore(options: PlanStoreOptions): Promise<PlanStore> {
+  return initializePlanStore(options);
+}
+
+const defaultPreflightPluginData = preflightPluginData;
 
 export interface CommandResult {
   exitCode: ExitCode;
@@ -216,9 +230,38 @@ export async function executeCommand(
           { cause: "mcp runtime refused to start (fail-closed)" },
         );
       }
+
+      // Fail-closed storage prerequisite: no canonical data location means
+      // no server (frozen plan §32 — never fall back to cwd/temp paths).
+      const pluginData = env.CLAUDE_PLUGIN_DATA?.trim();
+      if (pluginData === undefined || pluginData === "") {
+        throw new RuntimeError(
+          "PLUGIN_DATA_UNAVAILABLE",
+          "CLAUDE_PLUGIN_DATA is not set; the Phase Plan MCP server requires a canonical plugin data location",
+          { cause: "mcp runtime refused to start without plugin storage (fail-closed)" },
+        );
+      }
+      const preflight = await (deps.preflightPluginData ?? defaultPreflightPluginData)(pluginData);
+      if (preflight.status !== "ok") {
+        throw new RuntimeError(preflight.errorCode, preflight.message);
+      }
+
+      // Store before server: initialize/migrate to the current schema, and
+      // only then serve (frozen plan §31). Store errors (too new, corrupt,
+      // migration/backup failure) fail closed above and never yield a
+      // seemingly-healthy Phase Plan server.
+      const store = await (deps.initializeStore ?? defaultInitializeStore)({
+        pluginDataRoot: preflight.resolvedRoot,
+      });
       const logger = deps.logger ?? createLogger(resolveLogLevel(env.PHASE_PLAN_LOG_LEVEL));
-      const { waitStopped } = await (deps.startMcp ?? startMcpServer)({ logger });
-      await waitStopped;
+      logger.info(`plan store ready at ${resolveStorePaths(preflight.resolvedRoot).databasePath}`);
+      try {
+        const { waitStopped } = await (deps.startMcp ?? startMcpServer)({ logger });
+        await waitStopped;
+      } finally {
+        // Deterministic close of the store connection once serving stops.
+        store.close();
+      }
       return { exitCode: EXIT_CODES.success, longRunning: true };
     }
 

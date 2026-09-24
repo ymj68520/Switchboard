@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { RuntimeError, type RuntimeErrorCode } from "../src/runtime/errors.js";
 import { EXIT_CODES, exitCodeForError } from "../src/runtime/exit-codes.js";
+import { createLogger } from "../src/runtime/logger.js";
 import { executeCommand, parseRuntimeCommand, KNOWN_HOOK_EVENTS, usage } from "../src/runtime/dispatch.js";
 import type { DoctorReport } from "../src/doctor/report.js";
 
@@ -60,6 +61,14 @@ describe("error → exit code mapping", () => {
     "HOOK_NOT_IMPLEMENTED",
     "MCP_BOOTSTRAP_FAILED",
     "INTERNAL_ERROR",
+    "STORE_SCHEMA_TOO_NEW",
+    "STORE_SCHEMA_TOO_OLD",
+    "STORE_SCHEMA_INVALID",
+    "STORE_CORRUPT",
+    "STORE_OPEN_FAILED",
+    "STORE_BUSY",
+    "STORE_BACKUP_FAILED",
+    "STORE_MIGRATION_FAILED",
   ];
 
   it("maps every runtime error code to a defined exit code", () => {
@@ -80,6 +89,9 @@ describe("error → exit code mapping", () => {
     expect(exitCodeForError("PLUGIN_DATA_UNAVAILABLE")).toBe(EXIT_CODES.storageEnvironment);
     expect(exitCodeForError("PLUGIN_DATA_NOT_WRITABLE")).toBe(EXIT_CODES.storageEnvironment);
     expect(exitCodeForError("INTERNAL_ERROR")).toBe(EXIT_CODES.internal);
+    for (const code of ALL_CODES.filter((c) => c.startsWith("STORE_"))) {
+      expect(exitCodeForError(code), code).toBe(EXIT_CODES.storageEnvironment);
+    }
   });
 });
 
@@ -126,6 +138,73 @@ describe("executeCommand", () => {
       }),
     ).rejects.toMatchObject({ code: "UNSUPPORTED_NODE_VERSION" });
     expect(mcpStarted).toBe(false);
+  });
+
+  it("mcp fails closed without CLAUDE_PLUGIN_DATA and never initializes a store", async () => {
+    let storeInitialized = false;
+    let mcpStarted = false;
+    await expect(
+      executeCommand({ kind: "mcp" }, {
+        env: {},
+        nodeVersion: () => "24.21.0",
+        initializeStore: async () => {
+          storeInitialized = true;
+          throw new Error("must not initialize");
+        },
+        startMcp: async () => {
+          mcpStarted = true;
+          throw new Error("must not start");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PLUGIN_DATA_UNAVAILABLE" });
+    expect(storeInitialized).toBe(false);
+    expect(mcpStarted).toBe(false);
+  });
+
+  it("mcp initializes the store before serving and closes it deterministically after", async () => {
+    const events: string[] = [];
+    const pluginDataRoot = process.env.PHASE_PLAN_TEST_ROOT ?? "D:/temp/plugin-data";
+    let storeClosed = false;
+    const fakeStore = {
+      path: pluginDataRoot,
+      close: () => {
+        storeClosed = true;
+        events.push("store-closed");
+      },
+    } as unknown as import("../src/store/sqlite-store.js").PlanStore;
+    const result = await executeCommand({ kind: "mcp" }, {
+      env: { CLAUDE_PLUGIN_DATA: pluginDataRoot },
+      nodeVersion: () => "24.21.0",
+      initializeStore: async () => {
+        events.push("store-initialized");
+        return fakeStore;
+      },
+      startMcp: async () => {
+        events.push("mcp-started");
+        return {
+          handle: { close: async () => undefined },
+          waitStopped: Promise.resolve(),
+        };
+      },
+      logger: createLogger("silent"),
+    });
+    expect(result.exitCode).toBe(EXIT_CODES.success);
+    expect(events).toEqual(["store-initialized", "mcp-started", "store-closed"]);
+    expect(storeClosed).toBe(true);
+  });
+
+  it("mcp maps a failed storage preflight onto its stable code", async () => {
+    await expect(
+      executeCommand({ kind: "mcp" }, {
+        env: { CLAUDE_PLUGIN_DATA: "D:/occupied" },
+        nodeVersion: () => "24.21.0",
+        preflightPluginData: async () => ({
+          status: "unavailable",
+          errorCode: "PLUGIN_DATA_UNAVAILABLE",
+          message: "occupied",
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "PLUGIN_DATA_UNAVAILABLE" });
   });
 
   it("hook dispatch is reserved but recognized events stay distinct", async () => {
@@ -221,6 +300,14 @@ function makeReport(overrides: {
         status: pluginDataStatus,
         required: pluginDataStatus !== "NOT_ACTIVE",
         ...(pluginDataStatus === "FAIL" ? { errorCode: "PLUGIN_DATA_NOT_WRITABLE" as const } : {}),
+        message: "test",
+      },
+      planStore: {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "NOT_ACTIVE",
+        required: false,
         message: "test",
       },
     },

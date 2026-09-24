@@ -189,9 +189,109 @@ describe("doctor integration (injected probes)", () => {
     const report = await runDoctor(baseDeps());
     expect(report.checks.pluginEnvironment.status).toBe("NOT_ACTIVE");
     expect(report.checks.pluginEnvironment.required).toBe(false);
+    expect(report.checks.planStore.status).toBe("NOT_ACTIVE");
     expect(report.hostIntegration).toBe("NOT_ACTIVE");
     expect(report.overall).toBe("READY");
     expect(doctorExitCode(report)).toBe(0);
+  });
+
+  it("inspects the store read-only: READY passes, ABSENT is NOT_INITIALIZED (non-blocking)", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-");
+    try {
+      const report = await runDoctor(baseDeps({ env: { CLAUDE_PLUGIN_DATA: root } }));
+      expect(report.checks.pluginData.status).toBe("PASS");
+      expect(report.checks.planStore.status).toBe("NOT_INITIALIZED");
+      expect(report.checks.planStore.required).toBe(false);
+      expect(report.checks.planStore.message).toContain("STORE ABSENT");
+      expect(report.overall).toBe("READY");
+      expect(doctorExitCode(report)).toBe(0);
+      // The doctor must not have created the canonical database.
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(path.join(root, "store", "phase-plan.sqlite3"))).toBe(false);
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it("fails with exit 5 when the store is too new (STORE_SCHEMA_TOO_NEW)", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-");
+    try {
+      const report = await runDoctor(baseDeps({
+        env: { CLAUDE_PLUGIN_DATA: root },
+        inspectStore: () => ({
+          status: "too_new",
+          schemaVersion: 2,
+          supported: 1,
+          databasePath: path.join(root, "store", "phase-plan.sqlite3"),
+        }),
+      }));
+      expect(report.checks.planStore.status).toBe("FAIL");
+      expect(report.checks.planStore.errorCode).toBe("STORE_SCHEMA_TOO_NEW");
+      expect(report.hostIntegration).toBe("NOT_READY");
+      expect(doctorExitCode(report)).toBe(5);
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it("fails with exit 5 when the store inspection reports an invalid store", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-");
+    try {
+      const report = await runDoctor(baseDeps({
+        env: { CLAUDE_PLUGIN_DATA: root },
+        inspectStore: () => ({
+          status: "invalid",
+          schemaVersion: 1,
+          supported: 1,
+          databasePath: path.join(root, "store", "phase-plan.sqlite3"),
+          problems: ["migration history [2] does not match user_version 1"],
+        }),
+      }));
+      expect(report.checks.planStore.status).toBe("FAIL");
+      expect(report.checks.planStore.errorCode).toBe("STORE_SCHEMA_INVALID");
+      expect(doctorExitCode(report)).toBe(5);
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it("renders a thrown inspection failure as an invalid-store check instead of crashing", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-");
+    try {
+      const report = await runDoctor(baseDeps({
+        env: { CLAUDE_PLUGIN_DATA: root },
+        inspectStore: () => {
+          throw new Error("boom during inspection");
+        },
+      }));
+      expect(report.checks.planStore.status).toBe("FAIL");
+      expect(report.checks.planStore.errorCode).toBe("STORE_SCHEMA_INVALID");
+      expect(report.overall).toBe("NOT_READY");
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it("reports STORE READY when the inspection seam says so", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-");
+    try {
+      const report = await runDoctor(baseDeps({
+        env: { CLAUDE_PLUGIN_DATA: root },
+        inspectStore: () => ({
+          status: "ready",
+          schemaVersion: 1,
+          supported: 1,
+          databasePath: path.join(root, "store", "phase-plan.sqlite3"),
+          storeId: "store-1234",
+        }),
+      }));
+      expect(report.checks.planStore.status).toBe("PASS");
+      expect(report.checks.planStore.message).toContain("STORE READY schema=1");
+      expect(report.checks.planStore.detail).toMatchObject({ storeId: "store-1234" });
+      expect(doctorExitCode(report)).toBe(0);
+    } finally {
+      await removeTempDir(root);
+    }
   });
 
   it("produces byte-stable JSON across repeated runs with identical inputs", async () => {
@@ -209,6 +309,7 @@ describe("doctor integration (injected probes)", () => {
       "claudeCapabilities",
       "pluginEnvironment",
       "pluginData",
+      "planStore",
     ]);
   });
 

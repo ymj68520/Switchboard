@@ -19,6 +19,7 @@ import {
   REQUIRED_NODE_VERSION,
 } from "../runtime/node-version.js";
 import type { SqliteCapabilityResult } from "../store/sqlite-capability.js";
+import type { PlanStoreInspection } from "../store/sqlite-store.js";
 
 export type CheckId =
   | "node.version"
@@ -26,9 +27,10 @@ export type CheckId =
   | "claude.cli"
   | "claude.capabilities"
   | "claude.plugin_environment"
-  | "claude.plugin_data";
+  | "claude.plugin_data"
+  | "claude.plan_store";
 
-export type CheckStatus = "PASS" | "FAIL" | "UNKNOWN" | "NOT_ACTIVE";
+export type CheckStatus = "PASS" | "FAIL" | "UNKNOWN" | "NOT_ACTIVE" | "NOT_INITIALIZED";
 
 export type CheckTier = "runtime" | "host";
 
@@ -233,4 +235,81 @@ export function checkPluginData(
     errorCode: preflight.errorCode,
     message: preflight.message,
   };
+}
+
+/**
+ * Read-only Plan Store inspection (frozen plan §33): the doctor never
+ * creates or migrates the store. A store that has not been initialized yet
+ * is NOT_INITIALIZED — informational, never "runtime broken". A store that
+ * is too new, inconsistent, or corrupt IS a failure (the MCP runtime would
+ * fail closed on it).
+ */
+export function checkPlanStore(inspection: PlanStoreInspection | null): CheckOutcome {
+  if (inspection === null) {
+    return {
+      id: "claude.plan_store",
+      label: "Plan Store",
+      tier: "host",
+      status: "NOT_ACTIVE",
+      required: false,
+      message: "CLAUDE_PLUGIN_DATA not set — store inspection skipped (plugin session only)",
+    };
+  }
+  const versionSuffix =
+    inspection.schemaVersion === undefined ? "" : ` (schema ${inspection.schemaVersion})`;
+  switch (inspection.status) {
+    case "ready":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "PASS",
+        required: true,
+        message: `STORE READY schema=${inspection.schemaVersion} at ${inspection.databasePath}`,
+        detail: { ...inspection, ...(inspection.storeId === undefined ? {} : { storeId: inspection.storeId }) },
+      };
+    case "absent":
+    case "uninitialized":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "NOT_INITIALIZED",
+        required: false,
+        message: `STORE ABSENT — initialized on first MCP startup${versionSuffix}`,
+        detail: { ...inspection },
+      };
+    case "too_old":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "NOT_INITIALIZED",
+        required: false,
+        message: `STORE PENDING MIGRATION schema=${inspection.schemaVersion} → ${inspection.supported} (migrates on next initialize)`,
+        detail: { ...inspection },
+      };
+    case "too_new":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "FAIL",
+        required: true,
+        errorCode: "STORE_SCHEMA_TOO_NEW",
+        message: `STORE TOO_NEW schema=${inspection.schemaVersion} > supported ${inspection.supported} — upgrade the plugin; the store was left untouched`,
+        detail: { ...inspection },
+      };
+    case "invalid":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "FAIL",
+        required: true,
+        errorCode: "STORE_SCHEMA_INVALID",
+        message: `STORE INVALID${versionSuffix}: ${(inspection.problems ?? []).join("; ")}`,
+        detail: { ...inspection },
+      };
+  }
 }
