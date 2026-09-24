@@ -183,7 +183,9 @@ npm run typecheck
 npm run lint
 ```
 
-74 tests: semver/Claude-version parsing, capability registry, arg parsing,
+87 tests: semver/Claude-version parsing, the per-capability compatibility
+matrix (2.1.198 fails the approval gate, 2.1.199 passes it, 2.1.276 passes,
+unknown/malformed versions stay UNKNOWN and fail closed), arg parsing,
 error→exit mapping, env classification, plugin-data preflight (real fs
 including spaces/Unicode paths + injected failure paths), sqlite probe
 (injected module + real `node:sqlite`), doctor integration (all probes
@@ -191,9 +193,11 @@ injected — no dependence on a specific installed Claude version), and an MCP
 bundle smoke over real stdio (protocol purity on stdout, clean exit; on
 unsupported Node it asserts the fail-closed refusal).
 
-Verified on Node v24.21.0 (doctor READY exit 0, real Claude Code 2.1.276
-detected via the `.cmd` shim, MCP handshake round-trip) and Node v22.23.2
-(doctor NOT_READY exit 3, MCP refuses fail-closed).
+Verified on Node v24.21.0 (87/87 tests; doctor READY exit 0 — approval gate
+PASS at the 2.1.199 floor with real Claude Code 2.1.276 detected via the
+`.cmd` shim and `planModeIntegration`/`hookLifecycle` reported UNKNOWN
+non-blocking; MCP handshake round-trip) and Node v22.23.2 (87/87 tests;
+doctor NOT_READY exit 3 on the Node floor; MCP refuses fail-closed).
 
 ## Known limitations (intentional, Phase 2+ scope)
 
@@ -207,3 +211,18 @@ detected via the `.cmd` shim, MCP handshake round-trip) and Node v22.23.2
 - SKILL.md / validator.md / hooks.json are minimal placeholders.
 - `claude.cmd` shim detection on Windows goes through `cmd.exe` with a fixed
   argv (documented above); a native-installer `claude.exe` is found directly.
+
+## Freeze notes (Phase 1 closure)
+
+- Phase 1 Claude baseline: **FROZEN / PASS**, as of the per-capability
+  capability-policy correction. Code commits: `713d831` (runtime bootstrap)
+  and `5b8b755` (capability gates); the frozen architecture baseline is
+  committed separately as `docs(claude): freeze phase plan v0.1
+  architecture`, and this document closes the baseline in `docs(claude):
+  close phase 1 implementation baseline`.
+- OpenCode regression at closure time read 103/104, with the single failing
+  test in `adapters/opencode/test/protocol-boundary.test.ts` originating
+  from that line's uncommitted in-progress worktree. Recorded as
+  `EXTERNAL_CONCURRENT_WORKTREE_FAILURE`: it has zero overlap with the
+  Claude adapter (no shared modules; this baseline touches only
+  `adapters/claude-code` plus docs) and is NOT a Phase 1 failure.
