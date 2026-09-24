@@ -1,0 +1,28 @@
+{
+  "name": "@switchboard/opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Switchboard adapter for OpenCode, including the Ultra Plan planning harness (/ultra-plan).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.32"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vitest": "^3.2.4"
+  }
+}
