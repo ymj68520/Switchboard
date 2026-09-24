@@ -113,7 +113,8 @@ Checks:
   `cmd.exe /d /s /c` with a fixed argv (Node refuses `.cmd` without a shell;
   no `which`/`where`, no user input in the command). `PHASE_PLAN_CLAUDE_BIN`
   overrides. Structured outcomes: `not_found` / `unreadable` / `ok`.
-- **capabilities** — version-policy evaluation (below), UNKNOWN fail-closed.
+- **capabilities** — per-capability compatibility policy (below), UNKNOWN
+  fail-closed for critical entries.
 - **plugin env** — `CLAUDE_PLUGIN_ROOT`/`CLAUDE_PLUGIN_DATA` (plugin_runtime),
   `CLAUDE_PROJECT_DIR`/`CLAUDE_CODE_SESSION_ID` (host_session).
 - **plugin data** — when `CLAUDE_PLUGIN_DATA` is set: resolve, create root +
@@ -123,14 +124,37 @@ Checks:
 
 ## Claude compatibility policy
 
-Centralized in `src/doctor/capabilities.ts`:
+Centralized in `src/doctor/capabilities.ts` as a **per-capability** policy
+matrix (correction 2026-09-24: the single global minimum was replaced — the
+Approval security boundary must not be inferred from a general version
+gate). Each entry declares `verification`, optional `minimumVersion`,
+`critical`, `reason` (architecture basis), and `evidence`:
 
-- `MINIMUM_CLAUDE_CODE_VERSION = "2.0.0"` — the only place this number lives.
-- Five frozen capabilities (plugins, stdioMcp, planModeIntegration,
-  requiredUserInteraction, hookLifecycle) evaluated against that policy with
-  explicit reasons; all must be proven PASS for `supported=true`.
-- Missing/unreadable version ⇒ UNKNOWN ⇒ fail-closed (spec §13.4); no magic
-  version numbers outside this module.
+| capability | verification | minimumVersion | critical | evidence/basis |
+|---|---|---|---|---|
+| plugins | version | 2.0.0 | yes | plugin system + marketplace GA with Claude Code v2.0.0 (official release notes, 2025-09) |
+| stdioMcp | version | 2.0.0 | yes | plugin-scoped `.mcp.json` registration ships with the plugin system (GA v2.0.0) |
+| planModeIntegration | unknown | — | no | no reliable official floor for session-scoped plan transitions; Plan Mode is the host-owned boundary (spec §6.1) and Phase Plan guards (§6.3) are the fail-closed backstop |
+| requiredUserInteraction | version | **2.1.199** | yes | correction directive 2026-09-24; official changelog documents `requiresUserInteraction` handling (allow-rule bypass fix) by 2.1.246 |
+| hookLifecycle | unknown | — | no | no reliable official floor for the exact event set; absence degrades observation/recovery UX, not the fail-closed write boundary |
+
+Evaluation semantics:
+
+- `verification: "version"` entries PASS/FAIL against their floor; unreadable
+  or missing version ⇒ UNKNOWN.
+- `verification: "unknown"` entries are NEVER PASS from a version number —
+  they stay UNKNOWN until runtime probes exist (Phase 2 promotion path).
+- `supported` is true only when every **critical** capability is a proven
+  PASS. A critical UNKNOWN or FAIL closes the gate (architecture §13.4);
+  UNKNOWN ≠ SUPPORTED.
+- Floors live only in this module and are pinned by
+  `test/capabilities.test.ts` — never in business code.
+
+Doctor outcomes: Claude 2.1.198 ⇒ `requiredUserInteraction` FAIL ⇒
+`CLAUDE_CAPABILITY_UNSUPPORTED`, host integration NOT_READY, exit 4. Claude
+≥ 2.1.199 ⇒ approval gate PASS; `planModeIntegration`/`hookLifecycle` are
+reported as UNKNOWN (visible in the JSON `detail` and the human message)
+without blocking readiness.
 
 ## MCP bootstrap
 
@@ -173,8 +197,9 @@ detected via the `.cmd` shim, MCP handshake round-trip) and Node v22.23.2
 
 ## Known limitations (intentional, Phase 2+ scope)
 
-- Capability checks are version-policy only; no live plugin/MCP/Plan-Mode
-  probes yet. UNKNOWN stays fail-closed.
+- Capability checks are per-capability version policy; `planModeIntegration`
+  and `hookLifecycle` have no verified official floor and report UNKNOWN
+  (non-blocking) until runtime probes land in a later phase.
 - `hook <event>` parses and classifies known events (SessionStart,
   UserPromptSubmit, PreToolUse, PostToolBatch, PostCompact, FileChanged) but
   every handler is an explicit `HOOK_NOT_IMPLEMENTED` stub.

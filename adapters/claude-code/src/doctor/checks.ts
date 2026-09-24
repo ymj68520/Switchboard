@@ -130,9 +130,16 @@ export function checkClaudeCli(result: ClaudeVersionResult): CheckOutcome {
 }
 
 export function checkClaudeCapabilities(report: ClaudeCapabilityReport): CheckOutcome {
-  const failed = Object.entries(report.capabilities)
+  const criticalNames = report.policy.entries
+    .filter((entry) => entry.critical)
+    .map((entry) => entry.id);
+  const unknownNames = Object.entries(report.capabilities)
+    .filter(([, check]) => check.status === "UNKNOWN")
+    .map(([name]) => name);
+  const nonPass = Object.entries(report.capabilities)
     .filter(([, check]) => check.status !== "PASS")
     .map(([name, check]) => `${name}: ${check.status} — ${check.reason}`);
+
   return {
     id: "claude.capabilities",
     label: "Claude capabilities",
@@ -141,14 +148,25 @@ export function checkClaudeCapabilities(report: ClaudeCapabilityReport): CheckOu
     required: true,
     ...(report.supported ? {} : { errorCode: "CLAUDE_CAPABILITY_UNSUPPORTED" as const }),
     message: report.supported
-      ? `all capabilities PASS (policy minimum ${report.policy.minimumVersion})`
-      : failed.join("; "),
+      ? `critical gates PASS (${criticalNames.join(", ")}; approval floor ${report.policy.approvalInteractionFloor})${
+          unknownNames.length > 0 ? `; UNKNOWN unverified (non-blocking): ${unknownNames.join(", ")}` : ""
+        }`
+      : nonPass.join("; "),
     detail: {
-      policy: { ...report.policy },
+      policy: {
+        approvalInteractionFloor: report.policy.approvalInteractionFloor,
+        entries: report.policy.entries.map((entry) => ({
+          id: entry.id,
+          verification: entry.verification,
+          critical: entry.critical,
+          ...(entry.minimumVersion === undefined ? {} : { minimumVersion: entry.minimumVersion }),
+          evidence: entry.evidence,
+        })),
+      },
       capabilities: Object.fromEntries(
         Object.entries(report.capabilities).map(([name, check]) => [
           name,
-          { status: check.status, reason: check.reason },
+          { status: check.status, reason: check.reason, basis: check.basis },
         ]),
       ),
     },

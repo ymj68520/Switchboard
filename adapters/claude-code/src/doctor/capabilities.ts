@@ -3,22 +3,19 @@
  *
  * This module is the SINGLE place where Claude version → capability
  * judgments are made. Later phases must call into it instead of sprinkling
- * version comparisons through business code. Every judgment carries an
- * explicit reason; inability to prove a capability yields UNKNOWN, which is
- * fail-closed for critical capabilities (architecture §13.4): an unreadable
- * version must never be reported as supported.
+ * version comparisons through business code.
+ *
+ * The policy is per-capability, not one global minimum: the formal Approval
+ * security boundary (`requiredUserInteraction`, spec §13) is gated much
+ * tighter than general platform features. Every entry states its evidence;
+ * capabilities whose first-support version cannot be reliably determined
+ * from official evidence use `verification: "unknown"` and can never be
+ * reported as PASS from a version number alone — UNKNOWN ≠ SUPPORTED, and a
+ * critical UNKNOWN fails closed (architecture §13.4).
  */
 
 import type { ClaudeVersionResult } from "../claude/version.js";
-
-/**
- * Minimum Claude Code version for which Phase Plan v0.1 claims capability
- * compatibility. The plugin system, stdio MCP support, mandatory-interaction
- * tool metadata, and the hook lifecycle used by the frozen architecture are
- * all required; versions below this baseline are rejected as a matter of
- * policy. This number is policy, pinned here and in tests — nowhere else.
- */
-export const MINIMUM_CLAUDE_CODE_VERSION = "2.0.0";
+import { compareSemver } from "../runtime/node-version.js";
 
 export const CLAUDE_CAPABILITY_NAMES = [
   "plugins",
@@ -30,12 +27,88 @@ export const CLAUDE_CAPABILITY_NAMES = [
 
 export type ClaudeCapabilityName = (typeof CLAUDE_CAPABILITY_NAMES)[number];
 
+export type CapabilityVerification = "version" | "runtime_probe" | "unknown";
+
 export type CapabilityStatus = "PASS" | "FAIL" | "UNKNOWN";
+
+/**
+ * Version floor for the formal Approval interaction primitive. This is the
+ * fail-closed security gate: below it, mandatory-user-interaction metadata
+ * cannot be relied on, so transactional approval must not be attempted.
+ */
+export const REQUIRED_USER_INTERACTION_VERSION = "2.1.199";
+
+export interface CapabilityPolicyEntry {
+  id: ClaudeCapabilityName;
+  /** Present only when verification === "version". */
+  minimumVersion?: string;
+  verification: CapabilityVerification;
+  /** Critical capabilities gate overall compatibility and fail closed. */
+  critical: boolean;
+  /** Why Phase Plan requires this capability (architecture basis). */
+  reason: string;
+  /** Evidence for the chosen floor, or why the floor is unknown. */
+  evidence: string;
+}
+
+/**
+ * The capability compatibility matrix. Order is stable — it is the doctor
+ * report rendering order. No other module may encode version gates for
+ * Claude capabilities.
+ */
+export const CAPABILITY_POLICY: readonly CapabilityPolicyEntry[] = [
+  {
+    id: "plugins",
+    verification: "version",
+    minimumVersion: "2.0.0",
+    critical: true,
+    reason: "Phase Plan ships as a Claude Code plugin; the plugin system must load .claude-plugin and its skills/agents",
+    evidence:
+      "plugin system and plugin marketplace GA together with Claude Code v2.0.0 (official release notes, 2025-09)",
+  },
+  {
+    id: "stdioMcp",
+    verification: "version",
+    minimumVersion: "2.0.0",
+    critical: true,
+    reason: "the model-facing Phase Plan API is a plugin-scoped stdio MCP server (.mcp.json in the plugin root)",
+    evidence:
+      "plugin-scoped .mcp.json server registration ships with the plugin system (GA with Claude Code v2.0.0, 2025-09)",
+  },
+  {
+    id: "planModeIntegration",
+    verification: "unknown",
+    critical: false,
+    reason:
+      "session-scoped plan permission anchors the planning/execution boundary (spec §6); Plan Mode is the host-owned boundary and Phase Plan guards (§6.3) remain the fail-closed backstop without it",
+    evidence:
+      "no reliable official evidence pins the first version supporting the exact session-scoped plan-mode transition behavior; must be proven by a runtime probe (Phase 2) before any PASS is claimed",
+  },
+  {
+    id: "requiredUserInteraction",
+    verification: "version",
+    minimumVersion: REQUIRED_USER_INTERACTION_VERSION,
+    critical: true,
+    reason:
+      "formal Proposal Approval requires reliable mandatory-user-interaction tool metadata; below this floor Phase Plan must fail closed (spec §13.1/§13.4)",
+    evidence:
+      "Phase Plan capability correction directive 2026-09-24; official changelog documents requiresUserInteraction tool-metadata handling (allow-rule bypass fix) by 2.1.246, corroborating the mechanism's presence in the 2.1.x line",
+  },
+  {
+    id: "hookLifecycle",
+    verification: "unknown",
+    critical: false,
+    reason:
+      "guards, observation capture, and context injection ride the Claude hook lifecycle (spec §29.2); their absence degrades observation/recovery UX but not the fail-closed write boundary (Plan Mode primary + Core authority)",
+    evidence:
+      "no reliable official evidence pins the first version supporting the exact Phase Plan hook event set; must be proven by a runtime probe (Phase 2) before any PASS is claimed",
+  },
+] as const;
 
 export interface CapabilityCheck {
   status: CapabilityStatus;
   reason: string;
-  /** What the judgment is based on (version policy today; live probes later). */
+  /** Evidence/basis behind this judgment (from the policy entry). */
   basis: string;
 }
 
@@ -43,77 +116,86 @@ export interface ClaudeCapabilityReport {
   version?: string;
   supported: boolean;
   capabilities: Record<ClaudeCapabilityName, CapabilityCheck>;
-  policy: { minimumVersion: string };
-}
-
-const CAPABILITY_BASES: Readonly<Record<ClaudeCapabilityName, string>> = {
-  plugins: "plugin system required to load Phase Plan as a Claude Code plugin",
-  stdioMcp: "stdio MCP server transport is the Phase Plan model-facing API channel",
-  planModeIntegration: "session-scoped Plan Mode transition anchors the planning/execution boundary",
-  requiredUserInteraction: "formal Approval requires mandatory-user-interaction MCP metadata (architecture §13)",
-  hookLifecycle: "guards, observation capture, and context injection run on the Claude hook lifecycle",
-};
-
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(".");
-  const pb = b.split(".");
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const ai = Number(pa[i] ?? 0);
-    const bi = Number(pb[i] ?? 0);
-    if (ai !== bi) return ai - bi;
-  }
-  return 0;
+  policy: {
+    /** Convenience accessor for the approval fail-closed floor. */
+    approvalInteractionFloor: string;
+    entries: readonly CapabilityPolicyEntry[];
+  };
 }
 
 function evaluate(
-  name: ClaudeCapabilityName,
+  entry: CapabilityPolicyEntry,
   versionResult: ClaudeVersionResult,
-  minimumVersion: string,
 ): CapabilityCheck {
-  const basis = CAPABILITY_BASES[name];
+  if (entry.verification === "unknown") {
+    return {
+      status: "UNKNOWN",
+      reason: "cannot be proven from a version number — no verified official floor; runtime probe required",
+      basis: entry.evidence,
+    };
+  }
   if (versionResult.status === "not_found") {
     return {
       status: "UNKNOWN",
       reason: "Claude Code CLI not found — capability cannot be proven",
-      basis,
+      basis: entry.evidence,
     };
   }
   if (versionResult.status === "unreadable") {
     return {
       status: "UNKNOWN",
       reason: `Claude Code version unreadable (${versionResult.reason}) — capability cannot be proven`,
-      basis,
+      basis: entry.evidence,
     };
   }
-  const supported = compareVersions(versionResult.version, minimumVersion) >= 0;
+  const minimum = entry.minimumVersion;
+  if (minimum === undefined) {
+    // A "version"-verified entry without a floor is a policy bug: fail closed.
+    return {
+      status: "UNKNOWN",
+      reason: "policy entry is version-verified but has no floor — fail closed",
+      basis: entry.evidence,
+    };
+  }
+  const supported = compareSemver(versionResult.version, minimum) >= 0;
   return supported
     ? {
         status: "PASS",
-        reason: `Claude Code ${versionResult.version} satisfies the policy minimum ${minimumVersion}`,
-        basis,
+        reason: `Claude Code ${versionResult.version} satisfies the ${entry.id} floor ${minimum}`,
+        basis: entry.evidence,
       }
     : {
         status: "FAIL",
-        reason: `Claude Code ${versionResult.version} is below the policy minimum ${minimumVersion}`,
-        basis,
+        reason: `Claude Code ${versionResult.version} is below the ${entry.id} floor ${minimum}`,
+        basis: entry.evidence,
       };
 }
 
 /**
- * Evaluate all frozen capabilities for the detected CLI. `supported` is true
- * only when every critical capability is a proven PASS — UNKNOWN and FAIL
- * both fail closed.
+ * Evaluate every capability for the detected CLI. `supported` is true only
+ * when every CRITICAL capability is a proven PASS — a critical UNKNOWN or
+ * FAIL closes the gate (architecture §13.4). Non-critical UNKNOWN entries
+ * are reported honestly but do not claim support and do not block readiness.
  */
 export function evaluateClaudeCapabilities(
   versionResult: ClaudeVersionResult,
-  minimumVersion: string = MINIMUM_CLAUDE_CODE_VERSION,
+  policy: readonly CapabilityPolicyEntry[] = CAPABILITY_POLICY,
 ): ClaudeCapabilityReport {
   const capabilities = {} as Record<ClaudeCapabilityName, CapabilityCheck>;
-  for (const name of CLAUDE_CAPABILITY_NAMES) {
-    capabilities[name] = evaluate(name, versionResult, minimumVersion);
+  for (const entry of policy) {
+    capabilities[entry.id] = evaluate(entry, versionResult);
   }
   const version = versionResult.status === "ok" ? versionResult.version : undefined;
-  const supported = CLAUDE_CAPABILITY_NAMES.every((name) => capabilities[name].status === "PASS");
-  return { ...(version === undefined ? {} : { version }), supported, capabilities, policy: { minimumVersion } };
+  const supported = policy
+    .filter((entry) => entry.critical)
+    .every((entry) => capabilities[entry.id].status === "PASS");
+  return {
+    ...(version === undefined ? {} : { version }),
+    supported,
+    capabilities,
+    policy: {
+      approvalInteractionFloor: REQUIRED_USER_INTERACTION_VERSION,
+      entries: policy,
+    },
+  };
 }

@@ -98,6 +98,39 @@ describe("doctor integration (injected probes)", () => {
     expect(doctorExitCode(report)).toBe(4);
   });
 
+  it("rejects Claude 2.1.198: approval capability FAIL, host integration NOT_READY", async () => {
+    const report = await runDoctor(baseDeps({
+      probeClaude: async () => ({ status: "ok", version: "2.1.198", raw: "Claude Code 2.1.198", binPath: "claude" }),
+    }));
+    expect(report.checks.claudeCapabilities.status).toBe("FAIL");
+    expect(report.checks.claudeCapabilities.errorCode).toBe("CLAUDE_CAPABILITY_UNSUPPORTED");
+    expect(report.checks.claudeCapabilities.detail).toMatchObject({
+      capabilities: expect.objectContaining({
+        requiredUserInteraction: expect.objectContaining({
+          status: "FAIL",
+          reason: expect.stringContaining("2.1.199"),
+        }),
+      }),
+    });
+    expect(report.hostIntegration).toBe("NOT_READY");
+    expect(doctorExitCode(report)).toBe(4);
+  });
+
+  it("accepts Claude 2.1.199: approval capability PASS, unverified capabilities stay UNKNOWN", async () => {
+    const report = await runDoctor(baseDeps({
+      probeClaude: async () => ({ status: "ok", version: "2.1.199", raw: "Claude Code 2.1.199", binPath: "claude" }),
+    }));
+    expect(report.checks.claudeCapabilities.status).toBe("PASS");
+    expect(report.checks.claudeCapabilities.detail).toMatchObject({
+      capabilities: expect.objectContaining({
+        requiredUserInteraction: expect.objectContaining({ status: "PASS" }),
+        planModeIntegration: expect.objectContaining({ status: "UNKNOWN" }),
+        hookLifecycle: expect.objectContaining({ status: "UNKNOWN" }),
+      }),
+    });
+    expect(doctorExitCode(report)).toBe(0);
+  });
+
   it("fails with exit 3 when node:sqlite is unavailable", async () => {
     const report = await runDoctor(baseDeps({
       probeSqlite: async () => ({
