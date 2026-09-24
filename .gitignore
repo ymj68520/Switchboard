@@ -8,6 +8,11 @@ dist/
 # Test output
 coverage/
 
+# Local temp / scratch files (e.g. adapters/opencode/.tmp/)
+.tmp/
+*.tmp
+.tmp-*
+
 # Environment
 .env
 .env.*
