@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "phase-plan": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "mcp"]
+    }
+  }
+}

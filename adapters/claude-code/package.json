@@ -1,0 +1,28 @@
+{
+  "name": "@switchboard/claude-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Switchboard adapter for Claude Code: Phase Plan plugin (Phase 1 runtime bootstrap).",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "build": "esbuild src/runtime.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/phase-plan-runtime.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vitest": "^3.2.4"
+  }
+}
