@@ -362,6 +362,7 @@ describe("ModelController thread binding", () => {
     await waitForEvent(events, "topLevelThreadBound");
     const pending = await waitForEvent(events, "threadSubscriptionPending");
     expect(pending.reason).toContain("no rollout found");
+    expect(controller.subscription).toBe("pending");
     // Observation continues — subscription gaps are fail-open, not fatal.
     expect(controller.state).toBe("listening");
 

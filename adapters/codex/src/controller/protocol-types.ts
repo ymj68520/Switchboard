@@ -120,3 +120,66 @@ export function parseInitializeResult(result: unknown): ServerInfoView | null {
     platformOs: result.platformOs,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: subscription reconciliation surfaces
+// ---------------------------------------------------------------------------
+
+/** Narrow view of `thread/status/changed` (empirical 0.156.1 shape). */
+export interface ThreadStatusChangedView {
+  readonly threadId: string;
+  /** e.g. "idle" | "active" | "notLoaded" | "systemError". */
+  readonly statusType: string;
+}
+
+/**
+ * Tolerant reader for `thread/status/changed`. This notification is an
+ * AUXILIARY input (it only drives pending-subscription retries — directive
+ * §11), so structural drift here is safe-ignored by the caller, not fatal.
+ */
+export function parseThreadStatusChanged(params: unknown): ThreadStatusChangedView | null {
+  if (!isRecord(params)) {
+    return null;
+  }
+  const threadId = asNonEmptyString(params.threadId);
+  if (threadId === null || !isRecord(params.status)) {
+    return null;
+  }
+  const statusType = asNonEmptyString(params.status.type);
+  if (statusType === null) {
+    return null;
+  }
+  return { threadId, statusType };
+}
+
+/** Collaboration-mode snapshot carried by a `thread/resume` response. */
+export type ResumeModeSnapshotView =
+  | { kind: "ok"; mode: CollaborationModeKind }
+  | { kind: "absent" }
+  | { kind: "unsupported"; rawMode: unknown };
+
+/**
+ * Tolerant reader for the effective collaboration mode in a successful
+ * `thread/resume` response. On codex 0.156.1 the field lives at the TOP
+ * LEVEL of the response (`result.collaborationMode.mode`); the thread
+ * summary object does not carry it. Absent → stay subscribed and wait for
+ * `thread/settings/updated` — never guess Default (directive §8).
+ */
+export function parseResumeModeSnapshot(result: unknown): ResumeModeSnapshotView {
+  if (!isRecord(result)) {
+    return { kind: "absent" };
+  }
+  const container = isRecord(result.collaborationMode)
+    ? result.collaborationMode
+    : isRecord(result.threadSettings) && isRecord(result.threadSettings.collaborationMode)
+      ? result.threadSettings.collaborationMode
+      : null;
+  if (container === null || !("mode" in container)) {
+    return { kind: "absent" };
+  }
+  const mode = parseModeKind(container.mode);
+  if (mode !== null) {
+    return { kind: "ok", mode };
+  }
+  return { kind: "unsupported", rawMode: container.mode };
+}

@@ -1,42 +1,49 @@
 /**
  * ModelController — the launcher-internal controller lifecycle, top-level
- * thread binding and native collaboration-mode observation (Phase 2).
+ * thread binding and native collaboration-mode observation (Phases 2-3).
  *
  * Phase boundary: the controller ONLY OBSERVES. It has no model fields and
  * never sends `thread/settings/update` — mode transitions are surfaced as
- * domain events for Phase 3 (directive §2, §19-21).
+ * domain events for the later model-application phase. (Phase 2-3
+ * directives §2/§20.)
  *
- * Handshake (directive §7-9, verified on codex-cli 0.156.1):
+ * PASSIVE SUBSCRIBER RULE (Phase 3 directive §2 — safety frozen):
+ *
+ *   incoming server request → observe for diagnostics only → send NO
+ *   JSON-RPC response.
+ *
+ * Once subscribed via `thread/resume`, this connection is one of possibly
+ * several thread subscribers; codex may deliver thread-scoped server
+ * requests to every subscriber. The controller is not the request owner and
+ * has no tool/approval/user-interaction handlers, so ANY response from it
+ * could race the authoritative TUI subscriber's response.
+ *
+ * Handshake (Phase 2 directive §7-9, verified on codex-cli 0.156.1):
  *   connect → initialize (clientInfo + capabilities.experimentalApi=true)
  *           → exact-id success response → `initialized` notification with
  *             NO params key → LISTENING.
  *
- * Observation semantics (directive §12-19):
- * - only `thread/started` and `thread/settings/updated` are consumed; all
- *   other notifications are ignored (unknown ≠ fatal);
- * - top-level binding uses ONLY `parentThreadId == null` (no heuristics);
- * - a new top-level thread replaces the binding and clears `last_mode`;
- *   a duplicate `thread/started` for the current thread is ignored;
- * - settings for a non-current thread are ignored;
- * - first observed mode emits InitialModeObserved; a changed mode emits
- *   ModeChanged; same-mode updates (including model-only changes) emit
- *   nothing;
- * - an unknown mode value disables the controller (explicit unsupported,
- *   never guessed) — fail-open direction (Architecture SPEC §21.2);
- * - malformed required notifications disable the controller.
+ * Subscription convergence (Phase 3, empirically required on 0.156.1):
+ * `thread/settings/updated` is a THREAD-SCOPED notification — a side client
+ * only receives it after joining the fan-out with `thread/resume`. A fresh
+ * thread rejects resume with "no rollout found" until its first turn
+ * materializes the rollout. Therefore:
  *
- * Thread event subscription (empirical 0.156.1 requirement, reported to the
- * Phase 2 directive §30): `thread/settings/updated` is a THREAD-SCOPED
- * notification on this app-server version. A side client receives it only
- * after attaching to the thread via `thread/resume`. The controller issues
- * exactly one resume per bound thread — purely to join the notification
- * fan-out, NOT session recovery: no state reconstruction, no rebind, no
- * reconnect. A fresh thread without a persisted rollout rejects resume
- * ("no rollout found"); that outcome is a subscription-pending diagnostic
- * (fail-open), never a controller failure, and never retried automatically.
+ *   top-level bind → resume attempt
+ *     → success                       → subscribed (+ optional mode snapshot)
+ *     → "no rollout found" rejection  → pending (expected timing condition,
+ *                                       NOT a failure)
+ *     → any other failure             → controller failure semantics
+ *     pending + current-thread `thread/status/changed(idle)` → one retry
  *
- * Failure model (directive §23): any post-connect protocol failure disables
- * the controller. There is no automatic reconnect.
+ * Retry is event-driven only: NO timers, NO polling. An in-flight guard
+ * keeps at most one resume attempt per controller; a bind-generation token
+ * makes late completions for a replaced thread harmless.
+ *
+ * Failure model: any post-connect protocol failure disables the controller
+ * (fail-open direction, Architecture SPEC §21.2). There is no automatic
+ * reconnect. Unknown collaboration modes disable the controller — never
+ * guessed onto Default/Plan.
  */
 
 import {
@@ -48,8 +55,10 @@ import {
 } from "./app-server-rpc.js";
 import {
   parseInitializeResult,
+  parseResumeModeSnapshot,
   parseThreadSettingsUpdated,
   parseThreadStarted,
+  parseThreadStatusChanged,
   type CollaborationModeKind,
   type ServerInfoView,
 } from "./protocol-types.js";
@@ -63,6 +72,9 @@ export type ControllerState =
   | "disabled"
   | "stopped";
 
+/** Transient in-memory subscription state (Phase 3 directive §5). */
+export type SubscriptionState = "none" | "pending" | "subscribed";
+
 export type ControllerEvent =
   | { type: "topLevelThreadBound"; threadId: string }
   | { type: "initialModeObserved"; threadId: string; mode: CollaborationModeKind }
@@ -72,7 +84,7 @@ export type ControllerEvent =
   | { type: "disabled"; reason: string };
 
 export interface ModelControllerOptions {
-  /** Stable client identity for initialize (directive §7). */
+  /** Stable client identity for initialize (Phase 2 directive §7). */
   readonly clientName?: string;
   readonly clientVersion?: string;
   readonly requestTimeoutMs?: number;
@@ -83,7 +95,7 @@ export interface ModelControllerOptions {
 
 export const CONTROLLER_CLIENT_NAME = "phase-model-controller";
 
-/** Default initialize timeout — the handshake must not hang (§8). */
+/** Default initialize timeout — the handshake must not hang. */
 const INITIALIZE_TIMEOUT_MS = 15_000;
 
 interface ConnectionContext {
@@ -101,6 +113,12 @@ export class ModelController {
   private currentThreadId: string | null = null;
   private lastMode: CollaborationModeKind | null = null;
   private serverInfo: ServerInfoView | null = null;
+
+  private subscriptionState: SubscriptionState = "none";
+  /** Increments on every top-level bind; stale resume completions are dropped. */
+  private bindGeneration = 0;
+  /** Generation of the resume attempt currently in flight, if any. */
+  private subscriptionInFlightGeneration: number | null = null;
 
   private readonly listeners = new Set<(event: ControllerEvent) => void>();
   private stopPromise: Promise<void> | null = null;
@@ -127,7 +145,11 @@ export class ModelController {
     return this.lastMode;
   }
 
-  /** Diagnostics-only server identity from the initialize response (§8). */
+  get subscription(): SubscriptionState {
+    return this.subscriptionState;
+  }
+
+  /** Diagnostics-only server identity from the initialize response. */
   get serverDiagnostics(): ServerInfoView | null {
     return this.serverInfo;
   }
@@ -144,7 +166,8 @@ export class ModelController {
    * Connect to the Phase 1 READY endpoint and complete the initialize →
    * initialized handshake. Resolves once LISTENING. A failure before the
    * socket opened leaves the controller disconnected; any later failure
-   * disables it (§23).
+   * disables it. After connect(), everything required for subscription is
+   * driven by app-server events — callers never orchestrate it.
    */
   async connect(endpoint: LoopbackEndpoint): Promise<void> {
     if (this.controllerState !== "disconnected") {
@@ -176,9 +199,10 @@ export class ModelController {
   }
 
   /**
-   * Deterministic stop (§24): mark stopping, close the socket, reject
-   * pending RPCs, stop the dispatch. Idempotent, never kills the app-server
-   * (child ownership stays with the Phase 1 runtime).
+   * Deterministic stop: mark stopping, best-effort unsubscribe the current
+   * subscription, close the socket, reject pending RPCs. Idempotent, never
+   * blocks on unsubscribe failure, never kills the app-server (child
+   * ownership stays with the Phase 1 runtime).
    */
   async stop(): Promise<void> {
     if (this.stopPromise !== null) {
@@ -206,7 +230,7 @@ export class ModelController {
       },
       this.options.initializeTimeoutMs,
     );
-    // Diagnostics only — never a capability gate (SPEC §19).
+    // Diagnostics only — never a capability gate (Architecture SPEC §19).
     this.serverInfo = parseInitializeResult(result);
 
     // `initialized` with NO params — exact frame verified against 0.156.1.
@@ -214,7 +238,7 @@ export class ModelController {
   }
 
   // ----------------------------------------------------------------------
-  // Notification dispatch
+  // Incoming dispatch
   // ----------------------------------------------------------------------
 
   private rpcOptions(): AppServerRpcOptions {
@@ -222,16 +246,13 @@ export class ModelController {
       requestTimeoutMs: this.options.requestTimeoutMs,
       websocketFactory: this.options.websocketFactory,
       onNotification: (notification) => this.onNotification(notification.method, notification.params),
-      onServerRequest: (request) => {
-        // §22: the controller is a non-interactive observer — never execute
-        // tools or user interaction; answer with the standard JSON-RPC
-        // rejection so the server does not hang on an unanswered request.
-        this.connection?.rpc.respondError(
-          request.id,
-          -32601,
-          "Method not supported by controller",
-        );
-      },
+      // Passive Subscriber Rule: this connection is a passive thread
+      // subscriber. Responding to thread-scoped server requests can race
+      // with the authoritative TUI subscriber, so incoming server requests
+      // are observed for diagnostics only and get NO JSON-RPC response —
+      // no -32601, no -32600, no null/empty success. Method names never
+      // carry payloads here; tool/approval/prompt contents are untouched.
+      onServerRequest: () => {},
       onProtocolError: (error) => {
         void this.disableFrom(error);
       },
@@ -241,7 +262,7 @@ export class ModelController {
         }
       },
       onStrayResponse: () => {
-        // Diagnostic only (§5): counted upstream, not fatal here.
+        // Diagnostic only: never fatal.
       },
     };
   }
@@ -258,8 +279,11 @@ export class ModelController {
       case "thread/settings/updated":
         this.onThreadSettingsUpdated(params);
         return;
+      case "thread/status/changed":
+        this.onThreadStatusChanged(params);
+        return;
       default:
-        // Unknown notification → ignore safely (§11).
+        // Unknown notification → ignore safely.
         return;
     }
   }
@@ -272,63 +296,53 @@ export class ModelController {
       );
       return;
     }
-    // §13: child/subagent threads never enter switching scope.
+    // Child/subagent threads never enter switching scope.
     if (view.parentThreadId !== null) {
       return;
     }
-    // §15: duplicate top-level notification for the current thread → ignore.
+    // Duplicate top-level notification for the current thread → ignore.
     if (view.threadId === this.currentThreadId) {
       return;
     }
-    // §14: bind new top-level thread, clear mode state.
+
+    // New top-level thread: discard ALL previous thread state (including a
+    // pending or subscribed old subscription) and start the fresh flow.
+    const previousThreadId = this.currentThreadId;
+    const wasSubscribed = this.subscriptionState === "subscribed";
+    this.bindGeneration += 1;
+    this.subscriptionInFlightGeneration = null;
     this.currentThreadId = view.threadId;
     this.lastMode = null;
+    this.subscriptionState = "none";
+    if (previousThreadId !== null && wasSubscribed) {
+      this.bestEffortUnsubscribe(previousThreadId);
+    }
     this.emit({ type: "topLevelThreadBound", threadId: view.threadId });
-    this.subscribeToThreadEvents();
+    this.attemptSubscription();
   }
 
-  /**
-   * One-shot notification fan-out subscription for the CURRENT binding via
-   * `thread/resume`. Invoked automatically at bind time; also public for the
-   * Phase 3 launcher, because on codex 0.156.1 a freshly created thread
-   * cannot be resumed until its rollout exists (after the first turn).
-   * Resolves true when subscribed. Never retries internally and never
-   * disables the controller — observation gaps stay fail-open (§23).
-   */
-  subscribeToCurrentThread(): Promise<boolean> {
-    const threadId = this.currentThreadId;
-    if (threadId === null) {
-      return Promise.resolve(false);
+  private onThreadStatusChanged(params: unknown): void {
+    const view = parseThreadStatusChanged(params);
+    if (view === null) {
+      // Auxiliary input only — structural drift here is safe-ignored.
+      return;
     }
-    const connection = this.connection;
-    if (connection === null || !connection.rpc.isOpen || this.controllerState !== "listening") {
-      return Promise.resolve(false);
+    // Only the current thread's lifecycle drives anything.
+    if (view.threadId !== this.currentThreadId) {
+      return;
     }
-    return connection.rpc
-      .request("thread/resume", { threadId })
-      .then(() => {
-        if (this.controllerState === "listening" && this.currentThreadId === threadId) {
-          this.emit({ type: "threadSubscribed", threadId });
-          return true;
-        }
-        return false;
-      })
-      .catch((error: unknown) => {
-        if (this.controllerState === "listening" && this.currentThreadId === threadId) {
-          const reason =
-            error instanceof RpcRequestError
-              ? `thread/resume rejected: ${error.message}`
-              : error instanceof Error
-                ? error.message
-                : String(error);
-          this.emit({ type: "threadSubscriptionPending", threadId, reason });
-        }
-        return false;
-      });
-  }
-
-  private subscribeToThreadEvents(): void {
-    void this.subscribeToCurrentThread();
+    // Only a settled (idle) transition may signal that the rollout has been
+    // materialized; status is never used to infer mode/model/planning state.
+    if (view.statusType !== "idle") {
+      return;
+    }
+    if (this.subscriptionState !== "pending") {
+      // subscribed → no duplicate resume; none → the bind attempt already ran.
+      return;
+    }
+    // Event-driven retry (no timers). The in-flight guard inside
+    // attemptSubscription keeps this to at most one concurrent request.
+    this.attemptSubscription();
   }
 
   private onThreadSettingsUpdated(params: unknown): void {
@@ -340,7 +354,7 @@ export class ModelController {
       return;
     }
     if (view.kind === "unsupportedMode") {
-      // §18: unknown mode must be explicit, never guessed → disable.
+      // Unknown mode must be explicit, never guessed → disable.
       void this.disableFrom(
         new RpcConnectionError(
           `unsupported collaboration mode: ${JSON.stringify(view.rawMode ?? null)}`,
@@ -348,15 +362,23 @@ export class ModelController {
       );
       return;
     }
-    // §17: only the current top-level thread is observed.
-    if (view.threadId !== this.currentThreadId) {
+    this.observeMode(view.threadId, view.mode);
+  }
+
+  /**
+   * Single mode-observation transition function (Phase 3 directive §17-18).
+   * Both authoritative sources — the resume-response snapshot and the
+   * thread/settings/updated notification — funnel through here. No model
+   * mutation happens anywhere.
+   */
+  private observeMode(threadId: string, observed: CollaborationModeKind): void {
+    // Only the current top-level thread is observed.
+    if (threadId !== this.currentThreadId) {
       return;
     }
-    const observed = view.mode;
     if (this.lastMode === null) {
-      // First observation (§19).
       this.lastMode = observed;
-      this.emit({ type: "initialModeObserved", threadId: view.threadId, mode: observed });
+      this.emit({ type: "initialModeObserved", threadId, mode: observed });
       return;
     }
     if (observed === this.lastMode) {
@@ -365,7 +387,105 @@ export class ModelController {
     }
     const previous = this.lastMode;
     this.lastMode = observed;
-    this.emit({ type: "modeChanged", threadId: view.threadId, from: previous, to: observed });
+    this.emit({ type: "modeChanged", threadId, from: previous, to: observed });
+  }
+
+  // ----------------------------------------------------------------------
+  // Subscription convergence
+  // ----------------------------------------------------------------------
+
+  /**
+   * One `thread/resume` attempt for the current binding — pure passive
+   * attach / notification subscription, no overrides of any kind. At most
+   * one attempt in flight; completions from replaced threads are dropped by
+   * generation check. No retries except the event-driven idle trigger.
+   */
+  private attemptSubscription(): void {
+    const connection = this.connection;
+    if (
+      connection === null ||
+      !connection.rpc.isOpen ||
+      this.controllerState !== "listening" ||
+      this.currentThreadId === null ||
+      this.subscriptionState === "subscribed" ||
+      this.subscriptionInFlightGeneration !== null
+    ) {
+      return;
+    }
+
+    const threadId = this.currentThreadId;
+    const generation = this.bindGeneration;
+    this.subscriptionInFlightGeneration = generation;
+
+    void connection.rpc
+      .request("thread/resume", { threadId })
+      .then((result: unknown) => {
+        if (this.subscriptionInFlightGeneration !== generation) {
+          return; // stale completion for a replaced thread — ignore entirely
+        }
+        this.subscriptionInFlightGeneration = null;
+        if (
+          this.controllerState !== "listening" ||
+          this.currentThreadId !== threadId ||
+          this.subscriptionState === "subscribed"
+        ) {
+          return;
+        }
+        this.subscriptionState = "subscribed";
+        this.emit({ type: "threadSubscribed", threadId });
+        // Optional authoritative initial snapshot (tolerant: absent is fine).
+        const snapshot = parseResumeModeSnapshot(result);
+        if (snapshot.kind === "ok") {
+          this.observeMode(threadId, snapshot.mode);
+        } else if (snapshot.kind === "unsupported") {
+          void this.disableFrom(
+            new RpcConnectionError(
+              `unsupported collaboration mode: ${JSON.stringify(snapshot.rawMode ?? null)}`,
+            ),
+          );
+        }
+        // absent → remain subscribed and wait for thread/settings/updated.
+      })
+      .catch((error: unknown) => {
+        if (this.subscriptionInFlightGeneration !== generation) {
+          return; // stale completion for a replaced thread — ignore entirely
+        }
+        this.subscriptionInFlightGeneration = null;
+        if (
+          this.controllerState !== "listening" ||
+          this.currentThreadId !== threadId ||
+          this.subscriptionState === "subscribed"
+        ) {
+          return;
+        }
+        if (isFreshThreadPendingError(error)) {
+          // Expected upstream timing condition — never Disabled, never
+          // retried on a timer. A later idle status transition re-drives us.
+          this.subscriptionState = "pending";
+          this.emit({
+            type: "threadSubscriptionPending",
+            threadId,
+            reason: `thread/resume rejected: ${error.message}`,
+          });
+          return;
+        }
+        // Any other resume failure is a real controller failure.
+        void this.disableFrom(error instanceof Error ? error : new Error(String(error)));
+      });
+  }
+
+  /**
+   * Best-effort `thread/unsubscribe` — sends the request and ignores any
+   * outcome. The WebSocket close remains the final cleanup boundary.
+   */
+  private bestEffortUnsubscribe(threadId: string): void {
+    const connection = this.connection;
+    if (connection === null || !connection.rpc.isOpen) {
+      return;
+    }
+    void connection.rpc.request("thread/unsubscribe", { threadId }).catch(() => {
+      // Unsubscribe failure must never block anything (Phase 3 §15/§31).
+    });
   }
 
   // ----------------------------------------------------------------------
@@ -377,6 +497,11 @@ export class ModelController {
       return;
     }
     this.controllerState = "disabled";
+    // Stop subscription retry + mode processing by clearing in-flight state.
+    this.subscriptionInFlightGeneration = null;
+    if (this.subscriptionState === "subscribed" && this.currentThreadId !== null) {
+      this.bestEffortUnsubscribe(this.currentThreadId);
+    }
     const connection = this.connection;
     this.connection = null;
     if (connection !== null) {
@@ -393,8 +518,11 @@ export class ModelController {
     if (this.controllerState === "stopped") {
       return;
     }
-    const wasDisabled = this.controllerState === "disabled";
     this.controllerState = "stopped";
+    this.subscriptionInFlightGeneration = null;
+    if (this.subscriptionState === "subscribed" && this.currentThreadId !== null) {
+      this.bestEffortUnsubscribe(this.currentThreadId);
+    }
     const connection = this.connection;
     this.connection = null;
     if (connection !== null) {
@@ -403,9 +531,6 @@ export class ModelController {
       } catch {
         // Closing must never block stop().
       }
-    }
-    if (!wasDisabled) {
-      // stop() from disabled state already emitted its disabled event.
     }
   }
 
@@ -418,4 +543,20 @@ export class ModelController {
       }
     }
   }
+}
+
+/**
+ * Narrow pending classification (Phase 3 directive §10): ONLY the
+ * empirically-confirmed fresh-thread case — a JSON-RPC invalid-request
+ * error whose message reports the missing rollout — counts as expected
+ * pending. Everything else is a real failure. Deliberately not a general
+ * string parser.
+ */
+function isFreshThreadPendingError(error: unknown): error is RpcRequestError {
+  return (
+    error instanceof RpcRequestError &&
+    error.payload.code === -32600 &&
+    typeof error.payload.message === "string" &&
+    error.payload.message.includes("no rollout found")
+  );
 }

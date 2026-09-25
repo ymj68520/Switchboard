@@ -44,6 +44,18 @@ export interface FakeAppServer {
   silenceInitialize(): void;
   /** How `thread/resume` is answered: "ok" (default) or rejected. */
   setThreadResumeBehavior(behavior: "ok" | "reject"): void;
+  /** Payload returned by a successful thread/resume reply. */
+  setThreadResumeResult(result: unknown): void;
+  /** Artificial delay before a thread/resume reply (in-flight tests). */
+  setThreadResumeDelay(ms: number): void;
+  /** How `thread/unsubscribe` is answered: "ok" (default) or rejected. */
+  setUnsubscribeBehavior(behavior: "ok" | "reject"): void;
+  /** Number of thread/resume requests received across all connections. */
+  resumeRequestCount(): number;
+  /** Number of thread/unsubscribe requests received across all connections. */
+  unsubscribeRequestCount(): number;
+  /** Frames the tested client sent whose method matches (all connections). */
+  clientRequests(method: string): Array<Record<string, unknown>>;
   closeConnection(index: number, code?: number): void;
   close(): Promise<void>;
 }
@@ -61,6 +73,9 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
   let initializeFailure: { code: number; message: string } | null = null;
   let respondToInitialize = true;
   let threadResumeBehavior: "ok" | "reject" = "ok";
+  let threadResumeResult: unknown = { thread: { id: null } };
+  let threadResumeDelayMs = 0;
+  let unsubscribeBehavior: "ok" | "reject" = "ok";
 
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise<void>((resolve) => wss.on("listening", resolve));
@@ -86,6 +101,25 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
     send(record, { jsonrpc: "2.0", id: frame.id, result: initializeResult });
   };
 
+  const replyThreadResume = (record: ConnectionRecord, frame: Record<string, unknown>): void => {
+    const respond = (): void => {
+      if (threadResumeBehavior === "ok") {
+        send(record, { jsonrpc: "2.0", id: frame.id, result: threadResumeResult });
+      } else {
+        send(record, {
+          jsonrpc: "2.0",
+          id: frame.id,
+          error: { code: -32600, message: "no rollout found for thread id (fake)" },
+        });
+      }
+    };
+    if (threadResumeDelayMs > 0) {
+      setTimeout(respond, threadResumeDelayMs);
+    } else {
+      respond();
+    }
+  };
+
   const handleMessage = (record: ConnectionRecord, data: RawData): void => {
     const text = data.toString();
     record.receivedRaw.push(text);
@@ -105,13 +139,17 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
       return;
     }
     if (typed.method === "thread/resume" && typeof typed.id !== "undefined") {
-      if (threadResumeBehavior === "ok") {
-        send(record, { jsonrpc: "2.0", id: typed.id, result: { thread: { id: null } } });
+      replyThreadResume(record, typed);
+      return;
+    }
+    if (typed.method === "thread/unsubscribe" && typeof typed.id !== "undefined") {
+      if (unsubscribeBehavior === "ok") {
+        send(record, { jsonrpc: "2.0", id: typed.id, result: { status: "unsubscribed" } });
       } else {
         send(record, {
           jsonrpc: "2.0",
           id: typed.id,
-          error: { code: -32600, message: "no rollout found for thread id (fake)" },
+          error: { code: -32600, message: "unsubscribe failed (fake)" },
         });
       }
     }
@@ -185,6 +223,29 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
     setThreadResumeBehavior: (behavior) => {
       threadResumeBehavior = behavior;
     },
+    setThreadResumeResult: (result) => {
+      threadResumeResult = result;
+    },
+    setThreadResumeDelay: (ms) => {
+      threadResumeDelayMs = ms;
+    },
+    setUnsubscribeBehavior: (behavior) => {
+      unsubscribeBehavior = behavior;
+    },
+    resumeRequestCount: () =>
+      records.reduce(
+        (total, record) =>
+          total + record.received.filter((frame) => frame.method === "thread/resume").length,
+        0,
+      ),
+    unsubscribeRequestCount: () =>
+      records.reduce(
+        (total, record) =>
+          total + record.received.filter((frame) => frame.method === "thread/unsubscribe").length,
+        0,
+      ),
+    clientRequests: (method) =>
+      records.flatMap((record) => record.received.filter((frame) => frame.method === method)),
     closeConnection: (index, code) => {
       records[index]?.socket.close(code ?? 1000);
     },

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Real Codex integration probe for the Model Controller (Phase 2, directive
- * §30). Uses the BUILT adapter (adapters/codex/dist) against the REAL Codex
- * CLI app-server with TWO clients:
+ * Real Codex probe for the passive controller (Phase 3, directives §32-33).
+ * Uses the BUILT adapter (adapters/codex/dist) against the REAL Codex CLI
+ * app-server with TWO clients:
  *
- *     Controller (production ModelController)
+ *     Controller (production ModelController, fully event-driven)
  *         \
  *          dedicated real app-server (via Phase 1 runtime)
  *         /
@@ -12,18 +12,22 @@
  *
  * Verified steps:
  *   1. runtime boots the session-dedicated app-server (Phase 1)
- *   2. Controller connects + initializes (experimentalApi) → LISTENING
- *   3. Driver connects + initializes
- *   4. Driver creates a real top-level thread
- *   5. Controller receives thread/started and binds it
- *   6. Driver runs one real turn — on codex-cli 0.156.1 a fresh thread
- *      cannot be attached via thread/resume until its rollout exists, and
- *      the rollout appears with the thread's first activity
- *   7. Controller subscribes to the thread's notification fan-out
- *   8. Driver switches collaboration mode default → plan → default; the
- *      Controller observes InitialModeObserved(plan) + ModeChanged(plan→
- *      default) — exactly the frozen Phase 2 observation boundary
- *   9. deterministic cleanup (controller stop, driver close, runtime stop)
+ *   2. Controller connects + initializes → LISTENING
+ *   3. driver starts a fresh top-level thread; Controller binds it
+ *   4. initial thread/resume returns the expected fresh-thread pending
+ *      ("no rollout found") — NO manual subscribe call anywhere
+ *   5. driver runs a first real turn; the thread's real
+ *      thread/status/changed(idle) drives the AUTOMATIC subscription retry
+ *   6. Controller becomes subscribed and the collaboration mode becomes
+ *      known (resume snapshot and/or settings events)
+ *   7. driver switches default → plan → default; Controller observes both
+ *   8. passive-subscriber interference check: with the Controller still
+ *      subscribed, the driver runs an ordinary turn to NORMAL completion —
+ *      the Controller stays listening, emits no disabled event, and (per
+ *      the fake-server regression + production boundary scans) sends no
+ *      JSON-RPC response frames and never thread/settings/update
+ *   9. deterministic cleanup (controller stop incl. best-effort
+ *      unsubscribe, driver close, runtime stop)
  *
  * The driver exists ONLY in this script — never in production code.
  * Usage: node scripts/codex-controller-probe.mjs
@@ -103,6 +107,24 @@ async function waitFor(predicate, timeoutMs, label) {
   throw new Error(`${label}: not satisfied within ${timeoutMs}ms`);
 }
 
+async function runTurn(driverConnection, threadId, seenNotifications, label) {
+  await driverConnection.request(
+    "turn/start",
+    { threadId, input: [{ type: "text", text: "Reply with exactly: OK" }] },
+    20_000,
+  );
+  const before = seenNotifications.length;
+  await waitFor(
+    () =>
+      seenNotifications
+        .slice(before)
+        .some((m) => m === "turn/completed" || m === "turn/failed"),
+    300_000,
+    `${label} completion`,
+  );
+  return seenNotifications.slice(before).includes("turn/completed");
+}
+
 try {
   // 1. Phase 1 runtime → READY endpoint
   const endpoint = await runtime.start();
@@ -116,7 +138,7 @@ try {
     controller.state === "listening",
   );
 
-  // 3. Test driver connects + initializes
+  // 3. Test driver connects + starts a fresh top-level thread
   driver = new AppServerRpcConnection(endpoint.wsUrl, {
     onNotification: (notification) => {
       driverNotifications.push(notification.method);
@@ -128,53 +150,62 @@ try {
     capabilities: { experimentalApi: true },
   });
   driver.notify("initialized");
-  report("3. Test driver initialized", true);
-
-  // 4. Driver creates a real top-level thread
   const thread = await driver.request("thread/start", {});
   const threadId = thread?.thread?.id ?? null;
-  report("4. driver created a real top-level thread", threadId !== null, threadId ?? "n/a");
+  report("3. driver initialized + started fresh top-level thread", threadId !== null, threadId ?? "n/a");
 
-  // 5. Controller receives thread/started and binds it
+  // 4. Controller binds; the automatic initial resume hits the fresh-thread
+  //    pending path — with NO manual orchestration anywhere.
   await waitFor(() => controller.boundThreadId === threadId, 10_000, "thread binding");
-  report("5. Controller observed thread/started and bound the top-level thread", true);
-
-  // 6. One real turn — codex 0.156.1 needs the thread rollout to exist
-  //    before a second client can attach (thread/resume).
-  console.log("  starting a real turn (persisting the thread rollout)…");
-  await driver.request(
-    "turn/start",
-    { threadId, input: [{ type: "text", text: "Reply with exactly: OK" }] },
-    20_000,
-  );
   await waitFor(
-    () =>
-      driverNotifications.includes("turn/completed") ||
-      driverNotifications.includes("turn/failed"),
-    240_000,
-    "turn completion",
+    () => controllerEvents.some((e) => e.type === "threadSubscriptionPending"),
+    15_000,
+    "fresh-thread pending",
   );
   report(
-    "6. real turn completed (thread rollout persisted)",
-    driverNotifications.includes("turn/completed"),
+    "4. automatic initial resume → expected fresh-thread PENDING (not Disabled)",
+    controller.subscription === "pending" && controller.state === "listening",
   );
 
-  // 7. Controller subscribes to the thread's notification fan-out
-  const subscribed = await controller.subscribeToCurrentThread();
-  report("7. Controller subscribed via thread/resume", subscribed);
+  // 5. First real turn materializes the rollout; the real idle status
+  //    transition drives the automatic retry.
+  console.log("  running first real turn (materializes rollout; idle drives retry)…");
+  const firstTurnCompleted = await runTurn(driver, threadId, driverNotifications, "first turn");
+  await waitFor(
+    () => controllerEvents.some((e) => e.type === "threadSubscribed"),
+    60_000,
+    "automatic subscription convergence",
+  );
+  report(
+    "5. real status/idle → AUTOMATIC subscription convergence",
+    controller.subscription === "subscribed",
+    `first turn completed=${firstTurnCompleted}`,
+  );
 
-  // 8. Mode observation: default → plan → default (driver-side mode switches)
+  // 6. Collaboration mode becomes known (resume snapshot and/or settings).
+  await waitFor(
+    () => controllerEvents.some((e) => e.type === "initialModeObserved"),
+    60_000,
+    "initial mode observation",
+  );
+  const initialMode = controllerEvents.find((e) => e.type === "initialModeObserved");
+  report(
+    "6. collaboration mode known without any manual call",
+    typeof initialMode?.mode === "string",
+    `initial=${initialMode?.mode ?? "unknown"}`,
+  );
+
+  // 7. Mode transitions default → plan → default observed.
   const model = thread?.thread?.model ?? "default-model";
   await driver.request("thread/settings/update", {
     threadId,
     collaborationMode: { mode: "plan", settings: { model } },
   });
   await waitFor(
-    () => controllerEvents.some((e) => e.type === "initialModeObserved" && e.mode === "plan"),
+    () => controllerEvents.some((e) => e.type === "modeChanged" && e.to === "plan"),
     15_000,
-    "initialModeObserved(plan)",
+    "modeChanged(→plan)",
   );
-
   await driver.request("thread/settings/update", {
     threadId,
     collaborationMode: { mode: "default", settings: { model } },
@@ -187,9 +218,22 @@ try {
     15_000,
     "modeChanged(plan→default)",
   );
-  report("8. Controller observed InitialModeObserved(plan) + ModeChanged(plan→default)", true);
+  report("7. Controller observed default→plan→default transitions", true);
 
-  // 9. Deterministic cleanup
+  // 8. Passive-subscriber interference check: an ordinary turn while the
+  //    Controller is subscribed completes normally and the Controller
+  //    stays healthy and silent (non-response is wire-verified by the
+  //    fake-server regression test + production boundary scans).
+  console.log("  running an ordinary turn while the Controller is subscribed…");
+  const secondCompleted = await runTurn(driver, threadId, driverNotifications, "subscribed turn");
+  const disabledDuring = controllerEvents.some((e) => e.type === "disabled");
+  report(
+    "8. subscribed Controller does not interfere: ordinary turn completes",
+    secondCompleted && controller.state === "listening" && !disabledDuring,
+    `turnCompleted=${secondCompleted}, controller=${controller.state}`,
+  );
+
+  // 9. Deterministic cleanup (controller stop includes best-effort unsubscribe)
   await controller.stop();
   await driver.close();
   await runtime.shutdown();

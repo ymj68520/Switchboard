@@ -65,14 +65,19 @@ export {
   type ControllerEvent,
   type ControllerState,
   type ModelControllerOptions,
+  type SubscriptionState,
 } from "./controller/model-controller.js";
 export {
   parseInitializeResult,
   parseModeKind,
+  parseResumeModeSnapshot,
   parseThreadSettingsUpdated,
   parseThreadStarted,
+  parseThreadStatusChanged,
   type CollaborationModeKind,
+  type ResumeModeSnapshotView,
   type ServerInfoView,
   type ThreadSettingsUpdatedView,
   type ThreadStartedView,
+  type ThreadStatusChangedView,
 } from "./controller/protocol-types.js";
