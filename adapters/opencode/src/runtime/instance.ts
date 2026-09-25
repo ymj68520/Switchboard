@@ -23,6 +23,10 @@ import { InMemoryObservationLedger } from "../repository/observations.js";
 import type { ObservationLedger } from "../repository/observations.js";
 import { OpenCodeRuntimeAdapter } from "./opencode-plugin.js";
 import type { UltraPlanRuntime } from "./types.js";
+import { OpenCodeSemanticValidator } from "../validation/opencode-validator.js";
+import type { SemanticValidator } from "../validation/types.js";
+import { OpenCodeExecutionAdapter } from "./opencode-execution-adapter.js";
+import type { PluginInput } from "@opencode-ai/plugin";
 
 export interface UltraPlanInstance {
   store: PlanStore;
@@ -30,6 +34,8 @@ export interface UltraPlanInstance {
   admissions: StartAdmissionLedger;
   runtime: UltraPlanRuntime;
   controller: UltraPlanController;
+  /** The bound isolated semantic validator, when the host provides a client. */
+  semanticValidator?: SemanticValidator;
   /** Release resources (durable store close); safe to call for memory stores. */
   dispose: () => void;
 }
@@ -37,7 +43,13 @@ export interface UltraPlanInstance {
 let current: UltraPlanInstance | undefined;
 const projectInstances = new Map<string, UltraPlanInstance>();
 
-function buildInstance(store: PlanStore): UltraPlanInstance {
+function buildInstance(
+  store: PlanStore,
+  options: {
+    semanticValidator?: SemanticValidator;
+    executionRuntime?: import("../core/controller.js").ControllerOptions["executionRuntime"];
+  } = {},
+): UltraPlanInstance {
   const ledger = new InMemoryObservationLedger();
   const admissions = new InMemoryStartAdmissionLedger();
   const runtime: UltraPlanRuntime = new OpenCodeRuntimeAdapter();
@@ -46,7 +58,15 @@ function buildInstance(store: PlanStore): UltraPlanInstance {
     ledger,
     admissions,
     runtime,
-    controller: new UltraPlanController({ store, ledger, admissions, runtime }),
+    ...(options.semanticValidator ? { semanticValidator: options.semanticValidator } : {}),
+    controller: new UltraPlanController({
+      store,
+      ledger,
+      admissions,
+      runtime,
+      ...(options.semanticValidator ? { semanticValidator: options.semanticValidator } : {}),
+      ...(options.executionRuntime ? { executionRuntime: options.executionRuntime } : {}),
+    }),
     dispose: () => {
       if (store instanceof DurablePlanStore) store.close();
     },
@@ -65,16 +85,40 @@ export function projectStorePath(projectKey: string): string {
 /**
  * Production entry: one durable instance per OpenCode project id. Opening the
  * store happens eagerly and synchronously-validating; failures propagate (the
- * plugin must not silently fall back to memory).
+ * plugin must not silently fall back to memory). When the host provides its
+ * SDK client, the isolated OpenCode semantic validator is bound to the
+ * controller (Phase 2G); without a client, run_semantic_validation fails
+ * honestly with `validator_unavailable` instead of faking results.
  */
-export function getProjectInstance(projectID: string): UltraPlanInstance {
+export function getProjectInstance(
+  projectID: string,
+  options: { client?: PluginInput["client"] } = {},
+): UltraPlanInstance {
   const existing = projectInstances.get(projectID);
   if (existing) return existing;
   const store = new DurablePlanStore(projectStorePath(projectID));
   // Force eager open so a corrupt/newer store fails the plugin load loudly.
   const opened = store.open();
   if (isPromise(opened)) opened.then(undefined, undefined);
-  const instance = buildInstance(store);
+  const instance = buildInstance(store, {
+    ...(options.client
+      ? {
+          semanticValidator: new OpenCodeSemanticValidator(options.client),
+          // Phase 2J: the runtime handoff bundle — the OpenCode execution
+          // adapter plus the deterministic execution role policy from the
+          // runtime spec (§29/§30). Without a client the handoff stays
+          // pending with `execution_runtime_unavailable` (never faked).
+          executionRuntime: (() => {
+            const spec = new OpenCodeRuntimeAdapter().spec;
+            return {
+              adapter: new OpenCodeExecutionAdapter(options.client),
+              executionAgent: spec.executionAgent,
+              executionModel: spec.executionModel,
+            };
+          })(),
+        }
+      : {}),
+  });
   projectInstances.set(projectID, instance);
   return instance;
 }
