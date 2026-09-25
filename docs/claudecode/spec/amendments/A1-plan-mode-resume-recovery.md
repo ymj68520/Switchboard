@@ -118,7 +118,7 @@ Key distinctions carried by the amendment:
 
 ## 5. Affected spec sections (edited in the consolidated spec)
 
-- §6 Claude Plan Mode Integration — new §6.5 "Plan Mode recovery after resume"
+- §6 Claude Plan Mode Integration — new §6.4 "Plan Mode recovery after resume"
 - §14.3 Recovery Context Capsule — mode-recovery indication when `permission_mode != plan`
 - §23.4 `/resume` — recovery list no longer includes Plan Mode; amended semantics recorded
 - §23.3 — unchanged (already correct)
