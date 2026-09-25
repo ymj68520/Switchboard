@@ -224,7 +224,45 @@ v0.1 uses two fail-closed layers:
 
 Claude Plan Mode is the primary boundary; Phase Plan guards are the correctness backstop.
 
-### 6.4 Final exit
+### 6.4 Plan Mode recovery after resume (Amendment A1)
+
+PlanningRun recovery and Claude permission-mode recovery are distinct operations (RI-22).
+
+Documented Claude Code behavior never restores Plan Mode on the interactive exact-session `/resume` path, and `SessionStart` cannot set the permission mode. Therefore:
+
+```text
+/resume
+    ↓
+recover exact Phase Plan authoritative state
+    ↓
+reattach exact-session PlanningRun when legal
+    ↓
+inspect current Claude permission mode
+
+if permission_mode == plan:
+    planning may continue
+
+if permission_mode != plan:
+    mode recovery is required
+    ↓
+    block ordinary Phase Plan continuation (fail-closed)
+    ↓
+    user explicitly invokes /phase-plan
+    ↓
+    existing EntryIntent / HostContext path
+    ↓
+    start_or_resume returns the SAME PlanningRun
+    ↓
+    PermissionRequest setMode(plan, session)
+    ↓
+    planning continues
+```
+
+`/phase-plan` re-entry for mode recovery is host-mode recovery authorization. It is not Proposal Approval, PlanCommit Approval, Final Approval, or takeover: committed design stays committed, an awaiting Proposal stays awaiting, no reapproval is caused by the host dropping Plan Mode, and the re-entered run is always the same PlanningRun (never created, duplicated, superseded, or reset). Mode recovery is never triggered by SessionStart, model inference, the MCP process environment, or conversation text — only by the user-invoked `/phase-plan` with a fresh signed EntryIntent.
+
+Phase Plan never persists Claude Plan Mode into user, project, or local settings solely to survive session resume (CC-11). No `mode_recovery_required` lifecycle/state exists: the condition is derived from `active PlanningRun + current session ownership + permission_mode != plan`.
+
+### 6.5 Final exit
 
 Only this sequence authorizes exit:
 
@@ -611,6 +649,15 @@ blocking Questions/Conflicts
 current Proposal if any
 context epoch
 ```
+
+When the recovered session's host permission mode is not `plan`, the capsule must additionally state clearly (Amendment A1, §6.4):
+
+```text
+Phase Plan run recovered.
+Claude Plan Mode must be restored by invoking /phase-plan.
+```
+
+SessionStart never claims to restore Plan Mode, and no model planning work proceeds from this context alone.
 
 ### 14.4 Normal turns
 
@@ -1167,16 +1214,17 @@ The run remains `active`; the session binding may become detached/offline.
 
 Exact-session resume automatically reattaches the bound PlanningRun when workspace identity still matches.
 
-Recovery restores:
+Recovery restores Phase Plan authoritative state:
 
 ```text
 active stage
 active scope
 HEAD Snapshot
 current Proposal
-Plan Mode
 Recovery Context Capsule
 ```
+
+Plan Mode is **not** in this list (Amendment A1, §6.4/RI-22): documented Claude Code never restores it on the interactive resume path and `SessionStart` cannot set it. Exact-session `/resume` restores the authoritative Phase Plan binding/state when identity and workspace match; if Claude Code has not restored Plan Mode, the run remains recovered but planning continuation is guarded (fail-closed drift guards) until the user explicitly re-invokes `/phase-plan` and the existing session-scoped Plan Mode transition succeeds. The existing PlanningRun is resumed — no new run, approval, commit, or ownership transfer occurs.
 
 ### 23.5 Pending Approval
 
@@ -2002,6 +2050,12 @@ The v0.1 architecture freezes the following cross-cutting invariants.
 55. Finalization/handoff expose no force/bypass flags.
 56. Abort is explicit human-authorized termination and produces no Final Plan/Build contract.
 
+### Amendment A1 (Plan Mode recovery — see `amendments/A1-plan-mode-resume-recovery.md`)
+
+RI-22. PlanningRun recovery and Claude permission-mode recovery are distinct operations. An exact-session resume may recover/reattach authoritative PlanningRun state even when the host does not restore Plan Mode. If the current host permission mode is not plan, no planning continuation or planning mutation is authorized until the user explicitly invokes `/phase-plan` and the documented session-scoped Plan Mode transition succeeds.
+
+CC-11. Phase Plan never persists Claude Plan Mode into user, project, or local settings solely to survive session resume. Where the host cannot restore Plan Mode, explicit `/phase-plan` re-entry is the recovery mechanism.
+
 ---
 
 ## 40. Frozen v0.1 Non-Goals
@@ -2158,6 +2212,10 @@ crash during handoff_pending
 fork without writable-run inheritance
 explicit takeover with fencing
 old plugin process fenced after schema migration
+resume without host Plan Mode restoration (Amendment A1):
+    state recovered/reattached, no new run/approval/commit,
+    run revision unchanged, ordinary continuation fail-closed
+    until /phase-plan re-entry restores mode to the same session
 ```
 
 ---
