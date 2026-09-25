@@ -1,0 +1,26 @@
+{
+  "name": "@switchboard/codex",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Switchboard adapter for Codex CLI: Phase Model Switcher session runtime (Phase 1).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vitest": "^3.2.4"
+  }
+}
