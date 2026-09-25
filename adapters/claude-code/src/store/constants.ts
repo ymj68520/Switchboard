@@ -6,7 +6,7 @@
  */
 
 /** The only schema version this binary can write. */
-export const SUPPORTED_SCHEMA_VERSION = 3;
+export const SUPPORTED_SCHEMA_VERSION = 4;
 
 /**
  * Store-level protocol version (distinct from schema and plugin versions).

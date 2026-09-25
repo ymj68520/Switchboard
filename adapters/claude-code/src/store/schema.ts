@@ -53,6 +53,27 @@ const SCHEMA_V2_TABLES = ["repositories", "workspaces", "session_bindings"] as c
 /** Planning-domain tables required once the store has reached schema v3. */
 const SCHEMA_V3_TABLES = ["planning_runs"] as const;
 
+/** Plan Memory tables required once the store has reached schema v4. */
+const SCHEMA_V4_TABLES = [
+  "memory_artifacts",
+  "memory_revisions",
+  "plan_snapshots",
+  "snapshot_members",
+  "plan_heads",
+] as const;
+
+/** Immutability triggers required once the store has reached schema v4. */
+const SCHEMA_V4_IMMUTABILITY_TRIGGERS = [
+  "memory_artifacts_no_update",
+  "memory_artifacts_no_delete",
+  "memory_revisions_no_update",
+  "memory_revisions_no_delete",
+  "plan_snapshots_no_update",
+  "plan_snapshots_no_delete",
+  "snapshot_members_no_update",
+  "snapshot_members_no_delete",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -195,11 +216,39 @@ function validateSchemaV3(db: StoreConnection | StoreTx, tables: Set<string>, pr
 }
 
 /**
+ * Structural Plan Memory checks for schema v4 (frozen plan §50/§E37): table
+ * presence, immutability triggers, and supporting indexes. Cheap sqlite_
+ * master lookups only — semantic snapshot validation (DAG, contract rules,
+ * JSON shape) runs at snapshot creation/read time in the memory primitives,
+ * so store open never scans history.
+ */
+function validateSchemaV4(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V4_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 4`);
+    }
+  }
+  for (const trigger of SCHEMA_V4_IMMUTABILITY_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`immutability trigger ${trigger} missing for schema version >= 4`);
+    }
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
  * must exist as a singleton. From version 2 the infrastructure-table
- * integrity checks apply as well.
+ * integrity checks apply as well; from version 4 the structural Plan Memory
+ * checks apply.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   const version = readSchemaVersion(db);
@@ -229,6 +278,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 3) {
     validateSchemaV3(db, tables, problems);
+  }
+  if (version >= 4) {
+    validateSchemaV4(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

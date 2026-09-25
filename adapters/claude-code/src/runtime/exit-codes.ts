@@ -71,6 +71,15 @@ const EXIT_CODE_BY_ERROR: Readonly<Record<RuntimeErrorCode, ExitCode>> = {
   STALE_RUN_REVISION: EXIT_CODES.domainState,
   INVALID_RUN_GOAL: EXIT_CODES.domainState,
   RUN_STATE_INVALID: EXIT_CODES.domainState,
+  MEMORY_ARTIFACT_NOT_FOUND: EXIT_CODES.domainState,
+  MEMORY_REVISION_NOT_FOUND: EXIT_CODES.domainState,
+  MEMORY_REVISION_CONFLICT: EXIT_CODES.domainState,
+  MEMORY_REVISION_INVALID: EXIT_CODES.domainState,
+  SNAPSHOT_NOT_FOUND: EXIT_CODES.domainState,
+  SNAPSHOT_INVALID: EXIT_CODES.domainState,
+  SECTION_DAG_INVALID: EXIT_CODES.domainState,
+  STALE_MEMORY_HEAD: EXIT_CODES.domainState,
+  MEMORY_HEAD_INVALID: EXIT_CODES.domainState,
 };
 
 export function exitCodeForError(code: RuntimeErrorCode): ExitCode {

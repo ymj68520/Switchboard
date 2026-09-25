@@ -6,6 +6,7 @@ import { openDatabase } from "../src/store/connection.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
+import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore, openPlanStore } from "../src/store/sqlite-store.js";
@@ -31,10 +32,17 @@ function makeSchema1Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    raw.exec("DROP TABLE IF EXISTS planning_runs");
-    raw.exec("DROP TABLE session_bindings");
-    raw.exec("DROP TABLE workspaces");
-    raw.exec("DROP TABLE repositories");
+    for (const table of ["plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
+      raw.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    for (const kind of ["update", "delete"]) {
+      for (const table of ["memory_artifacts", "memory_revisions", "plan_snapshots", "snapshot_members"]) {
+        raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+      }
+    }
+    raw.exec("DROP TABLE IF EXISTS session_bindings");
+    raw.exec("DROP TABLE IF EXISTS workspaces");
+    raw.exec("DROP TABLE IF EXISTS repositories");
     raw.exec("DELETE FROM schema_migrations WHERE version >= 2");
     raw.exec("DROP INDEX IF EXISTS idx_session_bindings_active_session");
     raw.exec("PRAGMA user_version = 1");
@@ -69,6 +77,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
           { version: 1, name: "initialize-plan-store" },
           { version: 2, name: "workspace-and-session-binding" },
           { version: 3, name: "planning-run-foundation" },
+          { version: 4, name: "plan-memory-foundation" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM phase2_sentinel").all(),
@@ -80,7 +89,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-3-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-4-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       // The backup captures the SOURCE state (schema 1 + sentinel).
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
@@ -121,6 +130,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
             createInitializeMigration({ generateStoreId: fixedClock().newId, nowIso: fixedClock().nowIso }),
             failing,
             createPlanningRunMigration(),
+            createPlanMemoryMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -141,7 +151,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(3);
+      expect(retry.getSchemaVersion()).toBe(4);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -157,7 +167,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       makeSchema1Store(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(3);
+        expect(store.getSchemaVersion()).toBe(4);
       } finally {
         store.close();
       }
@@ -201,11 +211,11 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       createSchema0Database(databasePath, "chain-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(3);
+        expect(store.getSchemaVersion()).toBe(4);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
         ) as { version: number }[];
-        expect(history.map((h) => h.version)).toEqual([1, 2, 3]);
+        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -214,7 +224,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
         store.close();
       }
       expect(publishedBackups(backupsDir)).toHaveLength(1);
-      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-3-/);
+      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-4-/);
     } finally {
       removeTempPluginDataRoot(root);
     }

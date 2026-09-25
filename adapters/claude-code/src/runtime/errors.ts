@@ -42,7 +42,17 @@ export type RuntimeErrorCode =
   | "INVALID_RUN_TRANSITION"
   | "STALE_RUN_REVISION"
   | "INVALID_RUN_GOAL"
-  | "RUN_STATE_INVALID";
+  | "RUN_STATE_INVALID"
+  // Phase 5 — Plan Memory immutable revision model (exit 6)
+  | "MEMORY_ARTIFACT_NOT_FOUND"
+  | "MEMORY_REVISION_NOT_FOUND"
+  | "MEMORY_REVISION_CONFLICT"
+  | "MEMORY_REVISION_INVALID"
+  | "SNAPSHOT_NOT_FOUND"
+  | "SNAPSHOT_INVALID"
+  | "SECTION_DAG_INVALID"
+  | "STALE_MEMORY_HEAD"
+  | "MEMORY_HEAD_INVALID";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {

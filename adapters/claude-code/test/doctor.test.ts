@@ -220,8 +220,8 @@ describe("doctor integration (injected probes)", () => {
         env: { CLAUDE_PLUGIN_DATA: root },
         inspectStore: () => ({
           status: "too_new",
-          schemaVersion: 4,
-          supported: 3,
+          schemaVersion: 5,
+          supported: 4,
           databasePath: path.join(root, "store", "phase-plan.sqlite3"),
         }),
       }));
@@ -279,14 +279,14 @@ describe("doctor integration (injected probes)", () => {
         env: { CLAUDE_PLUGIN_DATA: root },
         inspectStore: () => ({
           status: "ready",
-          schemaVersion: 3,
-          supported: 3,
+          schemaVersion: 4,
+          supported: 4,
           databasePath: path.join(root, "store", "phase-plan.sqlite3"),
           storeId: "store-1234",
         }),
       }));
       expect(report.checks.planStore.status).toBe("PASS");
-      expect(report.checks.planStore.message).toContain("STORE READY schema=3");
+      expect(report.checks.planStore.message).toContain("STORE READY schema=4");
       expect(report.checks.planStore.detail).toMatchObject({ storeId: "store-1234" });
       expect(doctorExitCode(report)).toBe(0);
     } finally {

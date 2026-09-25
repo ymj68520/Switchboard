@@ -8,6 +8,7 @@ import type { StoreTx } from "../transaction.js";
 import { createInitializeMigration } from "./001-initialize.js";
 import { createWorkspaceBindingMigration } from "./002-workspace-session-binding.js";
 import { createPlanningRunMigration } from "./003-planning-run-foundation.js";
+import { createPlanMemoryMigration } from "./004-plan-memory-foundation.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -64,5 +65,10 @@ export interface ProductionMigrationDeps {
  * `1→2 workspace-and-session-binding`, `2→3 planning-run-foundation`.
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
-  return [createInitializeMigration(deps), createWorkspaceBindingMigration(), createPlanningRunMigration()];
+  return [
+    createInitializeMigration(deps),
+    createWorkspaceBindingMigration(),
+    createPlanningRunMigration(),
+    createPlanMemoryMigration(),
+  ];
 }
