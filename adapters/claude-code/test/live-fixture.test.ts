@@ -1,11 +1,20 @@
 /**
- * Live-host fixture seam (Phase 7 live validation only).
+ * Live-host fixture seam (Phase 7/8 live validation only).
  *
- * Prepares a legitimate awaiting_approval Proposal on the CURRENT active run
- * of the host-managed store, using the same application services the runtime
- * itself uses. It never fabricates authorization: it only exercises the
- * domain's own prepare path. The test is inert unless PHASE_PLAN_LIVE_STORE
- * points at the live plugin data root, so the normal suite skips it.
+ * Phase 7 mode (default): prepares a legitimate awaiting_approval Proposal on
+ * the CURRENT active run of the host-managed store, using the same
+ * application services the runtime itself uses. It never fabricates
+ * authorization: it only exercises the domain's own prepare path.
+ *
+ * Phase 8 mode (PHASE_PLAN_LIVE_FIXTURE_MODE=phase8): additionally commits
+ * the prepared checkpoint through the Phase 6 engine using the TEST-ONLY
+ * authorization factory (makeTestUserAuthorization — the sanctioned fixture
+ * seam, never exported by any production surface), so the live run carries a
+ * real HEAD commit/snapshot with a hard constraint for compaction-recovery
+ * validation, then leaves a second proposal awaiting approval.
+ *
+ * The test is inert unless PHASE_PLAN_LIVE_STORE points at the live plugin
+ * data root, so the normal suite skips it.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -15,11 +24,17 @@ import { describe, expect, it } from "vitest";
 import { createPlanCommitEngine } from "../src/application/plan-commit-engine.js";
 import { createProposalService } from "../src/application/proposal-service.js";
 import { createPlanningRunService } from "../src/application/planning-run-service.js";
+import { createStoreContextSource } from "../src/application/context-read-model.js";
+import { assembleContext } from "../src/context/assembler.js";
+import { buildRecoveryCapsule } from "../src/context/capsule.js";
+import { getHeadSnapshotRecord } from "../src/store/plan-memory.js";
 import { initializePlanStore, type PlanStore } from "../src/store/sqlite-store.js";
 import { systemStoreClock } from "../src/store/clock.js";
+import { makeTestUserAuthorization } from "./proposal-helpers.js";
 
 const liveRoot = process.env.PHASE_PLAN_LIVE_STORE;
 const tag = process.env.PHASE_PLAN_LIVE_FIXTURE_TAG ?? "1";
+const phase8 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase8";
 const d = liveRoot === undefined ? describe.skip : describe;
 
 d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
@@ -60,17 +75,101 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
       }
 
       const proposals = createProposalService(store, clock);
-      const prepared = proposals.prepareProposal({
-        runId: current!.runId,
-        workspaceId: current!.workspaceId,
-        sessionId: current!.sessionId,
-        bindingGeneration: current!.generation,
-        expectedRunRevision: revision,
-        type: "design_checkpoint",
-        scope: { kind: "architecture" },
-        title: `Live-host validation checkpoint ${tag}`,
-        summary: "Awaiting proposal prepared outside the host for live Formal Approval validation.",
-        changes: [
+      const prepare = (changes: Parameters<typeof proposals.prepareProposal>[0]["changes"], title: string) =>
+        proposals.prepareProposal({
+          runId: current!.runId,
+          workspaceId: current!.workspaceId,
+          sessionId: current!.sessionId,
+          bindingGeneration: current!.generation,
+          expectedRunRevision: revision,
+          type: "design_checkpoint",
+          scope: { kind: "architecture" },
+          title,
+          summary: "Prepared by the live-host validation fixture.",
+          changes,
+        });
+
+      if (phase8) {
+        // Phase 8 §58 fixture: one COMMITTED hard constraint (engine commit
+        // via the TEST-ONLY authorization factory), then one AWAITING
+        // proposal — the exact state the Recovery Capsule must reconstruct
+        // after real compaction.
+        const checkpoint = prepare(
+          [
+            {
+              op: "ADD_CONSTRAINT",
+              content: {
+                source: "user",
+                statement: `Live Phase 8 compaction validation constraint ${tag}`,
+                severity: "hard",
+                status: "active",
+              },
+              compactProjection: `live-constraint-${tag}`,
+            },
+          ],
+          `Live compaction constraint checkpoint ${tag}`,
+        );
+        const engine = createPlanCommitEngine(store, clock);
+        const committed = engine.commitAuthorizedProposal({
+          runId: current!.runId,
+          workspaceId: current!.workspaceId,
+          sessionId: current!.sessionId,
+          bindingGeneration: current!.generation,
+          authorization: makeTestUserAuthorization({
+            proposalId: checkpoint.proposal.proposalId,
+            proposalRevision: checkpoint.proposal.revision,
+            proposalHash: checkpoint.proposal.proposalHash,
+          }),
+        });
+        revision = committed.runRevision ?? revision;
+
+        const awaiting = prepare(
+          [
+            {
+              op: "ADD_DECISION",
+              content: {
+                title: `Live compaction awaiting decision ${tag}`,
+                statement: "Decision content prepared by the live-host validation fixture.",
+                rationale: "leave an awaiting proposal visible to the recovery capsule",
+                alternatives: ["no-op"],
+                consequences: ["visible in working.awaitingProposal only"],
+                scope: "validation",
+                supportingRefs: [],
+              },
+              compactProjection: `live-awaiting-${tag}`,
+            },
+          ],
+          `Live compaction awaiting proposal ${tag}`,
+        );
+
+        const source = createStoreContextSource(store);
+        const context = assembleContext(source, current!.runId);
+        const capsule = buildRecoveryCapsule(context);
+        const headRefs = getHeadSnapshotRecord(store, current!.runId);
+        const constraintRef = headRefs?.refs.find((ref) => ref.kind === "constraint") ?? null;
+        console.log(
+          `LIVE_FIXTURE ${JSON.stringify({
+            mode: "phase8",
+            runId: current!.runId,
+            commitId: committed.commitId,
+            snapshotId: committed.snapshotId,
+            constraintRef,
+            epoch: context.epoch,
+            awaiting: {
+              proposalId: awaiting.proposal.proposalId,
+              proposalRevision: awaiting.proposal.revision,
+              proposalHash: awaiting.proposal.proposalHash,
+            },
+            capsule: capsule.text,
+          })}`,
+        );
+        expect(committed.commitId).toBeTruthy();
+        expect(awaiting.proposal.proposalId).toBeTruthy();
+        return;
+      }
+
+      const prepared = prepare(
+        [
           {
             op: "ADD_DECISION",
             content: {
@@ -85,11 +184,12 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
             compactProjection: `live-validation-${tag}`,
           },
         ],
-      });
+        `Live-host validation checkpoint ${tag}`,
+      );
 
-      createPlanCommitEngine(store, clock);
       console.log(
         `LIVE_FIXTURE ${JSON.stringify({
+          mode: "phase7",
           runId: current!.runId,
           proposalId: prepared.proposal.proposalId,
           proposalRevision: prepared.proposal.revision,
