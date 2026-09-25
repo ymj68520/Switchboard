@@ -57,13 +57,45 @@ export function definePlanStoreContractSuite(
     return run;
   }
 
+  /** World in the architecture stage with a user goal set (Phase 2C). */
+  async function architectureWorld(fixture: ParityFixture, sessionID = "ses_parity") {
+    fixture.controller.issueStartAdmission(sessionID);
+    let run = (await fixture.controller.startOrResume(sessionID, "Parity architecture goal")).run;
+    await fixture.controller.requestArchitecture(sessionID);
+    run = (await fixture.store.getRun(run.id)) as PlanningRun;
+    return run;
+  }
+
+  const ARCH_DRAFT = {
+    kind: "add_architecture" as const,
+    content: {
+      architecture: {
+        summary: "Parity architecture",
+        components: [{ name: "Core", summary: "kernel" }],
+        boundaries: [{ name: "Edge", description: "single entry" }],
+        dataFlows: [{ from: "UI", to: "Core", description: "commands" }],
+        principles: [{ statement: "committed memory is authoritative" }],
+      },
+    },
+  };
+
+  const COMPLETION_CHANGES = [
+    ARCH_DRAFT,
+    {
+      kind: "add_constraint" as const,
+      content: { constraint: { statement: "single writer", source: "environment" as const, severity: "hard" as const } },
+    },
+    { kind: "complete_architecture" as const },
+  ];
+
   async function prepareAwaiting(
     fixture: ParityFixture,
     sessionID: string,
     changes: unknown[],
+    type: "design_checkpoint" | "architecture_completion" = "design_checkpoint",
   ) {
     const prepared = await fixture.controller.prepareProposal(sessionID, {
-      type: "design_checkpoint",
+      type,
       scope: { type: "architecture" },
       title: "Parity proposal",
       summary: "s",
@@ -183,9 +215,10 @@ export function definePlanStoreContractSuite(
           title: "Dependent",
           objective: "o",
           dependencies: [SectionIDs.from(9)],
-          status: "pending",
+          status: "active",
           validation: "valid",
           currentRevision: 1,
+          approvedRevision: 1,
         },
       ],
       sectionRevisions: [
@@ -429,7 +462,7 @@ export function definePlanStoreContractSuite(
     await fixture.controller.recordApprovalAndCommit("ses_parity", prepared.proposal.id, {
       proposalID: prepared.proposal.id,
       proposalRevision: 1,
-      proposalHash: prepared.proposal.hash ?? "",
+      proposalHash: prepared.hash ?? "",
       oneShot: true,
       requestedAt: FIXED,
     });
@@ -437,6 +470,155 @@ export function definePlanStoreContractSuite(
     expect(types.indexOf("approval.recorded")).toBeGreaterThan(-1);
     expect(types.indexOf("transaction.committed")).toBeLessThan(types.indexOf("head.moved"));
     expect(types[types.length - 1]).toBe("head.moved");
+    await fixture.close();
+  });
+
+  // -- Phase 2C: the architecture workflow consumes the same store contract --
+
+  it(`[${name}] commits the initial Architecture as ARCH@1 approved and stays in architecture`, async () => {
+    const fixture = await createFixture();
+    const run = await architectureWorld(fixture);
+    const { prepared } = await prepareAwaiting(fixture, "ses_parity", [ARCH_DRAFT]);
+    await fixture.controller.recordApprovalAndCommit("ses_parity", prepared.proposal.id, {
+      proposalID: prepared.proposal.id,
+      proposalRevision: 1,
+      proposalHash: prepared.hash ?? "",
+      oneShot: true,
+      requestedAt: FIXED,
+    });
+    const architecture = await fixture.store.getArchitecture(run.id);
+    expect(architecture?.id).toBe("ARCH");
+    expect(architecture?.revision).toBe(1);
+    expect(architecture?.status).toBe("approved");
+    const after = await fixture.store.getRun(run.id);
+    expect(after?.stage).toBe("architecture");
+    expect(after?.architecture).toEqual({ id: "ARCH", revision: 1 });
+    expect((await fixture.store.getHeadSnapshot(run.id))?.state.architectureRevision).toBe(1);
+    // A second add is refused on both stores.
+    await expect(
+      fixture.controller.prepareProposal("ses_parity", {
+        type: "design_checkpoint",
+        scope: { type: "architecture" },
+        title: "duplicate",
+        summary: "s",
+        changes: [ARCH_DRAFT] as never,
+      }),
+    ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "invalid_scope");
+    await fixture.close();
+  });
+
+  it(`[${name}] commits Architecture completion and stage=detail as ONE transaction`, async () => {
+    const fixture = await createFixture();
+    const run = await architectureWorld(fixture);
+    const { prepared } = await prepareAwaiting(fixture, "ses_parity", COMPLETION_CHANGES, "architecture_completion");
+    const result = await fixture.controller.recordApprovalAndCommit("ses_parity", prepared.proposal.id, {
+      proposalID: prepared.proposal.id,
+      proposalRevision: 1,
+      proposalHash: prepared.hash ?? "",
+      oneShot: true,
+      requestedAt: FIXED,
+    });
+    expect(result.commit.changes.map((c) => c.kind)).toEqual([
+      "add_architecture",
+      "add_constraint",
+      "complete_architecture",
+    ]);
+    const after = await fixture.store.getRun(run.id);
+    expect(after?.stage).toBe("detail");
+    expect(after?.architecture).toEqual({ id: "ARCH", revision: 1 });
+    expect(after?.constraints.map((c) => c.id)).toEqual(["CON-001"]);
+    expect((await fixture.store.getArchitecture(run.id))?.components.map((c) => c.name)).toEqual(["Core"]);
+    // Stage event and commit are durable in the same publication.
+    const types = (await fixture.store.listEvents(run.id)).map((e) => e.detail.type);
+    expect(types.lastIndexOf("run.stage_changed")).toBeGreaterThan(-1);
+    expect(types.lastIndexOf("transaction.committed")).toBeGreaterThan(types.lastIndexOf("run.stage_changed"));
+    expect(types[types.length - 1]).toBe("head.moved");
+    await fixture.close();
+  });
+
+  it(`[${name}] keeps the architecture → detail transition atomic on completion failure`, async () => {    const fixture = await createFixture();
+    const run = await architectureWorld(fixture);
+    // A dangling basedOn reference makes freeze fail; nothing else changes.
+    await expect(
+      fixture.controller.prepareProposal("ses_parity", {
+        type: "architecture_completion",
+        scope: { type: "architecture" },
+        title: "dangling basedOn",
+        summary: "s",
+        changes: [
+          {
+            kind: "add_architecture" as const,
+            content: { architecture: { ...ARCH_DRAFT.content.architecture, basedOn: ["DEC-099"] } },
+          },
+          { kind: "complete_architecture" as const },
+        ] as never,
+      }),
+    ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "unknown_reference");
+    const after = await fixture.store.getRun(run.id);
+    expect(after?.stage).toBe("architecture");
+    expect(after?.architecture).toBeUndefined();
+    expect(await fixture.store.listCommits(run.id)).toHaveLength(0);
+    await fixture.close();
+  });
+
+  // -- Phase 2D: the Section DAG consumes the same store contract ------------
+
+  it(`[${name}] commits the initial Section DAG + detail admission as ONE transaction`, async () => {
+    const fixture = await createFixture();
+    // Reach detail through the real completion flow, then decompose.
+    const run = await architectureWorld(fixture);
+    const completion = await fixture.controller.prepareProposal("ses_parity", {
+      type: "architecture_completion",
+      scope: { type: "architecture" },
+      title: "Parity architecture",
+      summary: "s",
+      changes: [
+        {
+          kind: "add_architecture",
+          content: {
+            architecture: { summary: "Parity arch", components: [{ name: "Core", summary: "kernel" }], boundaries: [], dataFlows: [], principles: [] },
+          },
+        },
+        { kind: "complete_architecture" },
+      ] as never,
+    });
+    const completionBegun = await fixture.controller.beginProposalApproval("ses_parity", completion.proposal.id);
+    await fixture.controller.recordApprovalAndCommit("ses_parity", completion.proposal.id, completionBegun.request);
+
+    const prepared = await fixture.controller.prepareSectionDecomposition("ses_parity", {
+      sections: [
+        { key: "memory", title: "Plan Memory", objective: "state" },
+        { key: "reader", title: "Reader", objective: "reads", dependsOn: ["memory"] },
+      ],
+      initialSection: "reader",
+    });
+    // Canonical order = draft order; ids from the durable allocator.
+    expect(prepared.proposal.changes[0]).toMatchObject({ kind: "add_section", section: { id: "SEC-001", status: "pending" } });
+    expect(prepared.proposal.changes[1]).toMatchObject({ kind: "add_section", section: { id: "SEC-002", dependencies: ["SEC-001"] } });
+    expect(prepared.proposal.changes[2]).toEqual({ kind: "select_initial_section", section: { id: "SEC-002" } });
+    expect((prepared.proposal.scope as { revision: number }).revision).toBe(1);
+
+    const begun = await fixture.controller.beginProposalApproval("ses_parity", prepared.proposal.id);
+    const result = await fixture.controller.recordApprovalAndCommit("ses_parity", prepared.proposal.id, begun.request);
+    expect(result.commit.changes.map((c) => c.kind)).toEqual([
+      "add_section",
+      "add_section",
+      "select_initial_section",
+    ]);
+    const after = await fixture.store.getRun(run.id);
+    expect(after?.stage).toBe("detail"); // no new stage transition
+    expect(after?.sections.map((sec) => sec.id)).toEqual(["SEC-001", "SEC-002"]);
+    expect(after?.activeWork).toEqual({ type: "section", id: "SEC-002" });
+    const snapshot = await fixture.store.getHeadSnapshot(run.id);
+    expect(snapshot?.state.sectionRoots?.map((r) => r.id)).toEqual(["SEC-001", "SEC-002"]);
+    expect(snapshot?.state.sectionRevisions).toEqual({}); // no fake revisions
+    // Initial-only: a second decomposition is refused on both stores.
+    await expect(
+      fixture.controller.prepareSectionDecomposition("ses_parity", {
+        sections: [{ key: "x", title: "X", objective: "x" }],
+        initialSection: "x",
+      }),
+    ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "capability_not_available");
     await fixture.close();
   });
 

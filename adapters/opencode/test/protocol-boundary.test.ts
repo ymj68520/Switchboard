@@ -128,10 +128,11 @@ describe("controller-side authorization (test 8)", () => {
       }),
     ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "capability_not_available");
 
-    // request_synthesis is only granted in synthesis — here it IS synthesis,
-    // so the gate passes and the deterministic finalization failures surface.
+    // request_synthesis is WITHHELD in reachable synthesis state (Phase 2E2
+    // §30): the old provisional synthesis→final shortcut must never bypass
+    // the real Synthesis workflow.
     await expect(controller.requestSynthesis("ses_gate")).rejects.toSatisfy(
-      (e: unknown) => isUltraPlanError(e) && e.code === "finalization_blocked",
+      (e: unknown) => isUltraPlanError(e) && e.code === "capability_not_available",
     );
 
     // From a discovery run, request_synthesis is capability-blocked.
@@ -398,14 +399,15 @@ describe("proposal intent boundary (tests 9/10)", () => {
     expect(prepared.hash).toMatch(/^[0-9a-f]{64}$/);
     expect(prepared.proposal.hash).toBe(prepared.hash);
 
-    // Scope validation: unknown section.
+    // Scope validation: unknown section (the proposal scope must name a
+    // committed Section of the run).
     await expect(
       controller.prepareProposal("ses_prop", {
         type: "design_checkpoint",
         scope: { type: "section", sectionID: "SEC-099" },
         title: "bad scope",
         summary: "s",
-        changes: [{ kind: "complete_section" }],
+        changes: [{ kind: "add_decision", content: { title: "t", statement: "s", rationale: "r" } }],
       }),
     ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "invalid_scope");
   });
@@ -436,7 +438,11 @@ describe("proposal intent boundary (tests 9/10)", () => {
         summary: "s",
         changes: [{ kind: "complete_architecture" }],
       }),
-    ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "invalid_scope");
+    ).rejects.toSatisfy(
+      (e: unknown) =>
+        isUltraPlanError(e) &&
+        (e.code === "invalid_scope" || e.code === "proposal_type_invalid"),
+    );
   });
 
   it("freezes proposals: content-addressed hash, immutable at the boundary (test 10)", async () => {
@@ -478,16 +484,12 @@ describe("proposal intent boundary (tests 9/10)", () => {
 });
 
 describe("synthesis gate", () => {
-  it("fails deterministically with the finalization failures while the plan is incomplete", async () => {
+  it("request_synthesis is withheld in reachable synthesis state (Phase 2E2 §30) — the finalization predicate itself stays covered by finalization.test.ts", async () => {
     const { store, controller } = setup();
     await runInStage(store, controller, "ses_syn", "synthesis");
 
     await expect(controller.requestSynthesis("ses_syn")).rejects.toSatisfy(
-      (error: unknown) =>
-        isUltraPlanError(error) &&
-        error.code === "finalization_blocked" &&
-        Array.isArray(error.detail?.failures) &&
-        (error.detail?.failures as string[]).includes("architecture_not_approved"),
+      (error: unknown) => isUltraPlanError(error) && error.code === "capability_not_available",
     );
   });
 });

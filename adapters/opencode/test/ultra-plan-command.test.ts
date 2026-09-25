@@ -168,6 +168,7 @@ describe("storage boundary hard edges", () => {
         "",
         "Architecture: not started",
         "Sections: 0",
+        "Active work: none",
         "Open blocking questions: 0",
         "Blocking conflicts: 0",
       ].join("\n"),

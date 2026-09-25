@@ -442,11 +442,12 @@ describe("completion / reopen authority audit (tests 19/20)", () => {
       run = await store.saveRun(run);
     }
 
-    // No committed sections exist, so a completion request fails scope
-    // validation — and nothing anywhere is marked complete.
+    // No committed sections exist, so the detail substate withholds the
+    // section surface entirely (Phase 2D §23) — the request cannot even reach
+    // scope validation, and nothing anywhere is marked complete.
     await expectErrorCode(
-      controller.requestCompletion("ses_rc", { sectionID: "SEC-001" }),
-      "invalid_scope",
+      controller.requestCompletion("ses_rc", { kind: "section" }),
+      "capability_not_available",
     );
     expect(await store.getSection(run.id, SectionIDs.cast("SEC-001"))).toBeUndefined();
     expect(await store.listSections(run.id)).toHaveLength(0);
@@ -462,11 +463,14 @@ describe("completion / reopen authority audit (tests 19/20)", () => {
       run = await store.saveRun(run);
     }
 
-    // Reopen targets approved artifacts, which only exist after commits —
-    // today it fails deterministically and mutates nothing.
+    // Reopen targets approved artifacts, which only exist after commits. With
+    // no committed sections the detail substate withholds the reopen surface
+    // entirely (Phase 2D §23; Phase 2G grants request_reopen only in the
+    // section-ready substates) — the request fails deterministically and
+    // mutates nothing.
     await expectErrorCode(
-      controller.requestReopen("ses_rr", { ref: { kind: "section", id: "SEC-001" } }),
-      "unknown_reference",
+      controller.requestReopen("ses_rr", { sectionID: "SEC-001" }),
+      "capability_not_available",
     );
     expect(await store.listSections(run.id)).toHaveLength(0);
     await expectErrorCode(store.commitTransaction(COMMIT_INPUT), "unknown_reference");

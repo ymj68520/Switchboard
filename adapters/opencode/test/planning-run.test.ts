@@ -91,13 +91,16 @@ describe("one active run per session", () => {
 
   it("resumes the existing active run instead of creating another (controller-level)", async () => {
     const { controller } = setup();
-    const first = await admittedStart(controller, "ses_a");
+    // Phase 2C goal semantics: the goal is USER-authored via /ultra-plan
+    // arguments. A resume with arguments fills an EMPTY goal but NEVER
+    // overwrites an existing one.
+    const first = await admittedStart(controller, "ses_a", "the original goal");
     const second = await admittedStart(controller, "ses_a", "a changed goal must not apply");
 
     expect(second.created).toBe(false);
     expect(second.run.id).toBe(first.run.id);
-    // Resuming reports the existing run; it does not overwrite its goal.
     expect(second.run.goal).toEqual(first.run.goal);
+    expect(second.run.goal.statement).toBe("the original goal");
   });
 
   it("allows a new run only after the previous run completed", async () => {
@@ -220,6 +223,7 @@ describe("lifecycle transitions", () => {
       "",
       "Architecture: not started",
       "Sections: 0",
+      "Active work: none",
       "Open blocking questions: 0",
       "Blocking conflicts: 0",
     ].join("\n");

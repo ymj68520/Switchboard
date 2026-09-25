@@ -81,18 +81,20 @@ function seedWorld(): Seed {
       title: "Retrieval",
       objective: "reads from memory",
       dependencies: [SectionIDs.from(1)],
-      status: "pending",
+      status: "active",
       validation: "valid",
       currentRevision: 1,
+      approvedRevision: 1,
     },
     {
       id: SectionIDs.from(3),
       title: "Broken",
       objective: "has incomplete deps",
       dependencies: [SectionIDs.from(2)],
-      status: "pending",
+      status: "active",
       validation: "valid",
       currentRevision: 1,
+      approvedRevision: 1,
     },
   ];
   const sectionRevisions: SectionRevision[] = sections.map((section) => ({
@@ -494,7 +496,10 @@ describe("change application semantics (tests 23-27)", () => {
     const section = await store.getSection(run.id, SectionIDs.from(1));
     expect(section?.status).toBe("reopened"); // approved → reopened inside the commit
     expect(section?.currentRevision).toBe(2);
-    expect(section?.approvedRevision).toBe(1);
+    // Phase 2E1 §17/§18: approvedRevision means "latest approved checkpoint" —
+    // the amendment commit moves the pointer to the new revision (it is NOT
+    // Section completion, which stays a separate Phase 2E2 approval).
+    expect(section?.approvedRevision).toBe(2);
     const downstream = await store.getSection(run.id, SectionIDs.from(2));
     expect(downstream?.validation).toBe("needs_review"); // propagated
   });
@@ -566,20 +571,18 @@ describe("completion through PlanCommit only (tests 28-30)", () => {
     ).rejects.toSatisfy((e: unknown) => failCodes(e).includes("dependency_incomplete"));
   });
 
-  it("complete_section and complete_architecture succeed ONLY through the commit (tests 29/30)", async () => {
+  it("complete_section succeeds ONLY through the commit (test 28/29; the architecture completion path is frozen in Phase 2C — complete_architecture exists only inside architecture_completion proposals)", async () => {
     const { store, controller, run } = await detailedWorld();
-    // Before: SEC-002 pending, architecture awaiting_approval.
-    expect((await store.getSection(run.id, SectionIDs.from(2)))?.status).toBe("pending");
+    // Before: SEC-002 active (checkpointed but incomplete — a checkpoint is
+    // not a completion).
+    expect((await store.getSection(run.id, SectionIDs.from(2)))?.status).toBe("active");
 
     const proposal = await controller.prepareProposal("ses_tx", {
       type: "section_completion",
       scope: { type: "section", sectionID: "SEC-002" },
       title: "Complete retrieval",
       summary: "s",
-      changes: [
-        { kind: "complete_section", ref: { kind: "section", id: "SEC-002" } },
-        { kind: "complete_architecture" },
-      ],
+      changes: [{ kind: "complete_section", ref: { kind: "section", id: "SEC-002" } }],
     });
     const begun = await controller.beginProposalApproval("ses_tx", proposal.proposal.id);
     await controller.recordApprovalAndCommit("ses_tx", proposal.proposal.id, begun.request);
@@ -587,10 +590,25 @@ describe("completion through PlanCommit only (tests 28-30)", () => {
     const section = await store.getSection(run.id, SectionIDs.from(2));
     expect(section?.status).toBe("approved");
     expect(section?.approvedRevision).toBe(1);
-    const architecture = await store.getArchitecture(run.id);
-    expect(architecture?.status).toBe("approved");
+    // Section completion never moves the run out of detail.
     const after = await store.getRun(run.id);
-    expect(after?.architecture).toEqual({ id: "ARCH", revision: 1 });
+    expect(after?.stage).toBe("detail");
+  });
+
+  it("complete_architecture is only valid inside architecture_completion proposals (Phase 2C boundary)", async () => {
+    const { controller } = await detailedWorld();
+    await expect(
+      controller.prepareProposal("ses_tx", {
+        type: "section_completion",
+        scope: { type: "section", sectionID: "SEC-002" },
+        title: "smuggled completion",
+        summary: "s",
+        changes: [
+          { kind: "complete_section", ref: { kind: "section", id: "SEC-002" } },
+          { kind: "complete_architecture" },
+        ],
+      }),
+    ).rejects.toSatisfy((e: unknown) => isUltraPlanError(e) && e.code === "proposal_type_invalid");
   });
 });
 
@@ -621,11 +639,21 @@ describe("atomicity: multi-change rollback + fault injection (test 34, §30)", (
   it("an invalid second change rolls back a valid first staged change", async () => {
     const { store, controller, run } = await detailedWorld();
     // Change A (valid): add_decision. Change B (invalid): complete_section on
-    // SEC-003 whose dependency SEC-002 is pending.
-    const { prepared } = await prepareAwaiting(controller, "ses_tx", [
-      DECISION_DRAFT,
-      { kind: "complete_section", ref: { kind: "section", id: "SEC-003" } },
-    ]);
+    // SEC-003 whose dependency SEC-002 is not approved. The proposal is a
+    // properly-typed section_completion so the change passes freeze-time
+    // resolution and fails in the ENGINE's staged validation.
+    const prepared = await controller.prepareProposal("ses_tx", {
+      type: "section_completion",
+      scope: { type: "section", sectionID: "SEC-003" },
+      title: "Tx proposal",
+      summary: "s",
+      changes: [
+        DECISION_DRAFT,
+        { kind: "complete_section", ref: { kind: "section", id: "SEC-003" } },
+      ] as never,
+    });
+    const begun = await controller.beginProposalApproval("ses_tx", prepared.proposal.id);
+    await controller.recordApproval("ses_tx", prepared.proposal.id, begun.request);
     try {
       await store.commitTransaction({
         planID: run.id,

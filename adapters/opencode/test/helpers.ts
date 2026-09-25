@@ -1,9 +1,8 @@
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import type { Evidence } from "../src/repository/evidence.js";
-import { EvidenceIDs, SectionIDs } from "../src/core/ids.js";
+import { EvidenceIDs } from "../src/core/ids.js";
 import type { EvidenceID, SectionID } from "../src/core/ids.js";
-import type { FinalizationInput } from "../src/core/invariants.js";
 import type { Architecture, Section } from "../src/core/types.js";
 
 export function section(init: { id: SectionID } & Partial<Section>): Section {
@@ -50,20 +49,6 @@ export function approvedArchitecture(): Architecture {
     principles: [],
     unresolved: [],
     basedOn: [],
-  };
-}
-
-export function finalizationInput(
-  overrides: Partial<FinalizationInput> = {},
-): FinalizationInput {
-  const approved = section({ id: SectionIDs.from(1), status: "approved" });
-  return {
-    architecture: approvedArchitecture(),
-    sections: [approved],
-    openQuestions: [],
-    conflicts: [],
-    evidence: [],
-    ...overrides,
   };
 }
 
