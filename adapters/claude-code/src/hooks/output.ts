@@ -105,9 +105,9 @@ export function blockPrompt(reason: string): HookOutput {
   return jsonOutput({ decision: "block", reason });
 }
 
-/** The frozen UserPromptSubmit drift-guard reason (directive §39). */
+/** The frozen UserPromptSubmit drift-guard reason (Amendment A1 §9). */
 export const DRIFT_GUARD_REASON =
-  "An active Phase Plan run requires Claude Plan Mode. Invoke /phase-plan to restore planning mode.";
+  "An active Phase Plan run was recovered, but Claude Code did not restore Plan Mode. Invoke /phase-plan to resume planning.";
 
 /** The frozen ExitPlanMode deny reason (directive §41). */
 export const EXIT_PLAN_MODE_REASON =

@@ -122,8 +122,17 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
     `run=${attached.run.runId}`,
     `stage=${attached.run.stage}`,
     `head=${head === null ? "none" : head.resultingSnapshotId}`,
-  ].join("\n");
-  return contextOutput("SessionStart", context);
+  ];
+  // Amendment A1 §7: SessionStart recovers planning STATE, never the host's
+  // Plan Mode. When the mode is missing the recovered run stays fail-closed
+  // (UserPromptSubmit/PreToolUse guards) until /phase-plan re-entry.
+  if (input.permissionMode !== "plan") {
+    context.push(
+      "Phase Plan run recovered.",
+      "Claude Plan Mode must be restored by invoking /phase-plan.",
+    );
+  }
+  return contextOutput("SessionStart", context.join("\n"));
 }
 
 // ---------------------------------------------------------------------------

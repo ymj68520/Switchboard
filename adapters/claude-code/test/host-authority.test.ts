@@ -152,7 +152,8 @@ describe("EntryIntentV1 (directive §10/§11)", () => {
     try {
       const secret = loadHostSecret(root).key;
       const token = issueEntryIntent(secret, { sessionId: "S1", promptId: "P1" });
-      expect(token).not.toContain("S1");
+      // opaque to casual reading: not directly JSON, only decodable+verifiable
+      expect(() => JSON.parse(token)).toThrow();
       const intent = verifyEntryIntent(secret, token);
       expect(intent).toEqual({ version: 1, sessionId: "S1", promptId: "P1", commandName: "phase-plan" });
       expect(entryIntentIsCurrent(intent, { sessionId: "S1", promptId: "P1" })).toBe(true);
@@ -221,7 +222,7 @@ describe("HostContextEnvelopeV1 (directive §17–§23)", () => {
   it("round-trips through the opaque token and strips reserved fields from the input hash", () => {
     const secret = loadHostSecret(makeTempPluginDataRoot()).key;
     const token = encodeToken(secret, envelope());
-    expect(token).not.toContain("S1");
+    expect(() => JSON.parse(token)).toThrow();
     const verified = verifyHostContext(secret, token);
     expect(verified.sessionId).toBe("S1");
     expect(verified.toolUseId).toBe("TU1");
