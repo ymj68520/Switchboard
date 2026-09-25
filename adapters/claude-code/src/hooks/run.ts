@@ -28,6 +28,7 @@ import { loadHostSecret } from "../host/secret.js";
 import { HookInputError } from "./parse.js";
 import {
   parsePermissionRequestInput,
+  parsePostToolUseInput,
   parsePreToolUseInput,
   parseSessionEndInput,
   parseSessionStartInput,
@@ -37,6 +38,7 @@ import {
 import { blockPrompt, denyPermissionRequest, renderHookOutput } from "./output.js";
 import {
   handlePermissionRequest,
+  handlePostToolUse,
   handlePreToolUse,
   handleSessionEnd,
   handleSessionStart,
@@ -51,6 +53,7 @@ export const HOOK_EVENTS = [
   "UserPromptSubmit",
   "UserPromptExpansion",
   "PreToolUse",
+  "PostToolUse",
   "PermissionRequest",
 ] as const;
 
@@ -141,6 +144,10 @@ export async function runHook(options: {
           stdout = renderHookOutput(await handlePreToolUse(deps, parsePreToolUseInput(parsed)));
           break;
         }
+        case "PostToolUse": {
+          stdout = renderHookOutput(await handlePostToolUse(deps, parsePostToolUseInput(parsed)));
+          break;
+        }
         case "PermissionRequest": {
           stdout = renderHookOutput(handlePermissionRequest(deps, parsePermissionRequestInput(parsed)));
           break;
@@ -163,7 +170,11 @@ function failClosed(event: HookEvent): HookRunResult {
   switch (event) {
     case "SessionStart":
     case "SessionEnd":
-      // Advisory: degrade silently, never break the session lifecycle.
+    case "PostToolUse":
+      // Advisory: degrade silently, never break the session or a completed
+      // tool execution (PostToolUse capture is fail-visible at handler level
+      // when it can be attributed — Phase 9 §60; a hook-layer failure here
+      // cannot be attributed, so it stays silent).
       return { exitCode: 0, stdout: "" };
     case "UserPromptSubmit": {
       const stdout = renderHookOutput(

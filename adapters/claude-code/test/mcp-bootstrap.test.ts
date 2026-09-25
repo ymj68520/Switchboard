@@ -46,9 +46,9 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
           serverInfo: { name: "phase-plan", version: "0.1.0" },
         });
-        // Phase 8 (§42): five tools — the Phase 7 set plus the read-side
-        // get_context/read_memory; approve_proposal keeps the real boolean
-        // interaction flag.
+        // Phase 9 (§58): seven tools — the Phase 8 set plus the read-side
+        // get_context/read_memory and list_observations/promote_evidence;
+        // approve_proposal keeps the real boolean interaction flag.
         const tools = (
           parsed.find((m) => m.id === 2)?.result as {
             tools: Array<{ name: string; _meta?: Record<string, unknown> }>;
@@ -59,6 +59,8 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
           "get_state",
           "get_context",
           "read_memory",
+          "list_observations",
+          "promote_evidence",
           "approve_proposal",
         ]);
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
@@ -98,7 +100,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       await fs.writeFile(databasePath, "");
       // Leave a schema-2 marker via raw connection (test-only manipulation).
       const raw = rawConnection(databasePath, 500);
-      raw.exec("PRAGMA user_version = 6");
+      raw.exec("PRAGMA user_version = 7");
       raw.close();
 
       const result = await runMcpSmoke(process.execPath, BUNDLE, {
@@ -112,7 +114,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       expect(result.stderr).toContain("STORE_SCHEMA_TOO_NEW");
       expect(result.stdoutLines).toEqual([]);
       // Untouched: still the too-new marker, never downgraded.
-      expect(rawConnectionQueried(databasePath)).toBe(6);
+      expect(rawConnectionQueried(databasePath)).toBe(7);
     } finally {
       removeTempPluginDataRoot(pluginDataRoot);
     }

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { executePhasePlanTool } from "../src/mcp/tools.js";
+import { createBlobStore } from "../src/store/blob-store.js";
 import { handlePermissionRequest, handlePreToolUse, handleSessionStart, handleUserPromptExpansion, handleUserPromptSubmit, type HookHandlerDeps } from "../src/hooks/handlers.js";
 import { DRIFT_GUARD_REASON } from "../src/hooks/output.js";
 import { loadHostSecret } from "../src/host/secret.js";
@@ -31,8 +32,13 @@ interface A1Harness {
   close(): void;
 }
 
-function makeCtx(fixture: ProposalFixture, secret: Buffer) {
-  return { store: fixture.store, secret, clock: fixedClock({ ids: ["a1"] }) };
+function makeCtx(root: string, fixture: ProposalFixture, secret: Buffer) {
+  return {
+    store: fixture.store,
+    secret,
+    clock: fixedClock({ ids: ["a1"] }),
+    blobs: createBlobStore(path.join(root, "blobs")),
+  };
 }
 
 async function makeA1Harness(): Promise<A1Harness> {
@@ -44,7 +50,7 @@ async function makeA1Harness(): Promise<A1Harness> {
     fixture,
     projectDir: path.join(root, "project"),
     secret,
-    ctx: makeCtx(fixture, secret),
+    ctx: makeCtx(root, fixture, secret),
     close: () => {
       closeFixture(fixture);
       removeTempPluginDataRoot(root);

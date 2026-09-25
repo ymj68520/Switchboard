@@ -8,10 +8,12 @@
  * read-only no-mutation guarantees.
  */
 
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { executePhasePlanTool, PHASE_PLAN_TOOLS, type PhasePlanToolContext } from "../src/mcp/tools.js";
 import { loadHostSecret } from "../src/host/secret.js";
+import { createBlobStore } from "../src/store/blob-store.js";
 import { createStoreContextSource } from "../src/application/context-read-model.js";
 import { assembleContext } from "../src/context/assembler.js";
 import { getHeadSnapshotRecord } from "../src/store/plan-memory.js";
@@ -32,7 +34,7 @@ async function withFixture(fn: (fixture: ContextFixture, ctx: PhasePlanToolConte
   const fixture = await makeContextFixture();
   try {
     const secret = loadHostSecret(fixture.root).key;
-    const ctx: PhasePlanToolContext = { store: fixture.store, secret, clock: fixedClock({ ids: ["x"] }) };
+    const ctx: PhasePlanToolContext = { store: fixture.store, secret, clock: fixedClock({ ids: ["x"] }), blobs: createBlobStore(path.join(fixture.root, "blobs")) };
     await fn(fixture, ctx, secret);
   } finally {
     fixture.close();
@@ -210,7 +212,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
     });
   });
 
-  it("never mutates the store and leaves schema v5 (E22/E23/§48)", async () => {
+  it("never mutates the store and leaves the schema unchanged (E22/E23/§48; Phase 9: v6)", async () => {
     await withFixture((fixture, ctx, secret) => {
       commitCheckpoint(fixture, [{ op: "ADD_CONSTRAINT", content: CONSTRAINT_1, compactProjection: "CONST-1@1" }]);
       const before = memoryCounts(fixture.store);
@@ -226,7 +228,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
       const raw = rawConnection(storePathsFor(fixture.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(5);
+        expect(Object.values(row)[0]).toBe(6);
       } finally {
         raw.close();
       }
@@ -235,16 +237,18 @@ describe("read_memory (§23–§25, E25–E28)", () => {
 });
 
 describe("Phase 8 tool surface (§42, E31)", () => {
-  it("exposes exactly five tools and no Observation/Evidence/preparation tools", () => {
+  it("Phase 9 (§58): exposes exactly seven tools — the Phase 8 set plus the two observation/evidence tools", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
       "get_context",
       "read_memory",
+      "list_observations",
+      "promote_evidence",
       "approve_proposal",
     ]);
     const joined = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
-    for (const banned of ["observe", "evidence", "prepare", "takeover", "abort"]) {
+    for (const banned of ["prepare", "takeover", "abort", "revalidate"]) {
       expect(joined).not.toContain(banned);
     }
   });

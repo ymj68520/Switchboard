@@ -9,7 +9,7 @@ import { EXIT_CODES } from "../src/runtime/exit-codes.js";
 
 describe("store constants (single source)", () => {
   it("pins the frozen schema and protocol versions", () => {
-    expect(SUPPORTED_SCHEMA_VERSION).toBe(5);
+    expect(SUPPORTED_SCHEMA_VERSION).toBe(6);
     expect(STORE_PROTOCOL_VERSION).toBe(1);
     expect(STORE_DB_FILENAME).toBe("phase-plan.sqlite3");
   });

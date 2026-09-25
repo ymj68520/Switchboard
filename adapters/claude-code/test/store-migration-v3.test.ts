@@ -8,6 +8,7 @@ import { createInitializeMigration } from "../src/store/migrations/001-initializ
 import { createWorkspaceBindingMigration } from "../src/store/migrations/002-workspace-session-binding.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
 import { createProposalApprovalCommitMigration } from "../src/store/migrations/005-proposal-approval-plan-commit.js";
+import { createObservationEvidenceMigration } from "../src/store/migrations/006-observation-evidence-foundation.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore } from "../src/store/sqlite-store.js";
@@ -25,10 +26,15 @@ function makeSchema2Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
+    for (const table of ["evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     for (const kind of ["update", "delete"]) {
+      for (const table of ["observations", "evidence_artifacts", "evidence_revisions", "evidence_observation_refs", "evidence_derived_refs", "audit_events"]) {
+        raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+      }
+    }
+for (const kind of ["update", "delete"]) {
       for (const table of ["memory_artifacts", "memory_revisions", "plan_snapshots", "snapshot_members"]) {
         raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
@@ -82,6 +88,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
           { version: 3, name: "planning-run-foundation" },
           { version: 4, name: "plan-memory-foundation" },
           { version: 5, name: "proposal-approval-plan-commit" },
+          { version: 6, name: "observation-evidence-foundation" },
         ]);
         const runs = store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get()) as { n: number };
         expect(runs.n).toBe(0);
@@ -98,7 +105,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-5-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-6-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -143,6 +150,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
             failing,
             createPlanMemoryMigration(),
             createProposalApprovalCommitMigration(),
+            createObservationEvidenceMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -166,7 +174,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(5);
+      expect(retry.getSchemaVersion()).toBe(6);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

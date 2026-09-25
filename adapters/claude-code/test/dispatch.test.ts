@@ -237,7 +237,7 @@ describe("executeCommand", () => {
     await expect(
       executeCommand({ kind: "hook", event: "SessionStart" }, { env: {}, readStdin: async () => "{}" }),
     ).rejects.toMatchObject({ code: "PLUGIN_DATA_UNAVAILABLE" });
-    expect(HOOK_EVENTS.length).toBe(6);
+    expect(HOOK_EVENTS.length).toBe(7);
   });
 
   it("propagates RuntimeError subclasses with stable codes", async () => {

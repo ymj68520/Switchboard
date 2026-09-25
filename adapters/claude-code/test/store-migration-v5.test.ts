@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import { openDatabase } from "../src/store/connection.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
+import { createObservationEvidenceMigration } from "../src/store/migrations/006-observation-evidence-foundation.js";
 import {
   createInitializeMigration,
 } from "../src/store/migrations/001-initialize.js";
@@ -27,7 +28,7 @@ function makeSchema4Store(root: string, options: { keepLegacyHead?: boolean } = 
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals"]) {
+    for (const table of ["evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     // Rebuild plan_heads in the v4 (snapshot-only) shape, preserving rows.
@@ -143,6 +144,7 @@ describe("migration 4 → 5 proposal-approval-plan-commit (E1/§85)", () => {
           { version: 3, name: "planning-run-foundation" },
           { version: 4, name: "plan-memory-foundation" },
           { version: 5, name: "proposal-approval-plan-commit" },
+          { version: 6, name: "observation-evidence-foundation" },
         ]);
         // Old data fully preserved.
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get())).toEqual({ n: 1 });
@@ -159,7 +161,7 @@ describe("migration 4 → 5 proposal-approval-plan-commit (E1/§85)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-4-5-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-4-6-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -226,6 +228,7 @@ describe("migration 4 → 5 proposal-approval-plan-commit (E1/§85)", () => {
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
             failing,
+            createObservationEvidenceMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -247,7 +250,7 @@ describe("migration 4 → 5 proposal-approval-plan-commit (E1/§85)", () => {
         raw.close();
       }
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(5);
+      expect(retry.getSchemaVersion()).toBe(6);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

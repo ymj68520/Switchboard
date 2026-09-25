@@ -313,7 +313,7 @@ export async function executeCommand(
         // The signing secret is a boot prerequisite: no secret → no verified
         // HostContext → no authority (fail closed before serving).
         const secret = loadHostSecret(preflight.resolvedRoot);
-        const { waitStopped } = await (deps.startMcp ?? startMcpServer)({ logger, store, secret: secret.key });
+        const { waitStopped } = await (deps.startMcp ?? startMcpServer)({ logger, store, secret: secret.key, pluginDataRoot: preflight.resolvedRoot });
         await waitStopped;
       } finally {
         // Deterministic close of the store connection once serving stops.

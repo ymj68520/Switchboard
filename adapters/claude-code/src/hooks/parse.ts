@@ -76,6 +76,15 @@ export interface PermissionRequestInput extends HookCommonInput {
   // binding across this event relies on the signed tokens inside tool_input.
 }
 
+export interface PostToolUseInput extends HookCommonInput {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolUseId: string;
+  /** The actual result the host delivered to the model (Phase 9 §9). */
+  toolResponse: unknown;
+  durationMs?: number;
+}
+
 type RawRecord = Record<string, unknown>;
 
 function asRecord(raw: unknown): RawRecord {
@@ -239,4 +248,24 @@ export function parsePreToolUseInput(raw: unknown, expectedEvent = "PreToolUse")
 export function parsePermissionRequestInput(raw: unknown, expectedEvent = "PermissionRequest"): PermissionRequestInput {
   const { common, toolName, toolInput } = parseToolEvent(raw, expectedEvent);
   return { ...common, toolName, toolInput };
+}
+
+export function parsePostToolUseInput(raw: unknown, expectedEvent = "PostToolUse"): PostToolUseInput {
+  const record = asRecord(raw);
+  const { common, toolName, toolInput } = parseToolEvent(raw, expectedEvent);
+  const issues: HookParseIssue[] = [];
+  const toolUseId = requireString(record, "tool_use_id", issues);
+  if (!("tool_response" in record)) {
+    issues.push({ field: "tool_response", problem: "is required (the captured result must be the delivered result, §9)" });
+  }
+  const durationMs = typeof record.duration_ms === "number" ? record.duration_ms : undefined;
+  finish(issues);
+  return {
+    ...common,
+    toolName,
+    toolInput,
+    toolUseId,
+    toolResponse: record.tool_response,
+    ...(durationMs === undefined ? {} : { durationMs }),
+  };
 }

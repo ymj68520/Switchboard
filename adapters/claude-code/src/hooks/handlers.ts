@@ -18,15 +18,22 @@
 import { discoverAndRegisterWorkspace } from "../workspace/identity.js";
 import { getWorkspaceById, type WorkspaceRecord } from "../store/repositories.js";
 import { comparisonKey } from "../workspace/canonical-path.js";
+import * as path from "node:path";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
+import { createBlobStore, type BlobStore } from "../store/blob-store.js";
 import { createBindingService } from "../session/binding-service.js";
 import { createPlanningRunService } from "../application/planning-run-service.js";
 import { findAttachedActiveRun, findDetachedActiveRun, listSessionRuns } from "../session/session-lookup.js";
+import { captureObservation } from "../observations/capture.js";
+import { observationClassForTool } from "../observations/classify.js";
+import type { ObservationCaptureEvent } from "../observations/types.js";
+import { toRuntimeError } from "../runtime/errors.js";
 import { RuntimeError } from "../runtime/errors.js";
 import { HookInputError } from "./parse.js";
 import type {
   PermissionRequestInput,
+  PostToolUseInput,
   PreToolUseInput,
   SessionEndInput,
   SessionStartInput,
@@ -67,6 +74,8 @@ export interface HookHandlerDeps {
   store: PlanStore;
   secret: Buffer;
   clock: StoreClock;
+  /** Optional override of the content-addressed blob store (tests). */
+  blobs?: BlobStore;
 }
 
 /** §44: cwd must still sit inside the bound workspace for mutation contexts. */
@@ -90,6 +99,8 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "get_state" ||
     logical === "get_context" ||
     logical === "read_memory" ||
+    logical === "list_observations" ||
+    logical === "promote_evidence" ||
     logical === "approve_proposal"
   );
 }
@@ -174,6 +185,80 @@ export function handleSessionEnd(deps: HookHandlerDeps, _input: SessionEndInput)
     }
   }
   return emptyOutput();
+}
+
+// ---------------------------------------------------------------------------
+// PostToolUse (Phase 9 §9/§11–§13/§59/§60) — Observation capture
+// ---------------------------------------------------------------------------
+
+/** Canonical blob root derived from the canonical store layout (`<root>/blobs`). */
+function blobsForDeps(deps: HookHandlerDeps): BlobStore {
+  if (deps.blobs !== undefined) return deps.blobs;
+  // store.path is the canonical `<pluginDataRoot>/store/phase-plan.sqlite3`.
+  const pluginDataRoot = path.dirname(path.dirname(deps.store.path));
+  return createBlobStore(path.join(pluginDataRoot, "blobs"));
+}
+
+/**
+ * Capture the delivered tool result as an Observation. Host facts are
+ * authoritative for WHAT was observed; run/workspace attribution is
+ * re-resolved through the SessionBinding Store (never from any input id,
+ * §11). Capture requires an attributable active run (§12) plus an
+ * evidence-capable tool class (§7) — never merely permission_mode=plan (§13).
+ *
+ * Failure semantics (§60): capture NEVER breaks the tool flow — exit 0 —
+ * and a failed capture of an attributable evidence-capable result is
+ * fail-VISIBLE via additionalContext, marking that result unpromotable.
+ * Successful captures write nothing to stdout (protocol-clean).
+ */
+export async function handlePostToolUse(deps: HookHandlerDeps, input: PostToolUseInput): Promise<HookOutput> {
+  if (observationClassForTool(input.toolName) === null) {
+    return emptyOutput(); // §8: unknown tools are never guessed; debug-only skip
+  }
+  const attached = findAttachedActiveRun(deps.store, input.sessionId);
+  if (attached === null || attached.run === null) {
+    return emptyOutput(); // §12: Phase Plan is not a global tool logger
+  }
+  const workspace = getWorkspaceById(deps.store, attached.binding.workspaceId);
+  if (workspace === null) {
+    return emptyOutput(); // attribution impossible — skip, never guess
+  }
+  if (input.cwd !== undefined && input.cwd.trim() !== "" && !cwdInsideWorkspace(input.cwd, workspace)) {
+    return emptyOutput(); // tool executed outside the planning workspace
+  }
+
+  const event: ObservationCaptureEvent = {
+    sessionId: input.sessionId,
+    toolName: input.toolName,
+    toolUseId: input.toolUseId,
+    toolInput: input.toolInput,
+    toolResponse: input.toolResponse,
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+  };
+  try {
+    await captureObservation(
+      {
+        store: deps.store,
+        clock: deps.clock,
+        runId: attached.run.runId,
+        workspace,
+        blobs: blobsForDeps(deps),
+      },
+      event,
+    );
+    return emptyOutput();
+  } catch (err) {
+    // The tool ALREADY executed; only the provenance capture failed (§60).
+    const error = toRuntimeError(err, "OBSERVATION_CAPTURE_FAILED");
+    return contextOutput(
+      "PostToolUse",
+      [
+        `Phase Plan observation capture failed (${error.code}).`,
+        `error=${error.code}: ${error.message}`,
+        "This tool result was not recorded as a Phase Plan Observation and cannot be promoted as Evidence. If a design decision depends on this fact, observe it again.",
+      ].join("\n"),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,13 +416,14 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
-  // approve_proposal requires an owned active run for its mutation context;
-  // reads (get_state/get_context/read_memory) degrade to a run-less outcome:
-  // nothing is signed, so the MCP layer fails closed and never reaches a
-  // workspace-wide run selection (Phase 8 §40/§41 — no auto-takeover).
+  // approve_proposal and promote_evidence require an owned active run for
+  // their write contexts; reads (get_state/get_context/read_memory/
+  // list_observations) degrade to a run-less outcome: nothing is signed, so
+  // the MCP layer fails closed and never reaches a workspace-wide run
+  // selection (Phase 8 §40/§41 — no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
-    if (logical === "approve_proposal") {
+    if (logical === "approve_proposal" || logical === "promote_evidence") {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
     // get_state/get_context/read_memory without a run: no read context is

@@ -46,6 +46,8 @@ export type HostContextLogicalTool =
   | "get_state"
   | "get_context"
   | "read_memory"
+  | "list_observations"
+  | "promote_evidence"
   | "approve_proposal";
 
 export interface BuildHostContextInput {

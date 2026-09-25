@@ -114,6 +114,34 @@ const SCHEMA_V5_INDEXES = [
   "idx_plan_commits_approval",
 ] as const;
 
+/** Observation/Evidence tables required once the store has reached v6 (Phase 9 §4). */
+const SCHEMA_V6_TABLES = [
+  "observations",
+  "evidence_artifacts",
+  "evidence_revisions",
+  "evidence_observation_refs",
+  "evidence_derived_refs",
+] as const;
+
+/** Immutability triggers required once the store has reached v6 (§6/§52). */
+const SCHEMA_V6_TRIGGERS = [
+  "observations_no_update",
+  "observations_no_delete",
+  "evidence_artifacts_no_update",
+  "evidence_artifacts_no_delete",
+  "evidence_revisions_no_update",
+  "evidence_revisions_no_delete",
+  "evidence_observation_refs_no_update",
+  "evidence_observation_refs_no_delete",
+  "evidence_derived_refs_no_update",
+  "evidence_derived_refs_no_delete",
+] as const;
+
+/** Constraint index backing the deterministic ledger order (§20). */
+const SCHEMA_V6_INDEXES = [
+  "idx_observations_run_seq",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -322,13 +350,44 @@ function validateSchemaV5(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural Observation/Evidence checks for schema v6 (Phase 9 §4/§6/§52):
+ * table presence, immutability triggers, and the ledger order + capture
+ * idempotency indexes. Cheap sqlite_master lookups only.
+ */
+function validateSchemaV6(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V6_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 6`);
+    }
+  }
+  for (const trigger of SCHEMA_V6_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 6`);
+    }
+  }
+  for (const index of SCHEMA_V6_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 6`);
+    }
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
  * must exist as a singleton. From version 2 the infrastructure-table
  * integrity checks apply as well; from version 4 the structural Plan Memory
  * checks apply; from version 5 the Proposal/Approval/PlanCommit structural
- * checks apply.
+ * checks apply; from version 6 the Observation/Evidence structural checks
+ * apply.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   const version = readSchemaVersion(db);
@@ -364,6 +423,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 5) {
     validateSchemaV5(db, problems);
+  }
+  if (version >= 6) {
+    validateSchemaV6(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

@@ -54,9 +54,27 @@ const WRITER_ALLOWED = new Set([
  */
 const READ_ONLY_ALLOWED = new Set([path.join(SRC_ROOT, "application", "context-read-model.ts")]);
 
-/** The transaction-scoped WRITE primitives (engine-only, §75/E43/E44). */
+/**
+ * The transaction-scoped WRITE primitives (engine-only, §75/E43/E44), the
+ * Phase 9 Observation writer (hook-side capture only, §71) and the Phase 9
+ * Evidence writer (application domain writer only, §71).
+ */
 const WRITE_PRIMITIVE_SYMBOLS =
   /insertArtifactIdentityInTx|insertMemoryRevisionInTx|insertSnapshotInTx|setHeadSnapshotInTx|createInternalPlanMemoryWriter/;
+const OBSERVATION_WRITE_SYMBOLS = /insertObservationInTx/;
+const EVIDENCE_WRITE_SYMBOLS = /insertEvidenceArtifactInTx|insertEvidenceRevisionInTx|insertEvidenceRefsInTx/;
+
+/** Production modules allowed to touch the raw Observation writer. */
+const OBSERVATION_WRITER_ALLOWED = new Set([
+  path.join(SRC_ROOT, "store", "observations.ts"),
+  path.join(SRC_ROOT, "observations", "capture.ts"),
+]);
+
+/** Production modules allowed to touch the raw Evidence writers. */
+const EVIDENCE_WRITER_ALLOWED = new Set([
+  path.join(SRC_ROOT, "store", "evidence.ts"),
+  path.join(SRC_ROOT, "application", "evidence-service.ts"),
+]);
 
 function namedImportsOf(text: string, modulePattern: RegExp): string[] {
   const names: string[] = [];
@@ -78,6 +96,32 @@ describe("committed-memory writer boundary (§75/E43/E44)", () => {
       const text = readModuleText(file);
       const names = namedImportsOf(text, /plan-memory(\.js)?$/);
       if (names.some((name) => WRITE_PRIMITIVE_SYMBOLS.test(name))) {
+        offenders.push(path.relative(SRC_ROOT, file));
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("only capture.ts imports the Observation writer (hook-side capture, Phase 9 §71)", () => {
+    const offenders: string[] = [];
+    for (const file of listFiles(SRC_ROOT, ".ts")) {
+      if (OBSERVATION_WRITER_ALLOWED.has(path.resolve(file))) continue;
+      const text = readModuleText(file);
+      const names = namedImportsOf(text, /store\/observations(\.js)?$/);
+      if (names.some((name) => OBSERVATION_WRITE_SYMBOLS.test(name))) {
+        offenders.push(path.relative(SRC_ROOT, file));
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("only the Evidence application service imports the Evidence writers (§71)", () => {
+    const offenders: string[] = [];
+    for (const file of listFiles(SRC_ROOT, ".ts")) {
+      if (EVIDENCE_WRITER_ALLOWED.has(path.resolve(file))) continue;
+      const text = readModuleText(file);
+      const names = namedImportsOf(text, /store\/evidence(\.js)?$/);
+      if (names.some((name) => EVIDENCE_WRITE_SYMBOLS.test(name))) {
         offenders.push(path.relative(SRC_ROOT, file));
       }
     }

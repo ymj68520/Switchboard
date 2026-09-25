@@ -4,6 +4,7 @@
  * the Phase 6 engine (E28–E35, E55–E59, E26, E45).
  */
 
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -31,6 +32,7 @@ import {
   type ProposalFixture,
 } from "./proposal-helpers.js";
 import { fixedClock, makeTempPluginDataRoot, rawConnection, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
+import { createBlobStore } from "../src/store/blob-store.js";
 
 interface ToolHarness extends ProposalFixture {
   fixture: ProposalFixture;
@@ -49,7 +51,7 @@ async function makeToolHarness(): Promise<ToolHarness> {
     ...fixture,
     secret,
     root,
-    ctx: { store: fixture.store, secret, clock: fixedClock({ ids: ["x1"] }) },
+    ctx: { store: fixture.store, secret, clock: fixedClock({ ids: ["x1"] }), blobs: createBlobStore(path.join(root, "blobs")) },
     close: () => {
       closeFixture(fixture);
       removeTempPluginDataRoot(root);
@@ -89,13 +91,15 @@ function hostToken(
   );
 }
 
-describe("tools/list metadata (E27/E37/E38; Phase 8 §42 five-tool surface)", () => {
-  it("exposes exactly the Phase 8 tool set; approve_proposal carries real boolean requiresUserInteraction", () => {
+describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", () => {
+  it("exposes exactly the Phase 9 tool set; approve_proposal carries real boolean requiresUserInteraction", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
       "get_context",
       "read_memory",
+      "list_observations",
+      "promote_evidence",
       "approve_proposal",
     ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
@@ -153,7 +157,7 @@ describe("start_or_resume (E12/E13/E14/E15/E62/E63)", () => {
       await import("node:fs").then((fs) => fs.mkdirSync(projectDir, { recursive: true }));
       const { registration } = await discoverAndRegisterWorkspace(store, projectDir, fixedClock({ ids: ["r", "w"] }));
       const secret = loadHostSecret(root).key;
-      const ctx: PhasePlanToolContext = { store, secret, clock: fixedClock({ ids: ["run1", "b1"] }) };
+      const ctx: PhasePlanToolContext = { store, secret, clock: fixedClock({ ids: ["run1", "b1"] }), blobs: createBlobStore(path.join(root, "blobs")) };
       const business = { goal: "new plan" };
       const result = executePhasePlanTool(ctx, "start_or_resume", {
         ...business,
@@ -525,7 +529,7 @@ describe("approve_proposal → Phase 6 engine (E28–E35, E55–E59)", () => {
   });
 });
 
-describe("schema v5 stays frozen through the whole Phase 7 flow (E45)", () => {
+describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61: v6)", () => {
   it("entry + approve leave PRAGMA user_version == 5", async () => {
     const h = await makeToolHarness();
     try {
@@ -546,7 +550,7 @@ describe("schema v5 stays frozen through the whole Phase 7 flow (E45)", () => {
       const raw = rawConnection(storePathsFor(h.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(5);
+        expect(Object.values(row)[0]).toBe(6);
       } finally {
         raw.close();
       }

@@ -56,6 +56,18 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Read|Grep|Glob|Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PostToolUse"]
+          }
+        ]
+      }
+    ],
     "PermissionRequest": [
       {
         "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal)$",

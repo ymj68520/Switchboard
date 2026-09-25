@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
+import { createObservationEvidenceMigration } from "../src/store/migrations/006-observation-evidence-foundation.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
@@ -87,6 +88,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
             createProposalApprovalCommitMigration(),
+            createObservationEvidenceMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -131,6 +133,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
             createProposalApprovalCommitMigration(),
+            createObservationEvidenceMigration(),
           ],
           clock,
         }),

@@ -1,8 +1,9 @@
 /**
  * Phase Plan stdio MCP bootstrap (frozen plan §10, architecture §28.2).
  *
- * Phase 8 scope: five tools — start_or_resume, get_state, get_context,
- * read_memory (Phase 8 read-side), approve_proposal. Tool visibility is not
+ * Phase 9 scope: seven tools — start_or_resume, get_state, get_context,
+ * read_memory (Phase 8 read-side), list_observations, promote_evidence
+ * (Phase 9 observation/evidence), approve_proposal. Tool visibility is not
  * authority: every handler verifies the hook-signed HostContext and then
  * delegates to the Application services / Phase 6 engine, which revalidate
  * stage, lifecycle, binding, HEAD and proposal state (directive §49).
@@ -14,11 +15,14 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
+import * as path from "node:path";
+
 import { createLogger, type Logger } from "../runtime/logger.js";
 import { RuntimeError, isRuntimeError, toRuntimeError } from "../runtime/errors.js";
 import { RUNTIME_NAME, RUNTIME_VERSION } from "../runtime/version.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
+import { createBlobStore } from "../store/blob-store.js";
 import { PHASE_PLAN_TOOLS, executePhasePlanTool, type PhasePlanToolContext } from "./tools.js";
 
 export interface McpServerHandle {
@@ -32,6 +36,8 @@ export interface McpBootstrapOptions {
   store: PlanStore;
   /** Persistent host signing secret for HostContext verification. */
   secret: Buffer;
+  /** Plugin data root — anchors the content-addressed Observation blob store. */
+  pluginDataRoot: string;
   clock?: StoreClock;
 }
 
@@ -60,6 +66,7 @@ export async function startMcpServer(options: McpBootstrapOptions): Promise<{
     store: options.store,
     secret: options.secret,
     clock: options.clock ?? { nowIso: () => new Date().toISOString(), newId: () => crypto.randomUUID() },
+    blobs: createBlobStore(path.join(options.pluginDataRoot, "blobs")),
   };
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

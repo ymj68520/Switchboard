@@ -16,7 +16,10 @@ export function makeTempPluginDataRoot(prefix = "phase-plan-store-"): string {
 }
 
 export function removeTempPluginDataRoot(root: string): void {
-  fs.rmSync(root, { recursive: true, force: true });
+  // Windows can transiently EPERM/EBUSY on freshly written files (AV/indexer
+  // scan); rm's built-in bounded retry absorbs that without hiding real
+  // retention bugs (retries are exhausted → the error still throws).
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
 /** Deterministic clock for injected seams (frozen plan §29). */

@@ -24,10 +24,11 @@ describe("hooks.json (directive §35)", () => {
     hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string; args: string[] }> }>>;
   } = JSON.parse(readAsset("hooks/hooks.json"));
 
-  it("wires all six Phase 7 events in Node exec form", () => {
+  it("wires all Phase 7 events plus the Phase 9 PostToolUse event in Node exec form", () => {
     const events = Object.keys(hooks.hooks).sort();
     expect(events).toEqual([
       "PermissionRequest",
+      "PostToolUse",
       "PreToolUse",
       "SessionEnd",
       "SessionStart",
@@ -54,6 +55,7 @@ describe("hooks.json (directive §35)", () => {
         "UserPromptSubmit",
         "UserPromptExpansion",
         "PreToolUse",
+        "PostToolUse",
         "PermissionRequest",
       ]),
     );

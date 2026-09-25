@@ -1,11 +1,14 @@
 /**
- * Phase 8 MCP tool surface (Phase 8 directive §20/§23/§42).
+ * Phase 9 MCP tool surface (Phase 9 directive §21/§22/§44/§45/§58).
  *
- * Exactly five tools — the Phase 7 set plus the two Phase 8 read tools:
+ * Exactly seven tools — the Phase 8 set plus the two Phase 9 observation/
+ * evidence tools:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
  *   get_state        (read-only, session-scoped)
  *   get_context      (read-only structured L0–L5 context projection + epoch)
  *   read_memory      (read-only exact MemoryRef retrieval)
+ *   list_observations(read-only Observation ledger summaries, §21/§22)
+ *   promote_evidence (explicit Observation→Evidence promotion, §28/§44/§45)
  *   approve_proposal (the Formal Approval bridge into the Phase 6 engine,
  *                     marked anthropic/requiresUserInteraction=true)
  *
@@ -17,6 +20,9 @@
  * the Phase 6 engine on every call. Read tools accept a read-only HostContext
  * without requiring permission_mode=plan (§39) but never widen scope: the run
  * is resolved from the signed session + workspace, never from model input.
+ * promote_evidence records PROVENANCE, not design authority — it needs no
+ * human Approval (§45) and no plan mode, but it does need an attached active
+ * run, and design consequences still require Proposal → Approval → PlanCommit.
  */
 
 import { getWorkspaceById } from "../store/repositories.js";
@@ -25,6 +31,7 @@ import { getHeadCommitRecord } from "../store/plan-commits.js";
 import { listPlanningRunsForWorkspaceRecord } from "../store/planning-runs.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
+import type { BlobStore } from "../store/blob-store.js";
 import type { PlanningRun } from "../core/planning-run.js";
 import type { BindingSnapshot } from "../store/session-bindings.js";
 import { isMemoryArtifactKind } from "../core/memory-refs.js";
@@ -32,6 +39,9 @@ import type { MemoryRef } from "../core/memory-refs.js";
 import { createBindingService } from "../session/binding-service.js";
 import { createPlanningRunService } from "../application/planning-run-service.js";
 import { createPlanCommitEngine } from "../application/plan-commit-engine.js";
+import { createEvidenceService, type PromoteEvidenceRequest } from "../application/evidence-service.js";
+import { listObservationSummaries } from "../application/observation-service.js";
+import { OBSERVATION_CLASSES, type ObservationClass } from "../observations/types.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
 import { assembleContext } from "../context/assembler.js";
 import { buildRecoveryCapsule } from "../context/capsule.js";
@@ -52,6 +62,8 @@ export interface PhasePlanToolContext {
   store: PlanStore;
   secret: Buffer;
   clock: StoreClock;
+  /** Content-addressed Observation payload store (plugin-data rooted). */
+  blobs: BlobStore;
 }
 
 export interface PhasePlanToolDefinition {
@@ -130,6 +142,70 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
       required: ["kind", "id", "revision", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_observations",
+    description:
+      "List the current run's captured Observations (actual host tool results recorded by the PostToolUse hook): "
+      + "class, tool, captured-at, normalized input, payload hash/size, promotability, and any promoted Evidence references. "
+      + "Summaries only — never whole payloads. Read-only; never accepts a run id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        class: { type: "string", enum: [...OBSERVATION_CLASSES], description: "Filter by observation class." },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size; defaults to 20." },
+        after: { type: "string", description: "Opaque ledger cursor from a previous page (observation_seq-based)." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "promote_evidence",
+    description:
+      "Promote captured Observations (or exact upstream Evidence revisions) into one durable, immutable Evidence claim. "
+      + "Reference observations by id — payload/source provenance is rebuilt server-side and can never be model-authored. "
+      + "Records provenance only; design consequences still require a Proposal and explicit human approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        claim: { type: "string", description: "The planning-relevant claim this Evidence asserts (non-empty)." },
+        kind: { type: "string", enum: ["source_fact", "locator_fact", "execution_result", "derived_claim"] },
+        scope: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: ["global", "architecture"] },
+          },
+          required: ["type"],
+          additionalProperties: false,
+          description: "Evidence scope; section scope is not available in this phase.",
+        },
+        confidence: { type: "string", enum: ["direct", "derived", "uncertain"] },
+        criticality: { type: "string", enum: ["critical", "supporting", "informational"] },
+        observation_refs: {
+          type: "array",
+          items: { type: "string" },
+          description: "Observation ids cited as provenance (required for confidence=direct).",
+        },
+        derived_from: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              evidence_id: { type: "string" },
+              revision: { type: "integer", minimum: 1 },
+            },
+            required: ["evidence_id", "revision"],
+            additionalProperties: false,
+          },
+          description: "Exact upstream Evidence revisions (required for confidence=derived; never 'latest').",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["claim", "kind", "scope", "confidence", "criticality", "_hostContext"],
       additionalProperties: false,
     },
   },
@@ -481,6 +557,170 @@ export function handleReadMemory(ctx: PhasePlanToolContext, rawArgs: Record<stri
 }
 
 // ---------------------------------------------------------------------------
+// list_observations (Phase 9 §21/§22) — read-only Observation ledger summaries
+// ---------------------------------------------------------------------------
+
+const OBSERVATION_CURSOR_PREFIX = "seq:";
+
+function observationCursorOf(seq: number): string {
+  return `${OBSERVATION_CURSOR_PREFIX}${seq}`;
+}
+
+function parseObservationCursor(after: unknown): number | undefined {
+  if (typeof after !== "string" || after === "") {
+    throw inputInvalid("after must be a non-empty ledger cursor string");
+  }
+  if (!after.startsWith(OBSERVATION_CURSOR_PREFIX)) {
+    throw inputInvalid("after is not a valid ledger cursor");
+  }
+  const seq = Number(after.slice(OBSERVATION_CURSOR_PREFIX.length));
+  if (!Number.isInteger(seq) || seq < 0) {
+    throw inputInvalid("after is not a valid ledger cursor");
+  }
+  return seq;
+}
+
+export function handleListObservations(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["class", "limit", "after"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "list_observations", businessInput: rawArgs });
+
+  let observationClass: ObservationClass | undefined;
+  if (rawArgs.class !== undefined) {
+    if (typeof rawArgs.class !== "string" || !(OBSERVATION_CLASSES as readonly string[]).includes(rawArgs.class)) {
+      throw inputInvalid(`class must be one of: ${OBSERVATION_CLASSES.join(", ")}`);
+    }
+    observationClass = rawArgs.class as ObservationClass;
+  }
+  let limit = 20;
+  if (rawArgs.limit !== undefined) {
+    if (typeof rawArgs.limit !== "number" || !Number.isInteger(rawArgs.limit) || rawArgs.limit < 1 || rawArgs.limit > 100) {
+      throw inputInvalid("limit must be an integer between 1 and 100");
+    }
+    limit = rawArgs.limit;
+  }
+  const afterSeq = rawArgs.after === undefined ? undefined : parseObservationCursor(rawArgs.after);
+
+  const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
+  if (preferred === null || preferred.run === null) {
+    return { status: "no_active_run" };
+  }
+  const summaries = listObservationSummaries(ctx.store, preferred.run.runId, {
+    ...(observationClass === undefined ? {} : { observationClass }),
+    afterSeq,
+    limit,
+  });
+  return {
+    status: "ok",
+    run: { id: preferred.run.runId, stage: preferred.run.stage, revision: preferred.run.revision },
+    observations: summaries.map((summary) => ({
+      observation_id: summary.observationId,
+      observation_seq: summary.observationSeq,
+      class: summary.observationClass,
+      tool: summary.tool,
+      captured_at: summary.capturedAt,
+      input: summary.input,
+      payload_size: summary.payloadSize,
+      ...(summary.payloadHash === null ? {} : { payload_hash: summary.payloadHash }),
+      promotable: summary.promotable,
+      ...(summary.sanitized === null ? {} : { sanitized: summary.sanitized }),
+      evidence_refs: summary.evidenceRefs,
+    })),
+    ...(summaries.length === limit && summaries.length > 0
+      ? { next_after: observationCursorOf(summaries[summaries.length - 1]!.observationSeq) }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// promote_evidence (Phase 9 §28/§44/§45) — explicit promotion into Evidence
+// ---------------------------------------------------------------------------
+
+export function handlePromoteEvidence(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, [
+    "claim",
+    "kind",
+    "scope",
+    "confidence",
+    "criticality",
+    "observation_refs",
+    "derived_from",
+  ]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "promote_evidence", businessInput: rawArgs });
+
+  // §44 — the operation id derives from the SIGNED HostContext tool use, so
+  // the model can neither fabricate one nor reuse another call's identity.
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+
+  const observationRefs =
+    rawArgs.observation_refs === undefined
+      ? []
+      : rawArgs.observation_refs;
+  if (!Array.isArray(observationRefs) || observationRefs.some((ref) => typeof ref !== "string")) {
+    throw inputInvalid("observation_refs must be an array of observation ids");
+  }
+  const derivedFromRaw = rawArgs.derived_from === undefined ? [] : rawArgs.derived_from;
+  if (!Array.isArray(derivedFromRaw)) {
+    throw inputInvalid("derived_from must be an array of {evidence_id, revision}");
+  }
+  const derivedFrom = derivedFromRaw.map((ref) => {
+    if (typeof ref !== "object" || ref === null) {
+      throw inputInvalid("derived_from entries must be {evidence_id, revision} objects");
+    }
+    const record = ref as Record<string, unknown>;
+    if (typeof record.evidence_id !== "string" || record.evidence_id === "") {
+      throw inputInvalid("derived_from entries must carry a non-empty evidence_id");
+    }
+    if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 1) {
+      throw inputInvalid("derived_from revision must be a positive integer");
+    }
+    return { evidenceId: record.evidence_id, revision: record.revision };
+  });
+
+  if (typeof rawArgs.claim !== "string") {
+    throw inputInvalid("claim must be a string");
+  }
+  const request: PromoteEvidenceRequest = {
+    claim: rawArgs.claim,
+    kind: rawArgs.kind as PromoteEvidenceRequest["kind"],
+    scope: rawArgs.scope as PromoteEvidenceRequest["scope"],
+    confidence: rawArgs.confidence as PromoteEvidenceRequest["confidence"],
+    criticality: rawArgs.criticality as PromoteEvidenceRequest["criticality"],
+    observationRefs: observationRefs as string[],
+    derivedFrom,
+  };
+  const service = createEvidenceService(ctx.store, ctx.blobs, ctx.clock);
+  const result = service.promoteEvidence({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    request,
+    operationId: `promote:${envelope.toolUseId}`,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    evidence: {
+      evidence_id: result.evidence.evidenceId,
+      revision: result.evidence.revision,
+      ref: `${result.evidence.evidenceId}@${result.evidence.revision}`,
+      claim: result.evidence.claim,
+      kind: result.evidence.kind,
+      scope: result.evidence.scope,
+      confidence: result.evidence.confidence,
+      criticality: result.evidence.criticality,
+      validation_strategy: result.evidence.validationStrategy,
+      observation_refs: result.evidence.observationRefs,
+      derived_from: result.evidence.derivedFrom,
+      source_fingerprints: result.evidence.sourceFingerprints,
+      created_at: result.evidence.createdAt,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // approve_proposal (directive §27–§32) — the Formal Approval bridge
 // ---------------------------------------------------------------------------
 
@@ -549,6 +789,10 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleGetContext(ctx, rawArgs);
     case "read_memory":
       return handleReadMemory(ctx, rawArgs);
+    case "list_observations":
+      return handleListObservations(ctx, rawArgs);
+    case "promote_evidence":
+      return handlePromoteEvidence(ctx, rawArgs);
     case "approve_proposal":
       return handleApproveProposal(ctx, rawArgs);
     default:

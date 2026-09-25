@@ -120,13 +120,14 @@ describe("runHook failure policy (in-process)", () => {
     }
   });
 
-  it("exposes the six implemented events", () => {
+  it("exposes the seven implemented events (Phase 9 §59: PostToolUse added)", () => {
     expect(HOOK_EVENTS).toEqual([
       "SessionStart",
       "SessionEnd",
       "UserPromptSubmit",
       "UserPromptExpansion",
       "PreToolUse",
+      "PostToolUse",
       "PermissionRequest",
     ]);
   });
