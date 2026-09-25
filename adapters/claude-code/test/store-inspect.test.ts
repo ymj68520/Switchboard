@@ -20,7 +20,7 @@ describe("read-only store inspection (E22/§33)", () => {
       const inspection = inspectPlanStore(root);
       expect(inspection).toMatchObject({
         status: "absent",
-        supported: 4,
+        supported: 5,
         databasePath: path.join(root, "store", "phase-plan.sqlite3"),
       });
       expect(fs.existsSync(path.join(root, "store"))).toBe(false);
@@ -37,7 +37,7 @@ describe("read-only store inspection (E22/§33)", () => {
       store.close();
       const inspection = inspectPlanStore(root);
       expect(inspection.status).toBe("ready");
-      expect(inspection.schemaVersion).toBe(4);
+      expect(inspection.schemaVersion).toBe(5);
       expect(inspection.storeId).toBe(storeId);
     } finally {
       removeTempPluginDataRoot(root);
@@ -62,10 +62,10 @@ describe("read-only store inspection (E22/§33)", () => {
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 5);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, 6);
       const inspection = inspectPlanStore(root);
-      expect(inspection).toMatchObject({ status: "too_new", schemaVersion: 5, supported: 4 });
-      expect(rawConnectionQueriedVersion(storePathsFor(root).databasePath)).toBe(5);
+      expect(inspection).toMatchObject({ status: "too_new", schemaVersion: 6, supported: 5 });
+      expect(rawConnectionQueriedVersion(storePathsFor(root).databasePath)).toBe(6);
     } finally {
       removeTempPluginDataRoot(root);
     }

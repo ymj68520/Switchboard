@@ -451,6 +451,22 @@ function loadSnapshotInTx(tx: MemoryWriteTx, snapshotId: string): MemorySnapshot
   };
 }
 
+/** Exact ref list of a snapshot, for composition inside a write transaction. */
+export function getSnapshotRefsInTx(tx: MemoryWriteTx, snapshotId: string): MemoryRef[] | null {
+  const snapshot = tx
+    .prepare("SELECT run_id AS runId FROM plan_snapshots WHERE snapshot_id = ?")
+    .get(snapshotId) as { runId: string } | undefined;
+  if (snapshot === undefined) return null;
+  const members = tx
+    .prepare(
+      "SELECT run_id AS runId, kind, artifact_id AS artifactId, revision FROM snapshot_members WHERE snapshot_id = ?",
+    )
+    .all(snapshotId) as { runId: string; kind: MemoryArtifactKind; artifactId: string; revision: number }[];
+  return sortMemoryRefs(
+    members.map((member) => ({ runId: member.runId, kind: member.kind, id: member.artifactId, revision: member.revision })),
+  );
+}
+
 /**
  * Internal convenience facade over the transaction-scoped primitives for
  * tests and the future Phase 6 engine. NOT an application service: nothing

@@ -5,6 +5,7 @@ import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
+import { createProposalApprovalCommitMigration } from "../src/store/migrations/005-proposal-approval-plan-commit.js";
 import {
   createProductionMigrations,
   validateMigrationRegistry,
@@ -85,6 +86,7 @@ describe("migration failure semantics (E14/§22)", () => {
             failingMigration,
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
+            createProposalApprovalCommitMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -128,6 +130,7 @@ describe("migration failure semantics (E14/§22)", () => {
             failing,
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
+            createProposalApprovalCommitMigration(),
           ],
           clock,
         }),

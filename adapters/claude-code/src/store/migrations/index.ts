@@ -9,6 +9,7 @@ import { createInitializeMigration } from "./001-initialize.js";
 import { createWorkspaceBindingMigration } from "./002-workspace-session-binding.js";
 import { createPlanningRunMigration } from "./003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "./004-plan-memory-foundation.js";
+import { createProposalApprovalCommitMigration } from "./005-proposal-approval-plan-commit.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -62,7 +63,8 @@ export interface ProductionMigrationDeps {
 
 /**
  * The production registry: `0→1 initialize-plan-store`,
- * `1→2 workspace-and-session-binding`, `2→3 planning-run-foundation`.
+ * `1→2 workspace-and-session-binding`, `2→3 planning-run-foundation`,
+ * `3→4 plan-memory-foundation`, `4→5 proposal-approval-plan-commit`.
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
   return [
@@ -70,5 +72,6 @@ export function createProductionMigrations(deps: ProductionMigrationDeps): Store
     createWorkspaceBindingMigration(),
     createPlanningRunMigration(),
     createPlanMemoryMigration(),
+    createProposalApprovalCommitMigration(),
   ];
 }

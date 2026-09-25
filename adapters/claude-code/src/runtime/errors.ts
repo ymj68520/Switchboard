@@ -52,7 +52,22 @@ export type RuntimeErrorCode =
   | "SNAPSHOT_INVALID"
   | "SECTION_DAG_INVALID"
   | "STALE_MEMORY_HEAD"
-  | "MEMORY_HEAD_INVALID";
+  | "MEMORY_HEAD_INVALID"
+  // Phase 6 — Proposal / Approval / PlanCommit transaction engine (exit 6)
+  | "PROPOSAL_NOT_FOUND"
+  | "PROPOSAL_SUPERSEDED"
+  | "PROPOSAL_HASH_MISMATCH"
+  | "PROPOSAL_NOT_AWAITING_APPROVAL"
+  | "PROPOSAL_ALREADY_COMMITTED"
+  | "PROPOSAL_ALREADY_AWAITING"
+  | "PROPOSAL_TYPE_UNAVAILABLE"
+  | "PROPOSAL_INVALID"
+  | "CAPABILITY_NOT_AVAILABLE"
+  | "IDEMPOTENCY_CONFLICT"
+  | "MEMORY_HEAD_UNCOMMITTED"
+  | "BLOCKING_QUESTION"
+  | "BLOCKING_CONFLICT"
+  | "PLAN_COMMIT_CONFLICT";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {

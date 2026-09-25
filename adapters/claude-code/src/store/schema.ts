@@ -74,6 +74,46 @@ const SCHEMA_V4_IMMUTABILITY_TRIGGERS = [
   "snapshot_members_no_delete",
 ] as const;
 
+/** Proposal/Approval/Commit tables required once the store has reached v5. */
+const SCHEMA_V5_TABLES = [
+  "proposals",
+  "proposal_revisions",
+  "proposal_states",
+  "approvals",
+  "plan_commits",
+  "audit_events",
+] as const;
+
+/** Immutability + constraint triggers required once the store has reached v5. */
+const SCHEMA_V5_TRIGGERS = [
+  "proposal_revisions_no_update",
+  "proposal_revisions_no_delete",
+  "approvals_no_update",
+  "approvals_no_delete",
+  "plan_commits_no_update",
+  "plan_commits_no_delete",
+  "audit_events_no_update",
+  "audit_events_no_delete",
+  "proposal_states_insert_awaiting",
+  "proposal_states_transition_guard",
+  "approvals_hash_match",
+  "plan_heads_commit_pair_insert",
+  "plan_heads_commit_pair_update",
+] as const;
+
+/** Constraint indexes backing the v5 uniqueness invariants. */
+const SCHEMA_V5_INDEXES = [
+  "idx_proposals_request",
+  "idx_proposal_states_one_awaiting",
+  "idx_approvals_request",
+  "idx_approvals_proposal_revision",
+  "idx_plan_commits_run_sequence",
+  "idx_plan_commits_one_root",
+  "idx_plan_commits_one_child",
+  "idx_plan_commits_run_commit",
+  "idx_plan_commits_approval",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -243,11 +283,51 @@ function validateSchemaV4(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural Proposal/Approval/PlanCommit checks for schema v5 (frozen plan
+ * Phase 6 §98): table presence, immutability + constraint triggers, and the
+ * unique indexes that pin one-awaiting-per-run, approval exactness, and the
+ * linear commit chain. Cheap sqlite_master lookups plus a PRAGMA column
+ * check on the upgraded plan_heads — NO O(history) commit-chain scan (the
+ * chain validator runs at commit time and via the explicit read API).
+ */
+function validateSchemaV5(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V5_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 5`);
+    }
+  }
+  for (const trigger of SCHEMA_V5_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 5`);
+    }
+  }
+  for (const index of SCHEMA_V5_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 5`);
+    }
+  }
+  // The upgraded plan_heads must carry the commit side of the HEAD pair.
+  const headColumns = db.prepare("PRAGMA table_info(plan_heads)").all() as { name?: unknown }[];
+  const columnNames = new Set(headColumns.map((column) => (typeof column.name === "string" ? column.name : "")));
+  if (!columnNames.has("head_commit_id")) {
+    problems.push("plan_heads is missing head_commit_id for schema version >= 5");
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
  * must exist as a singleton. From version 2 the infrastructure-table
  * integrity checks apply as well; from version 4 the structural Plan Memory
+ * checks apply; from version 5 the Proposal/Approval/PlanCommit structural
  * checks apply.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
@@ -281,6 +361,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 4) {
     validateSchemaV4(db, problems);
+  }
+  if (version >= 5) {
+    validateSchemaV5(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

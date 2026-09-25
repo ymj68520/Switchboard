@@ -19,7 +19,7 @@ function makeSchema3Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts"]) {
+    for (const table of ["audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     for (const kind of ["update", "delete"]) {
@@ -27,7 +27,7 @@ function makeSchema3Store(root: string): void {
         raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
     }
-    raw.exec("DELETE FROM schema_migrations WHERE version = 4");
+    raw.exec("DELETE FROM schema_migrations WHERE version >= 4");
     raw.exec("PRAGMA user_version = 3");
     raw.exec("CREATE TABLE phase4_sentinel (note TEXT NOT NULL)");
     raw.prepare("INSERT INTO phase4_sentinel (note) VALUES (?)").run("pre-v4-sentinel");
@@ -79,6 +79,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
           { version: 2, name: "workspace-and-session-binding" },
           { version: 3, name: "planning-run-foundation" },
           { version: 4, name: "plan-memory-foundation" },
+          { version: 5, name: "proposal-approval-plan-commit" },
         ]);
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get())).toEqual({ n: 1 });
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs WHERE run_id = ?").get(runId))).toEqual({ n: 1 });
@@ -93,7 +94,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-4-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-5-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -155,7 +156,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
         raw.close();
       }
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(4);
+      expect(retry.getSchemaVersion()).toBe(5);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

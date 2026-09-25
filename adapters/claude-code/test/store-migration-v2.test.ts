@@ -7,6 +7,7 @@ import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
+import { createProposalApprovalCommitMigration } from "../src/store/migrations/005-proposal-approval-plan-commit.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore, openPlanStore } from "../src/store/sqlite-store.js";
@@ -32,7 +33,7 @@ function makeSchema1Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
+    for (const table of ["audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     for (const kind of ["update", "delete"]) {
@@ -78,6 +79,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
           { version: 2, name: "workspace-and-session-binding" },
           { version: 3, name: "planning-run-foundation" },
           { version: 4, name: "plan-memory-foundation" },
+          { version: 5, name: "proposal-approval-plan-commit" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM phase2_sentinel").all(),
@@ -89,7 +91,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-4-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-5-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       // The backup captures the SOURCE state (schema 1 + sentinel).
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
@@ -131,6 +133,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
             failing,
             createPlanningRunMigration(),
             createPlanMemoryMigration(),
+            createProposalApprovalCommitMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -151,7 +154,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(4);
+      expect(retry.getSchemaVersion()).toBe(5);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -167,7 +170,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       makeSchema1Store(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(4);
+        expect(store.getSchemaVersion()).toBe(5);
       } finally {
         store.close();
       }
@@ -211,11 +214,11 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       createSchema0Database(databasePath, "chain-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(4);
+        expect(store.getSchemaVersion()).toBe(5);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
         ) as { version: number }[];
-        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4]);
+        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -224,7 +227,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
         store.close();
       }
       expect(publishedBackups(backupsDir)).toHaveLength(1);
-      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-4-/);
+      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-5-/);
     } finally {
       removeTempPluginDataRoot(root);
     }

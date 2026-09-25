@@ -92,6 +92,75 @@ try {
         compactProjection: `${artifactId} r${explicitRevision}`,
       });
       out({ ok: true, revision: ref.revision });
+    } else if (mode === "prepare") {
+      // Prepare a proposal from a real process (§95 concurrent prepare race).
+      // argv: prepare <root> <runId> <workspaceId> <sessionId> <gen> <rev> <prepareRequestId> <busyMs>
+      const { createProposalService } = await import("../../src/application/proposal-service.js");
+      const runId = process.argv[4] ?? "";
+      const workspaceId = process.argv[5] ?? "";
+      const sessionId = process.argv[6] ?? "";
+      const bindingGeneration = Number(process.argv[7] ?? "1");
+      const expectedRunRevision = Number(process.argv[8] ?? "1");
+      const prepareRequestId = process.argv[9] ?? `PREP-${process.pid}`;
+      const proposals = createProposalService(store, {
+        nowIso: () => new Date().toISOString(),
+        newId: () => crypto.randomUUID(),
+      });
+      const { proposal } = proposals.prepareProposal({
+        runId,
+        workspaceId,
+        sessionId,
+        bindingGeneration,
+        expectedRunRevision,
+        type: "design_checkpoint",
+        scope: { kind: "architecture" },
+        title: `checkpoint from ${process.pid}`,
+        summary: "raced prepare",
+        changes: [
+          {
+            op: "ADD_DECISION",
+            content: {
+              title: `decision from ${process.pid}`,
+              statement: "raced prepare",
+              rationale: "concurrency test",
+              alternatives: [],
+              consequences: [],
+              scope: "test",
+              supportingRefs: [],
+            },
+            compactProjection: `DEC from ${process.pid}`,
+          },
+        ],
+        prepareRequestId,
+      });
+      out({ ok: true, proposalId: proposal.proposalId, revision: proposal.revision, hash: proposal.proposalHash });
+    } else if (mode === "approve") {
+      // Commit an authorized proposal from a real process (§64/§65 races).
+      // argv: approve <root> <runId> <workspaceId> <sessionId> <gen> <authReqId> <proposalId> <revision> <hash> <busyMs>
+      const { createPlanCommitEngine } = await import("../../src/application/plan-commit-engine.js");
+      const runId = process.argv[4] ?? "";
+      const workspaceId = process.argv[5] ?? "";
+      const sessionId = process.argv[6] ?? "";
+      const bindingGeneration = Number(process.argv[7] ?? "1");
+      const authorization = {
+        authorizationRequestId: process.argv[8] ?? `AUTH-${process.pid}`,
+        proposalId: process.argv[9] ?? "",
+        proposalRevision: Number(process.argv[10] ?? "1"),
+        proposalHash: process.argv[11] ?? "",
+      };
+      const engine = createPlanCommitEngine(store, {
+        nowIso: () => new Date().toISOString(),
+        newId: () => crypto.randomUUID(),
+      });
+      const result = engine.commitAuthorizedProposal({ runId, workspaceId, sessionId, bindingGeneration, authorization });
+      out({
+        ok: true,
+        idempotent: result.idempotent,
+        approvalId: result.approvalId,
+        commitId: result.commitId,
+        snapshotId: result.snapshotId,
+        sequence: result.sequence,
+      });
     } else {
       fail(new Error(`unknown mode: ${mode}`));
     }
