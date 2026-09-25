@@ -44,3 +44,35 @@ export {
   type SpawnRequest,
 } from "./runtime/app-server-process.js";
 export { defaultReadyzProbe, isRetryableProbeError } from "./runtime/readyz.js";
+
+// ---- Controller protocol foundation (Phase 2) ------------------------------
+
+export {
+  AppServerRpcConnection,
+  nodeWebSocketFactory,
+  RpcConnectionError,
+  RpcRequestError,
+  type AppServerRpcOptions,
+  type RpcErrorPayload,
+  type RpcNotification,
+  type RpcServerRequest,
+  type WebSocketFactory,
+  type WebSocketLike,
+} from "./controller/app-server-rpc.js";
+export {
+  CONTROLLER_CLIENT_NAME,
+  ModelController,
+  type ControllerEvent,
+  type ControllerState,
+  type ModelControllerOptions,
+} from "./controller/model-controller.js";
+export {
+  parseInitializeResult,
+  parseModeKind,
+  parseThreadSettingsUpdated,
+  parseThreadStarted,
+  type CollaborationModeKind,
+  type ServerInfoView,
+  type ThreadSettingsUpdatedView,
+  type ThreadStartedView,
+} from "./controller/protocol-types.js";
