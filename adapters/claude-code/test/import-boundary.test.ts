@@ -45,17 +45,62 @@ const WRITER_ALLOWED = new Set([
   path.join(SRC_ROOT, "application", "plan-commit-engine.ts"),
 ]);
 
+/**
+ * Phase 8: the authoritative context read model is the ONE additional
+ * production consumer of plan-memory.ts — restricted to the documented
+ * READ APIs (plan-memory.ts itself lists the read side as the sanctioned
+ * surface for future context-assembler consumers). Write primitives stay
+ * engine-only below.
+ */
+const READ_ONLY_ALLOWED = new Set([path.join(SRC_ROOT, "application", "context-read-model.ts")]);
+
+/** The transaction-scoped WRITE primitives (engine-only, §75/E43/E44). */
+const WRITE_PRIMITIVE_SYMBOLS =
+  /insertArtifactIdentityInTx|insertMemoryRevisionInTx|insertSnapshotInTx|setHeadSnapshotInTx|createInternalPlanMemoryWriter/;
+
+function namedImportsOf(text: string, modulePattern: RegExp): string[] {
+  const names: string[] = [];
+  for (const match of text.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*["']([^"']+)["']/g)) {
+    if (!modulePattern.test(match[2]!)) continue;
+    for (const specifier of match[1]!.split(",")) {
+      const name = specifier.trim().replace(/^type\s+/, "").split(/\s+as\s+/)[0]!.trim();
+      if (name !== "") names.push(name);
+    }
+  }
+  return names;
+}
+
 describe("committed-memory writer boundary (§75/E43/E44)", () => {
   it("only plan-memory.ts (definition) and the PlanCommit engine import the raw writer primitives", () => {
     const offenders: string[] = [];
     for (const file of listFiles(SRC_ROOT, ".ts")) {
       if (WRITER_ALLOWED.has(path.resolve(file))) continue;
-      const imports = readImports(file).join(" ");
-      if (/plan-memory(\.js)?["']/.test(imports)) {
+      const text = readModuleText(file);
+      const names = namedImportsOf(text, /plan-memory(\.js)?$/);
+      if (names.some((name) => WRITE_PRIMITIVE_SYMBOLS.test(name))) {
         offenders.push(path.relative(SRC_ROOT, file));
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("plan-memory.ts imports are confined to the engine (write) and the context read model (read-only)", () => {
+    const offenders: string[] = [];
+    for (const file of listFiles(SRC_ROOT, ".ts")) {
+      const resolved = path.resolve(file);
+      if (WRITER_ALLOWED.has(resolved) || READ_ONLY_ALLOWED.has(resolved)) continue;
+      if (readImports(file).join(" ").match(/plan-memory(\.js)?["']/)) {
+        offenders.push(path.relative(SRC_ROOT, file));
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the context read model never imports a write primitive (read-only carve-out)", () => {
+    const text = readModuleText(path.join(SRC_ROOT, "application", "context-read-model.ts"));
+    const names = namedImportsOf(text, /plan-memory(\.js)?$/);
+    expect(names.length).toBeGreaterThan(0);
+    expect(names.filter((name) => WRITE_PRIMITIVE_SYMBOLS.test(name))).toEqual([]);
   });
 
   it("setHeadSnapshotInTx / insert*InTx are not re-exported from any public application surface", () => {

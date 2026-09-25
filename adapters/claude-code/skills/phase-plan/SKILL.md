@@ -35,5 +35,10 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
   not call `start_or_resume` without it.
 - `approve_proposal` always asks the user for explicit approval; present the
   exact proposal id, revision, and hash before calling it.
+- After a resume or compaction, rely on the injected Phase Plan Recovery
+  Capsule for authoritative state. If exact artifact detail is needed, call
+  `get_context` (structured projection + context epoch) or `read_memory`
+  (exact kind + id + revision). Never trust the conversation summary over
+  the run's HEAD state.
 - This skill is entry and workflow guidance only. It does not define Phase
   Plan's invariants or permissions — the tools and their errors do.

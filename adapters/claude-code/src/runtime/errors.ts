@@ -68,6 +68,11 @@ export type RuntimeErrorCode =
   | "BLOCKING_QUESTION"
   | "BLOCKING_CONFLICT"
   | "PLAN_COMMIT_CONFLICT"
+  // Phase 8 — context projection / recovery capsule / read tools
+  | "CONTEXT_NOT_AVAILABLE"
+  | "CONTEXT_BUDGET_EXCEEDED"
+  | "MEMORY_REF_INVALID"
+  | "MEMORY_DETAIL_UNAVAILABLE"
   // Phase 7 — host authority / approval bridge
   | "HOST_SECRET_UNAVAILABLE"
   | "ENTRY_INTENT_REQUIRED"

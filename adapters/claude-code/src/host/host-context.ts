@@ -41,7 +41,12 @@ export interface HostContextEnvelopeV1 {
 export const HOST_CONTEXT_RESERVED_FIELDS = ["_hostContext", "_entryIntent"] as const;
 
 /** The logical phase-plan tool a hook-built context may target. */
-export type HostContextLogicalTool = "start_or_resume" | "get_state" | "approve_proposal";
+export type HostContextLogicalTool =
+  | "start_or_resume"
+  | "get_state"
+  | "get_context"
+  | "read_memory"
+  | "approve_proposal";
 
 export interface BuildHostContextInput {
   sessionId: string;

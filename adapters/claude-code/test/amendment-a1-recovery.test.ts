@@ -110,7 +110,7 @@ describe("Amendment A1 — resume without host Plan Mode restoration", () => {
       //    recovery context explicitly does NOT claim mode restoration.
       const sessionStart = await handleSessionStart(h.deps, startResumeInput(h, "default"));
       const context = ((sessionStart as { kind: "json"; payload: Record<string, unknown> }).payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
-      expect(context).toContain(`run=${runId}`);
+      expect(context).toContain(`id=${runId}`);
       expect(context).toContain("Phase Plan run recovered.");
       expect(context).toContain("Claude Plan Mode must be restored by invoking /phase-plan.");
       const reattached = createBindingService(h.fixture.store, fixedClock()).getBinding(runId);
@@ -157,15 +157,16 @@ describe("Amendment A1 — resume without host Plan Mode restoration", () => {
       expect(decision.behavior).toBe("allow");
       expect(decision.updatedPermissions).toEqual([{ type: "setMode", mode: "plan", destination: "session" }]);
 
-      // 6. After plan mode: normal continuation is allowed again.
-      expect(
-        handleUserPromptSubmit(h.deps, {
-          sessionId,
-          hookEventName: "UserPromptSubmit",
-          prompt: "continue the plan",
-          permissionMode: "plan",
-        }).kind,
-      ).toBe("empty");
+      // 6. After plan mode: normal continuation is allowed again (the Phase 8
+      //    delta-context marker rides along, but nothing is blocked).
+      const continuation = handleUserPromptSubmit(h.deps, {
+        sessionId,
+        hookEventName: "UserPromptSubmit",
+        prompt: "continue the plan",
+        permissionMode: "plan",
+      });
+      expect(continuation.kind).toBe("json");
+      expect(JSON.stringify(continuation)).not.toContain('"decision":"block"');
       // Still no run/approval/commit/revision delta from the whole chain.
       expect(counts(h.fixture.store)).toEqual(before);
       expect(h.fixture.runs.getPlanningRun(runId)?.revision).toBe(revision);
@@ -181,14 +182,14 @@ describe("Amendment A1 — resume without host Plan Mode restoration", () => {
       const context = ((sessionStart as { kind: "json"; payload: Record<string, unknown> }).payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
       expect(context).toContain("Phase Plan active:");
       expect(context).not.toContain("Phase Plan run recovered.");
-      expect(
-        handleUserPromptSubmit(h.deps, {
-          sessionId: h.fixture.sessionId,
-          hookEventName: "UserPromptSubmit",
-          prompt: "continue",
-          permissionMode: "plan",
-        }).kind,
-      ).toBe("empty");
+      const continuation = handleUserPromptSubmit(h.deps, {
+        sessionId: h.fixture.sessionId,
+        hookEventName: "UserPromptSubmit",
+        prompt: "continue",
+        permissionMode: "plan",
+      });
+      expect(continuation.kind).toBe("json");
+      expect(JSON.stringify(continuation)).not.toContain('"decision":"block"');
     } finally {
       h.close();
     }

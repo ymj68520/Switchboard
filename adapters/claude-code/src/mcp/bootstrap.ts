@@ -1,8 +1,8 @@
 /**
  * Phase Plan stdio MCP bootstrap (frozen plan §10, architecture §28.2).
  *
- * Phase 7 scope: the intentionally minimal tool surface — start_or_resume,
- * get_state, approve_proposal (Phase 7 directive §48). Tool visibility is not
+ * Phase 8 scope: five tools — start_or_resume, get_state, get_context,
+ * read_memory (Phase 8 read-side), approve_proposal. Tool visibility is not
  * authority: every handler verifies the hook-signed HostContext and then
  * delegates to the Application services / Phase 6 engine, which revalidate
  * stage, lifecycle, binding, HEAD and proposal state (directive §49).

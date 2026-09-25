@@ -46,14 +46,21 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
           serverInfo: { name: "phase-plan", version: "0.1.0" },
         });
-        // Phase 7 (§48): the intentionally minimal surface — three tools,
-        // approve_proposal marked with the real boolean interaction flag.
+        // Phase 8 (§42): five tools — the Phase 7 set plus the read-side
+        // get_context/read_memory; approve_proposal keeps the real boolean
+        // interaction flag.
         const tools = (
           parsed.find((m) => m.id === 2)?.result as {
             tools: Array<{ name: string; _meta?: Record<string, unknown> }>;
           }
         ).tools;
-        expect(tools.map((tool) => tool.name)).toEqual(["start_or_resume", "get_state", "approve_proposal"]);
+        expect(tools.map((tool) => tool.name)).toEqual([
+          "start_or_resume",
+          "get_state",
+          "get_context",
+          "read_memory",
+          "approve_proposal",
+        ]);
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
           "anthropic/requiresUserInteraction": true,
         });

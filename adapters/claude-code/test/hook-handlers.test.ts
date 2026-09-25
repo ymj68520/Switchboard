@@ -74,8 +74,8 @@ const SCOPED = {
   get_state: "mcp__plugin_phase-plan_phase-plan__get_state",
 };
 
-describe("SessionStart (§36/§37)", () => {
-  it("attached run injects the minimal recovery marker only", async () => {
+describe("SessionStart (§36/§37; Phase 8 §29)", () => {
+  it("attached run injects the deterministic Recovery Capsule", async () => {
     const h = await makeHarness();
     try {
       const output = await handleSessionStart(h.deps, {
@@ -88,9 +88,12 @@ describe("SessionStart (§36/§37)", () => {
       const payload = (output as { kind: "json"; payload: Record<string, unknown> }).payload;
       const context = (payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
       expect(context).toContain("Phase Plan active:");
-      expect(context).toContain(`run=${h.fixture.runId}`);
+      expect(context).toContain("[Phase Plan Recovery v1]");
+      expect(context).toContain(`id=${h.fixture.runId}`);
       expect(context).toContain("stage=architecture");
-      expect(context).toContain("head=none");
+      expect(context).toContain("commit=none");
+      expect(context).toContain("snapshot=none");
+      expect(context).toContain("context_epoch=");
       expect(context).not.toContain("SQLite");
     } finally {
       h.close();
@@ -199,7 +202,8 @@ describe("UserPromptSubmit drift guard (§39/§40/E19)", () => {
         });
         expect(output.kind).toBe("empty");
       }
-      // plan mode → pass through
+      // plan mode → pass through, now with the Phase 8 delta-context epoch
+      // marker (directive §34; detailed coverage in context-recovery-hooks).
       expect(
         handleUserPromptSubmit(h.deps, {
           sessionId: "S1",
@@ -207,7 +211,7 @@ describe("UserPromptSubmit drift guard (§39/§40/E19)", () => {
           prompt: "go on",
           permissionMode: "plan",
         }).kind,
-      ).toBe("empty");
+      ).toBe("json");
       // no active run → no guard
       expect(
         handleUserPromptSubmit(h.deps, {

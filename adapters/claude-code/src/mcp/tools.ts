@@ -1,9 +1,11 @@
 /**
- * Phase 7 MCP tool surface (Phase 7 directive §12–§13, §24–§28, §48–§52).
+ * Phase 8 MCP tool surface (Phase 8 directive §20/§23/§42).
  *
- * Exactly three tools — the intentionally minimal Phase 7 set:
+ * Exactly five tools — the Phase 7 set plus the two Phase 8 read tools:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
  *   get_state        (read-only, session-scoped)
+ *   get_context      (read-only structured L0–L5 context projection + epoch)
+ *   read_memory      (read-only exact MemoryRef retrieval)
  *   approve_proposal (the Formal Approval bridge into the Phase 6 engine,
  *                     marked anthropic/requiresUserInteraction=true)
  *
@@ -12,7 +14,9 @@
  * environment — including CLAUDE_CODE_SESSION_ID — is NEVER authority
  * (directive §19/§26). Tool visibility is not authority: stage/lifecycle/
  * binding/HEAD/proposal state is revalidated by the application services and
- * the Phase 6 engine on every call.
+ * the Phase 6 engine on every call. Read tools accept a read-only HostContext
+ * without requiring permission_mode=plan (§39) but never widen scope: the run
+ * is resolved from the signed session + workspace, never from model input.
  */
 
 import { getWorkspaceById } from "../store/repositories.js";
@@ -23,9 +27,22 @@ import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import type { PlanningRun } from "../core/planning-run.js";
 import type { BindingSnapshot } from "../store/session-bindings.js";
+import { isMemoryArtifactKind } from "../core/memory-refs.js";
+import type { MemoryRef } from "../core/memory-refs.js";
 import { createBindingService } from "../session/binding-service.js";
 import { createPlanningRunService } from "../application/planning-run-service.js";
 import { createPlanCommitEngine } from "../application/plan-commit-engine.js";
+import { createStoreContextSource } from "../application/context-read-model.js";
+import { assembleContext } from "../context/assembler.js";
+import { buildRecoveryCapsule } from "../context/capsule.js";
+import {
+  CONTEXT_DETAILS,
+  DEFAULT_MEMORY_DETAIL,
+  isContextDetail,
+  isMemoryDetailLevel,
+  type ContextDetail,
+  type MemoryDetailLevel,
+} from "../context/detail-level.js";
 import { findAttachedActiveRun, findDetachedActiveRun, listSessionRuns } from "../session/session-lookup.js";
 import { RuntimeError } from "../runtime/errors.js";
 import { assertHostContextForTool } from "../host/host-context.js";
@@ -76,6 +93,43 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
       required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_context",
+    description:
+      "Read the current session's authoritative Phase Plan context projection (run, HEAD, committed memory, awaiting proposal, available operations) "
+      + "with its deterministic context_epoch. detail=recovery also returns the rendered Recovery Capsule. Read-only; never accepts a run id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        detail: { type: "string", enum: [...CONTEXT_DETAILS], description: '"recovery" includes the rendered Recovery Capsule; defaults to "current".' },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "read_memory",
+    description:
+      "Read one exact immutable Plan Memory revision of the current run by MemoryRef (kind + artifact id + revision). "
+      + "There is no latest/current/fuzzy lookup: take exact refs from get_context/HEAD. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["constraint", "decision", "architecture", "section", "open_question", "conflict"] },
+        id: { type: "string", description: "Artifact id within the current run." },
+        revision: { type: "integer", minimum: 1 },
+        detail: {
+          type: "string",
+          enum: ["identity", "summary", "full", "contract"],
+          description: 'Defaults to "summary"; "contract" is only valid for sections.',
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["kind", "id", "revision", "_hostContext"],
       additionalProperties: false,
     },
   },
@@ -256,6 +310,28 @@ function createNewRun(
 }
 
 // ---------------------------------------------------------------------------
+// Read-tool shared resolution (directive §21/§39/§40/§41)
+// ---------------------------------------------------------------------------
+
+/**
+ * The current session's preferred run in the signed workspace — the ONLY run
+ * a read tool can ever see. Attached-active wins; the session's own
+ * detached-active run (awaiting re-entry) is still readable. Another
+ * session's run is unreachable by construction, so /clear cannot leak the
+ * prior session's context and read tools can never auto-takeover.
+ */
+function resolveCurrentRun(ctx: PhasePlanToolContext, sessionId: string, workspaceId: string) {
+  const entries = listSessionRuns(ctx.store, sessionId).filter(
+    (entry) => entry.binding.workspaceId === workspaceId,
+  );
+  return (
+    entries.find((entry) => entry.binding.state === "attached" && entry.run?.lifecycle === "active") ??
+    entries.find((entry) => entry.run?.lifecycle === "active") ??
+    null
+  );
+}
+
+// ---------------------------------------------------------------------------
 // get_state (directive §26/§50) — read-only, current session+workspace scoped
 // ---------------------------------------------------------------------------
 
@@ -264,13 +340,7 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
   const token = requireHostContext(rawArgs);
   const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_state", businessInput: rawArgs });
 
-  const entries = listSessionRuns(ctx.store, envelope.sessionId).filter(
-    (entry) => entry.binding.workspaceId === envelope.workspaceId,
-  );
-  const preferred =
-    entries.find((entry) => entry.binding.state === "attached" && entry.run?.lifecycle === "active") ??
-    entries.find((entry) => entry.run?.lifecycle === "active") ??
-    null;
+  const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
   if (preferred === null || preferred.run === null) {
     return {};
   }
@@ -302,6 +372,112 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
           },
         }),
   };
+}
+
+// ---------------------------------------------------------------------------
+// get_context (Phase 8 directive §20–§22) — read-only structured projection
+// ---------------------------------------------------------------------------
+
+export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["detail"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_context", businessInput: rawArgs });
+
+  let detail: ContextDetail = "current";
+  if (rawArgs.detail !== undefined) {
+    if (!isContextDetail(rawArgs.detail)) {
+      throw inputInvalid(`detail must be one of: ${CONTEXT_DETAILS.join(", ")}`);
+    }
+    detail = rawArgs.detail;
+  }
+
+  const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
+  if (preferred === null || preferred.run === null) {
+    // §40/§41 — no run selection by workspace, no takeover: an unbound (or
+    // cleared) session simply has no context.
+    return { status: "no_active_run" };
+  }
+
+  const source = createStoreContextSource(ctx.store);
+  const context = assembleContext(source, preferred.run.runId);
+  return {
+    status: "ok",
+    context_epoch: context.epoch,
+    context,
+    ...(detail === "recovery" ? { recoveryCapsule: buildRecoveryCapsule(context).text } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// read_memory (Phase 8 directive §23–§25) — read-only exact MemoryRef read
+// ---------------------------------------------------------------------------
+
+export function handleReadMemory(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["kind", "id", "revision", "detail"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "read_memory", businessInput: rawArgs });
+
+  // §24 — exact refs only: kind/id/revision are required; no latest/current/
+  // by-title/fuzzy authority shortcut exists, and run_id is not model input.
+  if (typeof rawArgs.kind !== "string" || !isMemoryArtifactKind(rawArgs.kind)) {
+    throw inputInvalid(`kind must be one of: constraint, decision, architecture, section, open_question, conflict`);
+  }
+  if (typeof rawArgs.id !== "string" || rawArgs.id.trim() === "") {
+    throw inputInvalid("id must be a non-empty string");
+  }
+  if (typeof rawArgs.revision !== "number" || !Number.isInteger(rawArgs.revision) || rawArgs.revision < 1) {
+    throw inputInvalid("revision must be a positive integer");
+  }
+  let detail: MemoryDetailLevel = DEFAULT_MEMORY_DETAIL;
+  if (rawArgs.detail !== undefined) {
+    if (!isMemoryDetailLevel(rawArgs.detail)) {
+      throw inputInvalid(`detail must be one of: identity, summary, full, contract`);
+    }
+    detail = rawArgs.detail;
+  }
+
+  const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
+  if (preferred === null || preferred.run === null) {
+    return { status: "no_active_run" };
+  }
+
+  const ref: MemoryRef = { runId: preferred.run.runId, kind: rawArgs.kind, id: rawArgs.id, revision: rawArgs.revision };
+  const view = createStoreContextSource(ctx.store).readRevision(ref);
+  if (view === null) {
+    // The ref's run component comes from the signed session scope, so a miss
+    // is a plain exact-revision miss — cross-run reads cannot reach here.
+    throw domainError(
+      "MEMORY_REVISION_NOT_FOUND",
+      `no memory revision exists for ${ref.kind} '${ref.id}'@${ref.revision} in the current run`,
+    );
+  }
+
+  const refView = { runId: ref.runId, kind: ref.kind, id: ref.id, revision: ref.revision };
+  switch (detail) {
+    case "identity":
+      return { status: "ok", ref: refView };
+    case "summary":
+      return { status: "ok", ref: refView, compactProjection: view.compactProjection };
+    case "full":
+      return {
+        status: "ok",
+        ref: refView,
+        content: view.content,
+        compactProjection: view.compactProjection,
+        ...(view.contractJson === null ? {} : { contract: JSON.parse(view.contractJson) }),
+      };
+    case "contract":
+      // §25 — the frozen SectionContract is section-only; anything else is a
+      // typed capability error, never a best-effort guess.
+      if (ref.kind !== "section") {
+        throw domainError("CAPABILITY_NOT_AVAILABLE", `detail="contract" is only available for section artifacts (requested ${ref.kind})`);
+      }
+      return {
+        status: "ok",
+        ref: refView,
+        contract: view.contractJson === null ? null : JSON.parse(view.contractJson),
+      };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +545,10 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleStartOrResume(ctx, rawArgs);
     case "get_state":
       return handleGetState(ctx, rawArgs);
+    case "get_context":
+      return handleGetContext(ctx, rawArgs);
+    case "read_memory":
+      return handleReadMemory(ctx, rawArgs);
     case "approve_proposal":
       return handleApproveProposal(ctx, rawArgs);
     default:

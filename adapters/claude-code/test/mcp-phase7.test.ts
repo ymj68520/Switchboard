@@ -89,9 +89,15 @@ function hostToken(
   );
 }
 
-describe("tools/list metadata (E27/E37/E38)", () => {
-  it("exposes exactly the three Phase 7 tools; approve_proposal carries real boolean requiresUserInteraction", () => {
-    expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual(["start_or_resume", "get_state", "approve_proposal"]);
+describe("tools/list metadata (E27/E37/E38; Phase 8 §42 five-tool surface)", () => {
+  it("exposes exactly the Phase 8 tool set; approve_proposal carries real boolean requiresUserInteraction", () => {
+    expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
+      "start_or_resume",
+      "get_state",
+      "get_context",
+      "read_memory",
+      "approve_proposal",
+    ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
     expect(approve._meta).toBe(REQUIRES_USER_INTERACTION_META);
     expect(approve._meta!["anthropic/requiresUserInteraction"]).toBe(true);

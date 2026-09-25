@@ -18,7 +18,6 @@
 import { discoverAndRegisterWorkspace } from "../workspace/identity.js";
 import { getWorkspaceById, type WorkspaceRecord } from "../store/repositories.js";
 import { comparisonKey } from "../workspace/canonical-path.js";
-import { getHeadCommitRecord } from "../store/plan-commits.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import { createBindingService } from "../session/binding-service.js";
@@ -56,6 +55,10 @@ import {
   type HostContextLogicalTool,
 } from "../host/host-context.js";
 import { entryIntentIsCurrent, issueEntryIntent, verifyEntryIntent } from "../host/entry-intent.js";
+import { createStoreContextSource } from "../application/context-read-model.js";
+import { assembleContext } from "../context/assembler.js";
+import { deriveContextEpochFromSource } from "../context/epoch.js";
+import { buildRecoveryCapsule } from "../context/capsule.js";
 
 /** Marker injected with the entry token and echoed by SKILL.md (§39 exception). */
 export const PHASE_PLAN_ENTRY_MARKER = "phase-plan:entry-v1";
@@ -82,7 +85,13 @@ function deny(hookEventName: string, code: string, reason: string): HookOutput {
 const DRIFT_ALLOWLIST = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion"]);
 
 function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
-  return logical === "start_or_resume" || logical === "get_state" || logical === "approve_proposal";
+  return (
+    logical === "start_or_resume" ||
+    logical === "get_state" ||
+    logical === "get_context" ||
+    logical === "read_memory" ||
+    logical === "approve_proposal"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -116,13 +125,27 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
   if (attached === null || attached.run === null) {
     return emptyOutput();
   }
-  const head = getHeadCommitRecord(deps.store, attached.run.runId);
-  const context = [
-    "Phase Plan active:",
-    `run=${attached.run.runId}`,
-    `stage=${attached.run.stage}`,
-    `head=${head === null ? "none" : head.resultingSnapshotId}`,
-  ];
+  // Phase 8 (§29): the minimal Phase 7 marker is upgraded to the full
+  // deterministic Recovery Capsule — startup, resume, and compact sources all
+  // land here whenever the session owns an attached active run. The capsule
+  // is rebuilt from HEAD + run state alone; a Claude compact summary is
+  // conversation context and never an input (§31).
+  const context: string[] = ["Phase Plan active:"];
+  try {
+    const phaseContext = assembleContext(createStoreContextSource(deps.store), attached.run.runId);
+    context.push(buildRecoveryCapsule(phaseContext).text);
+  } catch (err) {
+    // §47 — SessionStart cannot block the host, so a capsule failure is
+    // fail-VISIBLE: the marker tells the model/user not to continue on stale
+    // context. (Store-level breakage additionally fails the later
+    // UserPromptSubmit/PreToolUse guards closed.)
+    const code = err instanceof RuntimeError ? err.code : "INTERNAL_ERROR";
+    context.push(
+      "Phase Plan recovery capsule could not be built (CONTEXT_RECOVERY_FAILED).",
+      `error=${code}: ${err instanceof Error ? err.message : String(err)}`,
+      "Do not continue planning on stale context; invoke /phase-plan.",
+    );
+  }
   // Amendment A1 §7: SessionStart recovers planning STATE, never the host's
   // Plan Mode. When the mode is missing the recovered run stays fail-closed
   // (UserPromptSubmit/PreToolUse guards) until /phase-plan re-entry.
@@ -132,7 +155,7 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
       "Claude Plan Mode must be restored by invoking /phase-plan.",
     );
   }
-  return contextOutput("SessionStart", context.join("\n"));
+  return contextOutput("SessionStart", context.join("\n\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +198,19 @@ export function handleUserPromptSubmit(deps: HookHandlerDeps, input: UserPromptS
     // Known active binding + not plan → fail closed (directive §40).
     return blockPrompt(DRIFT_GUARD_REASON);
   }
-  return emptyOutput();
+  // Phase 8 (§34) — normal-turn delta foundation: inject only the short
+  // deterministic epoch marker, never the full capsule (startup/resume/
+  // compact carry the capsule). The epoch is a stale-context hint, never a
+  // correctness fence (§6/§35): guards below still protect every mutation.
+  // A store failure here propagates and the hook runtime fails closed.
+  const epoch = deriveContextEpochFromSource(createStoreContextSource(deps.store), attached.run.runId);
+  if (epoch === null) {
+    return emptyOutput();
+  }
+  return contextOutput(
+    "UserPromptSubmit",
+    `Phase Plan context epoch: ${epoch}\nUse phase_plan.get_context if context appears stale.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -296,14 +331,17 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
-  // approve_proposal + get_state require an owned active run for mutation
-  // context; reads degrade to a run-less session-scoped context.
+  // approve_proposal requires an owned active run for its mutation context;
+  // reads (get_state/get_context/read_memory) degrade to a run-less outcome:
+  // nothing is signed, so the MCP layer fails closed and never reaches a
+  // workspace-wide run selection (Phase 8 §40/§41 — no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
     if (logical === "approve_proposal") {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
-    // get_state without a run still gets a session-scoped read context.
+    // get_state/get_context/read_memory without a run: no read context is
+    // signed (fail closed; the tool call then surfaces HOST_CONTEXT_REQUIRED).
     return emptyOutput();
   }
 
@@ -321,7 +359,9 @@ async function handlePhasePlanPreToolUse(
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }
   // §29 — approve_proposal additionally requires the session to BE in Plan
-  // Mode before a mutation context is signed at all.
+  // Mode before a mutation context is signed at all. Read tools (§39)
+  // deliberately do NOT require plan mode: a recovered run must stay
+  // readable while A1 mode restoration is pending.
   if (logical === "approve_proposal" && input.permissionMode !== "plan") {
     return deny(
       eventName,
