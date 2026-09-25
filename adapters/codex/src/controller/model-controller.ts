@@ -543,6 +543,32 @@ export class ModelController {
       }
     }
   }
+
+  // ----------------------------------------------------------------------
+  // Thread model command primitive (Phase 4)
+  // ----------------------------------------------------------------------
+
+  /**
+   * Narrow model command: sends `thread/settings/update` with params of
+   * EXACTLY `{ threadId, model }` — nothing else. Codex is the
+   * collaboration-mode authority, so the controller never sends
+   * collaborationMode/effort/sandbox/approval/permission fields alongside a
+   * model change (Phase 4 directive §2-3, Architecture SPEC A10).
+   *
+   * This primitive is deliberately dumb: it does NOT touch last_mode,
+   * subscription state, or any retry logic, and it does not track the
+   * current model. Failures propagate to the caller (the switcher owns the
+   * fail-open policy). Mode-observation semantics are unaffected: the
+   * server's same-mode settings echo produces no mode event, so applying a
+   * model can never loop.
+   */
+  async setThreadModel(threadId: string, model: string): Promise<void> {
+    const connection = this.connection;
+    if (connection === null || !connection.rpc.isOpen || this.controllerState !== "listening") {
+      throw new RpcConnectionError("controller is not listening");
+    }
+    await connection.rpc.request("thread/settings/update", { threadId, model });
+  }
 }
 
 /**

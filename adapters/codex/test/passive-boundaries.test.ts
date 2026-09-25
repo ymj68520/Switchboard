@@ -36,12 +36,34 @@ function stripComments(text: string): string {
 }
 
 describe("production boundary scans", () => {
-  it("never sends thread/settings/update (the settings mutation RPC)", () => {
+  it("sends thread/settings/update from EXACTLY ONE production site (the narrow primitive)", () => {
+    // Phase 4 legitimizes the settings mutation — but only as the narrow
+    // `{threadId, model}` primitive inside the controller. No other
+    // production module may reference the method.
+    const offenders = productionSources()
+      .filter(({ file }) => !file.endsWith("model-controller.ts"))
+      .filter(({ text }) => /thread\/settings\/update(?![dD])/.test(stripComments(text)));
+    expect(offenders.map((o) => o.file)).toEqual([]);
+  });
+
+  it("routes no turn interception and no model/list through production code", () => {
     const offenders = productionSources().filter(({ text }) =>
-      // "thread/settings/updated" (the notification) is fine; the bare
-      // request method is not.
-      /thread\/settings\/update(?![dD])/.test(stripComments(text)),
+      /turn\/(start|started|completed)(?![a-zA-Z])|model\/list/.test(stripComments(text)),
     );
+    expect(offenders.map((o) => o.file)).toEqual([]);
+  });
+
+  it("the switcher never mutates settings other than the model", () => {
+    // The outbound params object is behaviorally pinned to exactly
+    // {threadId, model}; here we pin that no OTHER settings field is even
+    // named as an outbound key in the switcher layer.
+    const offenders = productionSources()
+      .filter(({ file }) => file.endsWith("phase-model-switcher.ts") || file.endsWith("routing.ts"))
+      .filter(({ text }) =>
+        /["'](collaborationMode|reasoningEffort|effort|sandboxPolicy|approvalPolicy|permissions|serviceTier|cwd|personality)["']/.test(
+          stripComments(text),
+        ),
+      );
     expect(offenders.map((o) => o.file)).toEqual([]);
   });
 

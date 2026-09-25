@@ -81,3 +81,17 @@ export {
   type ThreadStartedView,
   type ThreadStatusChangedView,
 } from "./controller/protocol-types.js";
+
+// ---- Phase-triggered model application (Phase 4) ---------------------------
+
+export {
+  desiredModel,
+  validatePhaseModelConfig,
+  PhaseModelConfigError,
+  type PhaseModelConfig,
+} from "./switcher/routing.js";
+export {
+  PhaseModelSwitcher,
+  type SwitcherEvent,
+  type SwitcherState,
+} from "./switcher/phase-model-switcher.js";

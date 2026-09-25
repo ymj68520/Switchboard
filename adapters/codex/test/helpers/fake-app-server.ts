@@ -50,6 +50,12 @@ export interface FakeAppServer {
   setThreadResumeDelay(ms: number): void;
   /** How `thread/unsubscribe` is answered: "ok" (default) or rejected. */
   setUnsubscribeBehavior(behavior: "ok" | "reject"): void;
+  /** How `thread/settings/update` is answered: "ok" (default) or rejected. */
+  setSettingsUpdateBehavior(behavior: "ok" | "reject"): void;
+  /** Artificial delay before a thread/settings/update reply. */
+  setSettingsUpdateDelay(ms: number): void;
+  /** Params of every thread/settings/update request, in arrival order. */
+  settingsUpdateRequests(): Array<Record<string, unknown>>;
   /** Number of thread/resume requests received across all connections. */
   resumeRequestCount(): number;
   /** Number of thread/unsubscribe requests received across all connections. */
@@ -76,6 +82,8 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
   let threadResumeResult: unknown = { thread: { id: null } };
   let threadResumeDelayMs = 0;
   let unsubscribeBehavior: "ok" | "reject" = "ok";
+  let settingsUpdateBehavior: "ok" | "reject" = "ok";
+  let settingsUpdateDelayMs = 0;
 
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise<void>((resolve) => wss.on("listening", resolve));
@@ -140,6 +148,25 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
     }
     if (typed.method === "thread/resume" && typeof typed.id !== "undefined") {
       replyThreadResume(record, typed);
+      return;
+    }
+    if (typed.method === "thread/settings/update" && typeof typed.id !== "undefined") {
+      const respond = (): void => {
+        if (settingsUpdateBehavior === "ok") {
+          send(record, { jsonrpc: "2.0", id: typed.id, result: {} });
+        } else {
+          send(record, {
+            jsonrpc: "2.0",
+            id: typed.id,
+            error: { code: -32600, message: "unknown model (fake)" },
+          });
+        }
+      };
+      if (settingsUpdateDelayMs > 0) {
+        setTimeout(respond, settingsUpdateDelayMs);
+      } else {
+        respond();
+      }
       return;
     }
     if (typed.method === "thread/unsubscribe" && typeof typed.id !== "undefined") {
@@ -232,6 +259,18 @@ export async function startFakeAppServer(): Promise<FakeAppServer> {
     setUnsubscribeBehavior: (behavior) => {
       unsubscribeBehavior = behavior;
     },
+    setSettingsUpdateBehavior: (behavior) => {
+      settingsUpdateBehavior = behavior;
+    },
+    setSettingsUpdateDelay: (ms) => {
+      settingsUpdateDelayMs = ms;
+    },
+    settingsUpdateRequests: () =>
+      records.flatMap((record) =>
+        record.received
+          .filter((frame) => frame.method === "thread/settings/update")
+          .map((frame) => frame.params as Record<string, unknown>),
+      ),
     resumeRequestCount: () =>
       records.reduce(
         (total, record) =>
