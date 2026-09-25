@@ -2,10 +2,13 @@
   "name": "@switchboard/codex",
   "version": "0.1.0",
   "private": true,
-  "description": "Switchboard adapter for Codex CLI: Phase Model Switcher session runtime (Phase 1).",
+  "description": "Switchboard adapter for Codex CLI: Phase Model Switcher managed session launcher.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "phase-model": "./bin/phase-model.js"
+  },
   "files": [
     "dist"
   ],

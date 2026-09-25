@@ -40,6 +40,13 @@
  * keeps at most one resume attempt per controller; a bind-generation token
  * makes late completions for a replaced thread harmless.
  *
+ * Binding scope (Phase 5 empirical refinement, verified against real-TUI
+ * 0.156.1 payloads): among parentless threads, those Codex marks as
+ * internal helpers (`ephemeral: true`, observed source
+ * `thread_title` for TUI title generation) are ignored — they never
+ * persist a rollout and are not the conversation thread. Metadata-exact,
+ * never heuristic (Architecture SPEC §12.2).
+ *
  * Failure model: any post-connect protocol failure disables the controller
  * (fail-open direction, Architecture SPEC §21.2). There is no automatic
  * reconnect. Unknown collaboration modes disable the controller — never
@@ -298,6 +305,18 @@ export class ModelController {
     }
     // Child/subagent threads never enter switching scope.
     if (view.parentThreadId !== null) {
+      return;
+    }
+    // Phase 5 empirical refinement (verified against real-TUI 0.156.1
+    // payloads): the TUI internally spawns short-lived helper threads —
+    // observed: thread-title generation (`threadSource: "thread_title"`,
+    // `ephemeral: true`, `path: null`). They carry TOP-LEVEL metadata
+    // (parentThreadId == null) but are not the TUI's conversation thread,
+    // never persist a rollout (their subscription can never converge), and
+    // would permanently hijack the binding away from the real thread.
+    // This filter stays metadata-based (Architecture SPEC §12.2): exact
+    // Codex-declared fields, no cwd/recency/shape heuristics.
+    if (view.ephemeral || view.threadSource === "thread_title") {
       return;
     }
     // Duplicate top-level notification for the current thread → ignore.

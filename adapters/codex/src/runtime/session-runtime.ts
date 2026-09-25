@@ -75,6 +75,7 @@ export class CodexSessionRuntime {
   private exitGuard: (() => void) | null = null;
   private abortBootstrap: ((reason: BootstrapAbortReason) => void) | null = null;
   private rejectedEndpointCandidates: readonly RejectedEndpointCandidate[] = [];
+  private readonly exitListeners = new Set<(status: ChildExitStatus) => void>();
 
   constructor(config: CodexSessionRuntimeConfig = {}) {
     this.config = config;
@@ -93,6 +94,33 @@ export class CodexSessionRuntime {
   /** Exit status of the app-server child once it has exited, else null. */
   get exitStatus(): ChildExitStatus | null {
     return this.recordedExit;
+  }
+
+  /**
+   * Observe the app-server child's exit (Phase 5: the managed-session race
+   * between TUI exit and unexpected app-server death — directive §26).
+   * Pure observation; the runtime's own cleanup semantics are unchanged.
+   * Listeners registered after the child already exited fire immediately.
+   * Returns an unsubscribe function.
+   */
+  onExit(listener: (status: ChildExitStatus) => void): () => void {
+    this.exitListeners.add(listener);
+    if (this.recordedExit !== null) {
+      this.notifyExit(this.recordedExit);
+    }
+    return () => {
+      this.exitListeners.delete(listener);
+    };
+  }
+
+  private notifyExit(status: ChildExitStatus): void {
+    for (const listener of this.exitListeners) {
+      try {
+        listener(status);
+      } catch {
+        // Listener faults must not corrupt runtime state.
+      }
+    }
   }
 
   /**
@@ -198,6 +226,7 @@ export class CodexSessionRuntime {
       const exitWatch = handle.exits.then(
         (status): ExitWatchOutcome => {
           this.recordedExit = status;
+          this.notifyExit(status);
           return { kind: "exit", status };
         },
         (error): ExitWatchOutcome => ({ kind: "spawnError", error }),

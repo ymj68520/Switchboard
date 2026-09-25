@@ -29,6 +29,18 @@ export interface ThreadStartedView {
   readonly threadId: string;
   /** null/undefined ⇒ top-level thread; anything else ⇒ child/subagent. */
   readonly parentThreadId: string | null;
+  /**
+   * Codex thread metadata (Phase 5 empirical payloads, 0.156.1): `ephemeral`
+   * threads are internal runtime helpers (observed: TUI thread-title
+   * generation) that never persist a rollout. Absent field ⇒ not ephemeral.
+   */
+  readonly ephemeral: boolean;
+  /**
+   * Exact thread origin declared by Codex. Observed values: "user" for the
+   * TUI's conversation thread, "thread_title" for its internal title
+   * generator. null when the server omits the field (tolerant reading).
+   */
+  readonly threadSource: string | null;
 }
 
 /**
@@ -78,7 +90,12 @@ export function parseThreadStarted(params: unknown): ThreadStartedView | null {
   }
   const rawParent = params.thread.parentThreadId;
   const parentThreadId = typeof rawParent === "string" ? rawParent : null;
-  return { threadId, parentThreadId };
+  const ephemeral = params.thread.ephemeral === true;
+  const threadSource =
+    typeof params.thread.threadSource === "string" && params.thread.threadSource.length > 0
+      ? params.thread.threadSource
+      : null;
+  return { threadId, parentThreadId, ephemeral, threadSource };
 }
 
 /**

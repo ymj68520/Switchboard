@@ -48,6 +48,12 @@ export interface SpawnRequest {
   readonly args: readonly string[];
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * stdio attachment mode. "pipe" (default — app-server: the launcher reads
+   * startup output) or "inherit" (Phase 5 TUI: the child must own the user
+   * terminal — directive §18). Termination semantics are identical.
+   */
+  readonly stdio?: "pipe" | "inherit";
 }
 
 export type AppServerProcessFactory = (request: SpawnRequest) => AppServerProcess;
@@ -67,7 +73,7 @@ export class NodeAppServerProcess implements AppServerProcess {
       env: request.env,
       shell: false,
       detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: request.stdio === "inherit" ? ["inherit", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
     this.pid = this.child.pid;

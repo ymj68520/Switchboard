@@ -95,3 +95,50 @@ export {
   type SwitcherEvent,
   type SwitcherState,
 } from "./switcher/phase-model-switcher.js";
+
+// ---- Managed TUI launcher (Phase 5) ----------------------------------------
+
+export {
+  DEFAULT_REASONING_EFFORT,
+  DEFAULT_CONFIG_FILE_NAME,
+  ENV_PLANNING_MODEL,
+  ENV_EXECUTION_MODEL,
+  ENV_REASONING_EFFORT,
+  CLI_PLANNING_MODEL,
+  CLI_EXECUTION_MODEL,
+  CLI_REASONING_EFFORT,
+  CLI_CONFIG_FILE,
+  CodexPhaseModelConfigError,
+  loadCodexPhaseModelConfig,
+  type CodexPhaseModelConfig,
+  type PartialPhaseModelConfig,
+} from "./config/phase-model-config.js";
+export {
+  describeResolvedCodexCommand,
+  resolveCodexCommand,
+  type ResolvedCodexCommand,
+} from "./launcher/command-resolution.js";
+export {
+  ReservedArgumentConflictError,
+  assertNoReservedArgs,
+  buildCodexTuiArgs,
+  type BuildCodexTuiArgsInput,
+} from "./launcher/tui-args.js";
+export {
+  nodeCodexTuiProcessFactory,
+  type CodexTuiProcess,
+  type CodexTuiProcessFactory,
+} from "./launcher/tui-process.js";
+export {
+  ManagedCodexSession,
+  type ManagedCodexSessionOptions,
+  type ManagedSessionOutcome,
+} from "./launcher/managed-session.js";
+export {
+  LAUNCHER_USAGE,
+  LauncherUsageError,
+  parseLauncherArgs,
+  runLauncher,
+  type LauncherArgParse,
+  type RunLauncherOptions,
+} from "./launcher/cli.js";

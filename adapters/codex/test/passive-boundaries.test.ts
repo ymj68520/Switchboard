@@ -35,6 +35,11 @@ function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, " ");
 }
 
+/** Normalize the path so layer-prefix checks work on win32 separators. */
+function layerOf(file: string): string {
+  return file.replaceAll("\\", "/");
+}
+
 describe("production boundary scans", () => {
   it("sends thread/settings/update from EXACTLY ONE production site (the narrow primitive)", () => {
     // Phase 4 legitimizes the settings mutation — but only as the narrow
@@ -67,10 +72,43 @@ describe("production boundary scans", () => {
     expect(offenders.map((o) => o.file)).toEqual([]);
   });
 
-  it("contains no model routing vocabulary", () => {
-    const offenders = productionSources().filter(({ text }) =>
-      /planning_model|execution_model|model_for\s*\(/.test(stripComments(text)),
-    );
+  it("contains no model routing vocabulary outside the user-facing config surface", () => {
+    // Phase 5 introduces the user-facing configuration schema whose
+    // spelling is FROZEN by Architecture SPEC §25 (planning_model /
+    // execution_model snake_case in the config file and CLI usage text).
+    // The config/ and launcher/ layers carry that deliberate schema; the
+    // runtime/transport/controller/switcher layers must never use the
+    // routing vocabulary.
+    const offenders = productionSources()
+      .filter(({ file }) => { const f = layerOf(file); return !f.startsWith("config/") && !f.startsWith("launcher/"); })
+      .filter(({ text }) =>
+        /planning_model|execution_model|model_for\s*\(/.test(stripComments(text)),
+      );
+    expect(offenders.map((o) => o.file)).toEqual([]);
+  });
+
+  it("launcher owns no second process-tree kill implementation (Phase 5 §29)", () => {
+    const offenders = productionSources()
+      .filter(({ file }) => layerOf(file).startsWith("launcher/"))
+      .filter(({ text }) => /taskkill/i.test(stripComments(text)));
+    expect(offenders.map((o) => o.file)).toEqual([]);
+  });
+
+  it("launcher never reads TUI output streams (Phase 5 §19 terminal ownership)", () => {
+    const offenders = productionSources()
+      .filter(({ file }) => layerOf(file).startsWith("launcher/"))
+      .filter(({ text }) => /stdoutStream|stderrStream/.test(stripComments(text)));
+    expect(offenders.map((o) => o.file)).toEqual([]);
+  });
+
+  it("launcher adds no protocol surface beyond the frozen components (Phase 5 §0)", () => {
+    const offenders = productionSources()
+      .filter(({ file }) => { const f = layerOf(file); return f.startsWith("launcher/") || f.startsWith("config/"); })
+      .filter(({ text }) =>
+        /thread\/(started|settings\/updated|settings\/update|resume|unsubscribe)|"initialize"/.test(
+          stripComments(text),
+        ),
+      );
     expect(offenders.map((o) => o.file)).toEqual([]);
   });
 
