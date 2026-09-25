@@ -16,6 +16,12 @@ import type {
 export const DEFAULT_PLANNING_RUNTIME_SPEC: PlanningRuntimeSpec = {
   commandName: "ultra-plan",
   agentName: "ultraplan",
+  // Phase 2J §30: the HOST-NATIVE Build agent is the default execution
+  // runtime context — no second custom Build orchestration agent exists.
+  // The execution model is left UNSET deliberately (§29/§57): the session's
+  // host default model is the documented safe default; a tier-policy model
+  // can be configured via `executionModel` ("provider/model").
+  executionAgent: "build",
 };
 
 /**
@@ -40,11 +46,20 @@ export const ULTRA_PLAN_TOOL_NAMES = [
   "ultraplan_propose_question_resolution",
   "ultraplan_raise_conflict",
   "ultraplan_promote_evidence",
+  "ultraplan_request_architecture",
   "ultraplan_prepare_proposal",
+  "ultraplan_prepare_section_decomposition",
+  "ultraplan_prepare_section_checkpoint",
+  "ultraplan_request_section_focus",
   "ultraplan_request_user_approval",
   "ultraplan_request_completion",
   "ultraplan_request_reopen",
   "ultraplan_request_synthesis",
+  "ultraplan_begin_synthesis",
+  "ultraplan_submit_synthesis_manifest",
+  "ultraplan_run_semantic_validation",
+  "ultraplan_request_finalization",
+  "ultraplan_prepare_final_plan",
 ] as const;
 
 export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {

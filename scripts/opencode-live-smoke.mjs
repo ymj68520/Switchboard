@@ -14,6 +14,32 @@
  *   6. second invocation RESUMES the same run (no second run)
  *   7. deterministic status text is returned
  *   8. no second OpenCode session is created
+ *   9. ultraplan_request_architecture moves discovery → architecture live
+ *        (Phase 2C §33 vertical, real ToolContext/session)
+ *  10. a REAL server restart resumes the run with stage=architecture intact
+ *  11. ultraplan_prepare_section_decomposition is registered and refuses
+ *        outside detail/decomposition-needed (Phase 2D §48)
+ *  12. ultraplan_prepare_section_checkpoint is registered and refuses
+ *        outside detail/section-ready (Phase 2E1 §47)
+ *  13. ultraplan_request_section_focus is registered and refuses outside
+ *        detail; request_completion(kind=section) refuses outside a
+ *        checkpointed active Section (Phase 2E2 §52)
+ *  14. ultraplan_begin_synthesis + ultraplan_submit_synthesis_manifest are
+ *        registered and both refuse outside valid Synthesis state
+ *        (Phase 2F §64)
+ *  15. ultraplan_run_semantic_validation + ultraplan_request_reopen are
+ *        registered; run_semantic_validation refuses outside stage=synthesis
+ *        and request_reopen refuses outside the detail/synthesis reopen
+ *        states (Phase 2G §78)
+ *  16. ultraplan_request_finalization is registered and refuses outside
+ *        synthesis/current-clean-validation with a structured capability
+ *        failure; the full Evidence Audit → gate → candidate vertical stays
+ *        deterministic integration-tested (no live approval is faked)
+ *        (Phase 2H §78)
+ *  17. ultraplan_prepare_final_plan is registered and refuses outside the
+ *        candidate-ready synthesis substate; the full Proposal → Approval →
+ *        second-gate → Final PlanCommit chain stays deterministic
+ *        integration-tested (no live user Allow is faked) (Phase 2I §90)
  *
  * Requires network access for model inference (uses the free `opencode/*`
  * gateway model by default). Prints PASS/FAIL per criterion and exits
@@ -151,6 +177,11 @@ async function main() {
       ultraplanTools.length >= 8,
       ultraplanTools.length ? `found: ${ultraplanTools.join(", ")}` : `none (ids: ${toolIds.slice(0, 20).join(", ")})`,
     );
+    report(
+      "Phase 2D decomposition tool registered (ultraplan_prepare_section_decomposition)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_section_decomposition"),
+      ultraplanTools.includes("ultraplan_prepare_section_decomposition") ? "registered" : "missing from tool ids",
+    );
 
     // -- real session + /ultra-plan ------------------------------------------
     const sessionRes = await fetch(`${base}/session`, {
@@ -202,6 +233,220 @@ async function main() {
       `before=${beforeCount} after=${afterCount}`,
     );
 
+    // -- Phase 2C §33 live vertical: discovery → architecture ----------------
+    const toArch = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_request_architecture tool now, then report its result verbatim.",
+      /Stage: architecture/,
+    );
+    // The status block of the MOST RECENT message decides — earlier history
+    // still contains the original discovery block.
+    report(
+      "ultraplan_request_architecture moves the run discovery -> architecture (live model invocation)",
+      lastStageOf(toArch.text) === "Stage: architecture",
+      `latest status block: ${lastStageOf(toArch.text)}`,
+    );
+
+    // -- Phase 2D §48 live vertical: the decomposition capability is live and
+    // deterministically OUT of reach outside the detail decomposition-needed
+    // substate (this run is in architecture, so preparation must refuse).
+    const decompProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_prepare_section_decomposition tool now with two sections and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_prepare_section_decomposition refuses outside detail/decomposition-needed (live)",
+      decompProbe.ok,
+      decompProbe.ok ? "structured capability_not_available returned" : decompProbe.detail,
+    );
+
+    // -- Phase 2E1 §47 live vertical: the checkpoint tool is registered and
+    // capability-gated outside detail/section-ready (this run is in
+    // architecture, so the checkpoint surface must refuse deterministically).
+    report(
+      "Phase 2E1 checkpoint tool registered (ultraplan_prepare_section_checkpoint)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_section_checkpoint"),
+      ultraplanTools.includes("ultraplan_prepare_section_checkpoint") ? "registered" : "missing from tool ids",
+    );
+    const ckptProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_prepare_section_checkpoint tool now with a small design and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_prepare_section_checkpoint refuses outside detail/section-ready (live)",
+      ckptProbe.ok,
+      ckptProbe.ok ? "structured capability_not_available returned" : ckptProbe.detail,
+    );
+
+    // -- Phase 2E2 §52 live vertical: the focus-request tool is registered,
+    // and section completion is out of reach outside a checkpointed active
+    // Section (this run sits in architecture, so kind=section must refuse).
+    report(
+      "Phase 2E2 focus tool registered (ultraplan_request_section_focus)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_section_focus"),
+      ultraplanTools.includes("ultraplan_request_section_focus") ? "registered" : "missing from tool ids",
+    );
+    const focusProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_request_section_focus tool now with sectionID SEC-001 and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_request_section_focus refuses outside detail (live)",
+      focusProbe.ok,
+      focusProbe.ok ? "structured capability_not_available returned" : focusProbe.detail,
+    );
+    const completionProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_request_completion tool now with kind=section and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_request_completion(kind=section) refuses outside detail/section-ready (live)",
+      completionProbe.ok,
+      completionProbe.ok ? "structured capability_not_available returned" : completionProbe.detail,
+    );
+
+    // -- Phase 2F §64 live vertical: the derived-artifact synthesis tools are
+    // registered, and both are capability-gated outside valid Synthesis state
+    // (this run sits in architecture, so both must refuse deterministically).
+    report(
+      "Phase 2F begin-synthesis tool registered (ultraplan_begin_synthesis)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_begin_synthesis"),
+      ultraplanTools.includes("ultraplan_begin_synthesis") ? "registered" : "missing from tool ids",
+    );
+    report(
+      "Phase 2F manifest tool registered (ultraplan_submit_synthesis_manifest)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_submit_synthesis_manifest"),
+      ultraplanTools.includes("ultraplan_submit_synthesis_manifest") ? "registered" : "missing from tool ids",
+    );
+    const beginSynthesisProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_begin_synthesis tool now with no arguments and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_begin_synthesis refuses outside stage=synthesis (live)",
+      beginSynthesisProbe.ok,
+      beginSynthesisProbe.ok ? "structured capability_not_available returned" : beginSynthesisProbe.detail,
+    );
+    const submitManifestProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_submit_synthesis_manifest tool now with one cross-section link, one implementation step, and one limitation, and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_submit_synthesis_manifest refuses outside stage=synthesis (live)",
+      submitManifestProbe.ok,
+      submitManifestProbe.ok ? "structured capability_not_available returned" : submitManifestProbe.detail,
+    );
+
+    // -- Phase 2G §78 live vertical: the semantic-validation and reopen tools
+    // are registered and capability-gated (this run sits in architecture, so
+    // both must refuse deterministically). A REAL validation inference is NOT
+    // performed here: reaching synthesis live requires the interactive Detail
+    // approval cycles that headless smoke cannot satisfy — faking one would
+    // violate the no-fake-validation rule. The full semantic vertical is
+    // integration-tested (test/validation.test.ts) with deterministic fakes
+    // and process-level crash probes.
+    report(
+      "Phase 2G semantic-validation tool registered (ultraplan_run_semantic_validation)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_run_semantic_validation"),
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_run_semantic_validation") ? "registered" : "missing from tool ids",
+    );
+    report(
+      "Phase 2G reopen tool registered (ultraplan_request_reopen)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_reopen"),
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_reopen") ? "registered" : "missing from tool ids",
+    );
+    const runValidationProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_run_semantic_validation tool now with no arguments and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_run_semantic_validation refuses outside stage=synthesis (live)",
+      runValidationProbe.ok,
+      runValidationProbe.ok ? "structured capability_not_available returned" : runValidationProbe.detail,
+    );
+    const reopenProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_request_reopen tool now with sectionID SEC-001 and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_request_reopen refuses outside detail/synthesis reopen states (live)",
+      reopenProbe.ok,
+      reopenProbe.ok ? "structured capability_not_available returned" : reopenProbe.detail,
+    );
+
+    // -- Phase 2H §78 live vertical: the finalization request tool is
+    // registered and refuses outside synthesis/current-clean-validation with
+    // a structured capability failure (this run sits in architecture).
+    // HONEST SPLIT: the full finalization vertical (Evidence Audit →
+    // deterministic gate → FinalPlanCandidate) cannot traverse the interactive
+    // approval boundaries headlessly into synthesis, so it remains
+    // deterministic integration-tested
+    // (adapters/opencode/test/finalization.test.ts + crash probes); no live
+    // approval, audit, or candidate is faked here.
+    report(
+      "Phase 2H finalization tool registered (ultraplan_request_finalization)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_finalization"),
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_finalization") ? "registered" : "missing from tool ids",
+    );
+    const requestFinalizationProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_request_finalization tool now with no arguments and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_request_finalization refuses outside synthesis/current-clean-validation (live)",
+      requestFinalizationProbe.ok,
+      requestFinalizationProbe.ok ? "structured capability_not_available returned" : requestFinalizationProbe.detail,
+    );
+
+    // -- Phase 2I §90 live vertical: the final-plan preparation tool is
+    // registered and refuses outside the candidate-ready synthesis substate
+    // with a structured capability failure (this run sits in architecture).
+    // HONEST SPLIT: the full final-approval vertical (candidate → final_plan
+    // Proposal → ToolContext.ask → Approval → second FinalizationGate → Final
+    // PlanCommit) cannot traverse the interactive user-approval boundary
+    // headlessly — faking a user Allow would violate the no-fake-approval
+    // rule — so the complete chain remains deterministic integration-tested
+    // (adapters/opencode/test/final-plan.test.ts + the §67/§68 process-level
+    // crash probes). No live Approval or Final PlanCommit is faked here.
+    // That `ultraplan_request_user_approval` is granted ONLY in the
+    // final-proposal synthesis substate is pinned by the capability matrix
+    // tests (test/capabilities.test.ts), not by this headless run.
+    report(
+      "Phase 2I final-plan tool registered (ultraplan_prepare_final_plan)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_final_plan"),
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_final_plan") ? "registered" : "missing from tool ids",
+    );
+    const prepareFinalPlanProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_prepare_final_plan tool now with no arguments and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_prepare_final_plan refuses outside the candidate-ready synthesis substate (live)",
+      prepareFinalPlanProbe.ok,
+      prepareFinalPlanProbe.ok ? "structured capability_not_available returned" : prepareFinalPlanProbe.detail,
+    );
+
     // -- REAL server restart: durable PlanningRun must resume (§35) ----------
     await killTree(server);
     await sleep(2000);
@@ -228,6 +473,11 @@ async function main() {
       "/ultra-plan after a REAL server restart RESUMES the same durable PlanningRun (§35)",
       restartRun.ok && /PLAN-001/.test(restartRun.text ?? "") && !/PLAN-002/.test(restartRun.text ?? ""),
       restartRun.detail,
+    );
+    report(
+      "stage=architecture survives the restart (durable workflow state, Phase 2C §31)",
+      lastStageOf(restartRun.text) === "Stage: architecture",
+      `latest status block: ${lastStageOf(restartRun.text)}`,
     );
   } catch (error) {
     report("live validation aborted", false, String(error));
@@ -333,6 +583,12 @@ async function executeCommand(base, sessionID, args) {
 function matchError(text) {
   const match = text.match(/"(error|message)"\s*:\s*"([^"]{10,300})"/i);
   return match ? match[2] : text.slice(0, 200);
+}
+
+/** The `Stage:` line of the MOST RECENT status block in the session history. */
+function lastStageOf(text) {
+  const all = [...(text ?? "").matchAll(/Stage: \w+/g)].map((m) => m[0]);
+  return all[all.length - 1] ?? "(no status block found)";
 }
 
 function excerpt(text) {

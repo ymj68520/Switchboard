@@ -48,6 +48,20 @@ export interface PlanningRuntimeSpec {
    * applies.
    */
   planningModel?: string;
+  /**
+   * Phase 2J §30: the host-native Build/execution agent used for the runtime
+   * handoff turn. Defaults to the host's built-in Build agent ("build") —
+   * never a second custom orchestration agent. An EMPTY string means
+   * "configured but unresolvable" and leaves the handoff pending (§58).
+   */
+  executionAgent?: string;
+  /**
+   * Phase 2J §29: the execution model as "provider/model". Deterministic
+   * role policy from adapter configuration — when absent the HOST DEFAULT
+   * model applies (a host-supplied safe default, §57); the planning model is
+   * deliberately NOT reused.
+   */
+  executionModel?: string;
 }
 
 export interface RuntimeActivationInput {
@@ -74,4 +88,71 @@ export interface UltraPlanRuntime {
    * controller on /ultra-plan create AND resume (re-asserting is idempotent).
    */
   activatePlanningRuntime(input: RuntimeActivationInput): Promise<RuntimeActivationResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2J — the narrow ExecutionHandoff runtime boundary (§74/§75)
+// ---------------------------------------------------------------------------
+
+/**
+ * Receipt built ONLY from host-observable identifiers (§22/§112): the target
+ * session, the delivered user message id, and the execution agent/model the
+ * host recorded on that message. No credentials or provider internals.
+ */
+export interface HostDeliveryReceipt {
+  sessionID: string;
+  messageID: string;
+  agent?: string;
+  model?: { providerID: string; modelID: string };
+}
+
+export interface ExecutionHandoffDispatchInput {
+  /** Trusted runtime identity — exactly PlanningRun.sessionID (§27/§28). */
+  sessionID: string;
+  /** Resolved execution agent (undefined = host default). */
+  agent: string | undefined;
+  /** Resolved execution model (undefined = host default). */
+  model: { providerID: string; modelID: string } | undefined;
+  /** The deterministic handoff payload (includes the stable marker, §25). */
+  prompt: string;
+  /** §21 stable correlation key; also searchable in host history. */
+  deliveryKey: string;
+}
+
+/**
+ * The handoff side-effect boundary. CORE NEVER SEES SDK RESPONSE SHAPES
+ * (§75): it sees dispatch/accept, receipt, and confirmation. Implementations
+ * must NOT hold any PlanStore lock across these calls (§40) — the coordinator
+ * invokes them between locked store operations.
+ */
+export interface ExecutionRuntimeAdapter {
+  /**
+   * Deliver the handoff turn into the EXISTING session. Semantics: the host
+   * must accept the turn for execution WITHOUT the coordinator waiting for
+   * the whole Build turn to complete (§105 — delivered ≠ Build finished).
+   * Throws `HandoffDispatchRejected` BEFORE acceptance = definite failure
+   * (retryable); any other failure = possibly-accepted ambiguity (the caller
+   * keeps `dispatching` and recovers through findHandoffDelivery).
+   */
+  dispatchHandoff(input: ExecutionHandoffDispatchInput): Promise<{ accepted: true }>;
+  /**
+   * Query the host for the exact delivered handoff message in this session
+   * (§43 recovery step 1; §24 option B). `undefined` = the host definitively
+   * does not show the handoff (safe to re-dispatch). Implementations may
+   * return `undefined` with `capability: false` semantics by being absent —
+   * an adapter without query support forces fail-closed ambiguity instead.
+   */
+  findHandoffDelivery?(input: { sessionID: string; deliveryKey: string }): Promise<HostDeliveryReceipt | undefined>;
+}
+
+/**
+ * A DEFINITE host rejection before acceptance (§61): the delivery remains
+ * retryable. Every other dispatch failure is treated as possibly-accepted
+ * ambiguity (§62) — never classified retry-safe by the core.
+ */
+export class HandoffDispatchRejected extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HandoffDispatchRejected";
+  }
 }
