@@ -138,6 +138,9 @@ export function checkClaudeCapabilities(report: ClaudeCapabilityReport): CheckOu
   const unknownNames = Object.entries(report.capabilities)
     .filter(([, check]) => check.status === "UNKNOWN")
     .map(([name]) => name);
+  const runtimeVerifiedNames = Object.entries(report.capabilities)
+    .filter(([, check]) => check.via === "runtime-probe" && check.status === "PASS")
+    .map(([name]) => name);
   const nonPass = Object.entries(report.capabilities)
     .filter(([, check]) => check.status !== "PASS")
     .map(([name, check]) => `${name}: ${check.status} — ${check.reason}`);
@@ -151,8 +154,8 @@ export function checkClaudeCapabilities(report: ClaudeCapabilityReport): CheckOu
     ...(report.supported ? {} : { errorCode: "CLAUDE_CAPABILITY_UNSUPPORTED" as const }),
     message: report.supported
       ? `critical gates PASS (${criticalNames.join(", ")}; approval floor ${report.policy.approvalInteractionFloor})${
-          unknownNames.length > 0 ? `; UNKNOWN unverified (non-blocking): ${unknownNames.join(", ")}` : ""
-        }`
+          runtimeVerifiedNames.length > 0 ? `; runtime-verified: ${runtimeVerifiedNames.join(", ")}` : ""
+        }${unknownNames.length > 0 ? `; UNKNOWN unverified (non-blocking): ${unknownNames.join(", ")}` : ""}`
       : nonPass.join("; "),
     detail: {
       policy: {
@@ -168,7 +171,7 @@ export function checkClaudeCapabilities(report: ClaudeCapabilityReport): CheckOu
       capabilities: Object.fromEntries(
         Object.entries(report.capabilities).map(([name, check]) => [
           name,
-          { status: check.status, reason: check.reason, basis: check.basis },
+          { status: check.status, reason: check.reason, basis: check.basis, ...(check.via === undefined ? {} : { via: check.via }) },
         ]),
       ),
     },

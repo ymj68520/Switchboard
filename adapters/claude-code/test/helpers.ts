@@ -142,10 +142,18 @@ export function runMcpSmoke(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let childExited = false;
     child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    child.on("exit", () => {
+      childExited = true;
+    });
+    // A fail-closed boot (e.g. missing CLAUDE_PLUGIN_DATA) kills the server
+    // before the queued sends fire — EPIPE there is expected, not a leak.
+    child.stdin?.on("error", () => {});
 
     const send = (obj: unknown): void => {
+      if (childExited) return;
       child.stdin?.write(JSON.stringify(obj) + "\n");
     };
 

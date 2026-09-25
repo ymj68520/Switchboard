@@ -375,3 +375,15 @@ export function listBindingsForWorkspace(
       .all(workspaceId) as BindingRow[],
   );
 }
+
+/** Every binding row for one session (attached + detached), any workspace. */
+export function listBindingsForSessionRecord(
+  store: PlanStore,
+  sessionId: string,
+): BindingSnapshot[] {
+  return store.withRead((tx) =>
+    tx
+      .prepare(`${SELECT_BINDING} WHERE session_id = ? ORDER BY created_at, run_id`)
+      .all(sessionId) as BindingRow[],
+  );
+}

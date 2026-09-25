@@ -17,7 +17,7 @@ const BUNDLE_EXISTS = existsSync(BUNDLE);
 
 describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
   it.skipIf(!BUNDLE_EXISTS)(
-    "initializes the store, then serves an empty tool list with protocol-pure stdout",
+    "initializes the store, then serves the Phase 7 tool surface with protocol-pure stdout",
     async () => {
       const nodeSupported = isNodeVersionSupported(process.versions.node);
       const pluginDataRoot = makeTempPluginDataRoot();
@@ -37,13 +37,26 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         expect(result.exitCode).toBe(0);
 
         const parsed = result.stdoutLines.map(
-          (line) => JSON.parse(line) as { id?: number; result?: Record<string, unknown> },
+          (line) => JSON.parse(line) as {
+            id?: number;
+            result?: Record<string, unknown>;
+          },
         );
         expect(parsed).toHaveLength(2);
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
           serverInfo: { name: "phase-plan", version: "0.1.0" },
         });
-        expect(parsed.find((m) => m.id === 2)?.result).toEqual({ tools: [] });
+        // Phase 7 (§48): the intentionally minimal surface — three tools,
+        // approve_proposal marked with the real boolean interaction flag.
+        const tools = (
+          parsed.find((m) => m.id === 2)?.result as {
+            tools: Array<{ name: string; _meta?: Record<string, unknown> }>;
+          }
+        ).tools;
+        expect(tools.map((tool) => tool.name)).toEqual(["start_or_resume", "get_state", "approve_proposal"]);
+        expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
+          "anthropic/requiresUserInteraction": true,
+        });
         expect(result.stderr).toContain("[phase-plan]");
 
         // Store-first: the canonical database exists after a served session.

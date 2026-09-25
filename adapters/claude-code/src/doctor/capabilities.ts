@@ -16,6 +16,16 @@
 
 import type { ClaudeVersionResult } from "../claude/version.js";
 import { compareSemver } from "../runtime/node-version.js";
+import { proofFreshness, type CapabilityProofs } from "../host/capability-proofs.js";
+
+/** Capabilities whose PASS can only come from a real-host runtime proof. */
+const RUNTIME_PROVEN_CAPABILITIES = ["planModeIntegration", "hookLifecycle"] as const;
+
+type RuntimeProvenCapability = (typeof RUNTIME_PROVEN_CAPABILITIES)[number];
+
+function runtimeProofFlag(capability: RuntimeProvenCapability): keyof CapabilityProofs {
+  return capability === "planModeIntegration" ? "planModeIntegrationVerified" : "hookLifecycleVerified";
+}
 
 export const CLAUDE_CAPABILITY_NAMES = [
   "plugins",
@@ -110,6 +120,8 @@ export interface CapabilityCheck {
   reason: string;
   /** Evidence/basis behind this judgment (from the policy entry). */
   basis: string;
+  /** How the status was established (version floor vs real-host runtime proof). */
+  via?: "version" | "runtime-probe";
 }
 
 export interface ClaudeCapabilityReport {
@@ -126,8 +138,27 @@ export interface ClaudeCapabilityReport {
 function evaluate(
   entry: CapabilityPolicyEntry,
   versionResult: ClaudeVersionResult,
+  runtimeProof?: CapabilityProofs | null,
 ): CapabilityCheck {
   if (entry.verification === "unknown") {
+    // A runtime proof from a REAL host probe is the only path from UNKNOWN to
+    // PASS for these capabilities — and only for the exact same Claude
+    // version the proof was recorded on (directive §46/§47). Doctor never
+    // executes the probe and never invents a version floor.
+    if (
+      runtimeProof !== undefined &&
+      runtimeProof !== null &&
+      (RUNTIME_PROVEN_CAPABILITIES as readonly string[]).includes(entry.id) &&
+      proofFreshness(runtimeProof, versionResult.status === "ok" ? versionResult.version : undefined) === "current" &&
+      runtimeProof[runtimeProofFlag(entry.id as RuntimeProvenCapability)]
+    ) {
+      return {
+        status: "PASS",
+        reason: `${entry.id} PASS (runtime verified on Claude Code ${runtimeProof.claudeVersion}, probe recorded ${runtimeProof.verifiedAt})`,
+        basis: entry.evidence,
+        via: "runtime-probe",
+      };
+    }
     return {
       status: "UNKNOWN",
       reason: "cannot be proven from a version number — no verified official floor; runtime probe required",
@@ -180,10 +211,11 @@ function evaluate(
 export function evaluateClaudeCapabilities(
   versionResult: ClaudeVersionResult,
   policy: readonly CapabilityPolicyEntry[] = CAPABILITY_POLICY,
+  runtimeProof?: CapabilityProofs | null,
 ): ClaudeCapabilityReport {
   const capabilities = {} as Record<ClaudeCapabilityName, CapabilityCheck>;
   for (const entry of policy) {
-    capabilities[entry.id] = evaluate(entry, versionResult);
+    capabilities[entry.id] = evaluate(entry, versionResult, runtimeProof);
   }
   const version = versionResult.status === "ok" ? versionResult.version : undefined;
   const supported = policy

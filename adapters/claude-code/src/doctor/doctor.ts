@@ -22,7 +22,8 @@ import {
   type PlanStoreInspection,
 } from "../store/sqlite-store.js";
 import { checkClaudeCapabilities, checkClaudeCli, checkNodeVersion, checkPlanStore, checkPluginData, checkPluginEnvironment, checkSqliteCapability } from "./checks.js";
-import { evaluateClaudeCapabilities } from "./capabilities.js";
+import { evaluateClaudeCapabilities, CAPABILITY_POLICY } from "./capabilities.js";
+import { readCapabilityProofs, type CapabilityProofs } from "../host/capability-proofs.js";
 import {
   deriveHostIntegration,
   deriveOverallReadiness,
@@ -43,6 +44,8 @@ export interface DoctorDeps {
   claudeSpawnRunner?: SpawnRunner;
   /** Read-only store inspection seam (tests); errors become failed checks. */
   inspectStore?(pluginDataRoot: string): PlanStoreInspection;
+  /** Test seam: capability proof read (defaults to the real file read). */
+  readCapabilityProofs?(): CapabilityProofs | null;
 }
 
 export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
@@ -60,8 +63,6 @@ export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
     ? await deps.probeClaude(deps.claudeSpawnRunner ?? nodeSpawnRunner)
     : await probeClaudeVersion(deps.claudeSpawnRunner ?? nodeSpawnRunner);
   const claudeCliCheck = checkClaudeCli(claudeResult);
-  const capabilitiesReport = evaluateClaudeCapabilities(claudeResult);
-  const capabilitiesCheck = checkClaudeCapabilities(capabilitiesReport);
 
   const envReport = classifyPluginEnvironment(env);
   const envCheck = checkPluginEnvironment(envReport);
@@ -72,6 +73,18 @@ export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
     dataPreflight = await preflightPluginData(rawData, deps.pluginDataIo ?? nodePluginDataIo);
   }
   const dataCheck = checkPluginData(dataPreflight !== null, dataPreflight);
+
+  // Runtime capability proofs (Phase 7 §47): doctor only READS the stored
+  // proof; a proof recorded for a different Claude version is ignored and
+  // the capability stays UNKNOWN. Doctor never runs an interactive probe.
+  let runtimeProof: CapabilityProofs | null = null;
+  if (deps.readCapabilityProofs) {
+    runtimeProof = deps.readCapabilityProofs();
+  } else if (dataPreflight?.status === "ok") {
+    runtimeProof = readCapabilityProofs(dataPreflight.resolvedRoot);
+  }
+  const capabilitiesReport = evaluateClaudeCapabilities(claudeResult, CAPABILITY_POLICY, runtimeProof);
+  const capabilitiesCheck = checkClaudeCapabilities(capabilitiesReport);
 
   // Read-only store inspection (never creates/migrates). Inspection errors
   // (corrupt file, unreadable header) surface as a failed check, not a crash.

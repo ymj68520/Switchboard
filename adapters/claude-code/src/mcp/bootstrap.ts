@@ -1,21 +1,25 @@
 /**
  * Phase Plan stdio MCP bootstrap (frozen plan §10, architecture §28.2).
  *
- * Phase 1 scope: protocol/server initialization, server identity, clean
- * startup, clean shutdown, logging discipline, and the future tool
- * registration boundary. The frozen Phase Plan domain tools
- * (prepare_proposal, approve_proposal, …) belong to later phases and are
- * deliberately NOT stubbed here; tools/list returns an empty set, which keeps
- * stdout protocol-pure and the domain state untouched.
+ * Phase 7 scope: the intentionally minimal tool surface — start_or_resume,
+ * get_state, approve_proposal (Phase 7 directive §48). Tool visibility is not
+ * authority: every handler verifies the hook-signed HostContext and then
+ * delegates to the Application services / Phase 6 engine, which revalidate
+ * stage, lifecycle, binding, HEAD and proposal state (directive §49).
+ *
+ * stdout stays protocol-pure; diagnostics go to the logger (stderr).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import { createLogger, type Logger } from "../runtime/logger.js";
-import { RuntimeError } from "../runtime/errors.js";
+import { RuntimeError, isRuntimeError, toRuntimeError } from "../runtime/errors.js";
 import { RUNTIME_NAME, RUNTIME_VERSION } from "../runtime/version.js";
+import type { PlanStore } from "../store/sqlite-store.js";
+import type { StoreClock } from "../store/migration-runner.js";
+import { PHASE_PLAN_TOOLS, executePhasePlanTool, type PhasePlanToolContext } from "./tools.js";
 
 export interface McpServerHandle {
   /** Close the transport and stop serving. Idempotent. */
@@ -24,6 +28,11 @@ export interface McpServerHandle {
 
 export interface McpBootstrapOptions {
   logger?: Logger;
+  /** Opened Plan Store (fail-closed boot happens in the dispatcher). */
+  store: PlanStore;
+  /** Persistent host signing secret for HostContext verification. */
+  secret: Buffer;
+  clock?: StoreClock;
 }
 
 /**
@@ -31,18 +40,56 @@ export interface McpBootstrapOptions {
  * connected. The promise returned by `waitStopped` settles after the server
  * stops (stdin end, transport close, or explicit close()).
  */
-export async function startMcpServer(options: McpBootstrapOptions = {}): Promise<{
+export async function startMcpServer(options: McpBootstrapOptions): Promise<{
   handle: McpServerHandle;
   waitStopped: Promise<void>;
 }> {
   const logger = options.logger ?? createLogger("info");
   const server = new Server({ name: RUNTIME_NAME, version: RUNTIME_VERSION }, { capabilities: { tools: {} } });
 
-  // Phase 1 tool registration boundary: an empty, read-only tool surface.
-  // Later phases replace this handler's body with typed domain tools; the
-  // server must never expose ad-hoc mutation tools ahead of the frozen
-  // contract.
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: PHASE_PLAN_TOOLS.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      ...(tool._meta === undefined ? {} : { _meta: tool._meta }),
+    })),
+  }));
+
+  const toolContext: PhasePlanToolContext = {
+    store: options.store,
+    secret: options.secret,
+    clock: options.clock ?? { nowIso: () => new Date().toISOString(), newId: () => crypto.randomUUID() },
+  };
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const name = request.params.name;
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+    try {
+      const result = executePhasePlanTool(toolContext, name, args);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: true, ...result }) }],
+      };
+    } catch (err) {
+      const error = toRuntimeError(err, "INTERNAL_ERROR");
+      // Stable machine-readable failure: never a stack trace as protocol
+      // semantics (directive §52).
+      logger.error(`tool ${name} failed: [${error.code}] ${error.message}${error.causeText ? ` — ${error.causeText}` : ""}`);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              ok: false,
+              code: isRuntimeError(error) ? error.code : "INTERNAL_ERROR",
+              message: error.message,
+            }),
+          },
+        ],
+      };
+    }
+  });
 
   server.onerror = (err) => {
     logger.error(`mcp server error: ${err instanceof Error ? err.message : String(err)}`);
@@ -79,6 +126,6 @@ export async function startMcpServer(options: McpBootstrapOptions = {}): Promise
     });
   }
 
-  logger.info(`mcp server '${RUNTIME_NAME}' v${RUNTIME_VERSION} ready on stdio`);
+  logger.info(`mcp server '${RUNTIME_NAME}' v${RUNTIME_VERSION} ready on stdio (${PHASE_PLAN_TOOLS.length} tools)`);
   return { handle, waitStopped };
 }

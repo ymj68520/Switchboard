@@ -67,7 +67,23 @@ export type RuntimeErrorCode =
   | "MEMORY_HEAD_UNCOMMITTED"
   | "BLOCKING_QUESTION"
   | "BLOCKING_CONFLICT"
-  | "PLAN_COMMIT_CONFLICT";
+  | "PLAN_COMMIT_CONFLICT"
+  // Phase 7 — host authority / approval bridge
+  | "HOST_SECRET_UNAVAILABLE"
+  | "ENTRY_INTENT_REQUIRED"
+  | "ENTRY_INTENT_INVALID"
+  | "HOST_CONTEXT_REQUIRED"
+  | "HOST_CONTEXT_INVALID"
+  | "HOST_CONTEXT_INPUT_MISMATCH"
+  | "HOST_CONTEXT_TOOL_MISMATCH"
+  | "HOST_CONTEXT_WORKSPACE_MISMATCH"
+  | "MCP_INPUT_INVALID"
+  | "RUN_SELECTION_REQUIRED"
+  | "TAKEOVER_REQUIRED"
+  | "PLAN_MODE_REQUIRED"
+  | "PLAN_MODE_TRANSITION_FAILED"
+  // Hook-layer parser failure (fail-closed exit policy lives in hooks/run.ts)
+  | "HOOK_INPUT_INVALID";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {

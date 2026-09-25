@@ -3,7 +3,8 @@ import { describe, expect, it } from "vitest";
 import { RuntimeError, type RuntimeErrorCode } from "../src/runtime/errors.js";
 import { EXIT_CODES, exitCodeForError } from "../src/runtime/exit-codes.js";
 import { createLogger } from "../src/runtime/logger.js";
-import { executeCommand, parseRuntimeCommand, KNOWN_HOOK_EVENTS, usage } from "../src/runtime/dispatch.js";
+import { executeCommand, parseRuntimeCommand, RESERVED_HOOK_EVENTS, usage } from "../src/runtime/dispatch.js";
+import { HOOK_EVENTS } from "../src/hooks/run.js";
 import type { DoctorReport } from "../src/doctor/report.js";
 
 describe("parseRuntimeCommand", () => {
@@ -207,15 +208,36 @@ describe("executeCommand", () => {
     ).rejects.toMatchObject({ code: "PLUGIN_DATA_UNAVAILABLE" });
   });
 
-  it("hook dispatch is reserved but recognized events stay distinct", async () => {
-    for (const event of KNOWN_HOOK_EVENTS) {
-      await expect(executeCommand({ kind: "hook", event })).rejects.toMatchObject({
+  it("reserved hook events stay distinct from implemented ones", async () => {
+    for (const event of RESERVED_HOOK_EVENTS) {
+      await expect(
+        executeCommand({ kind: "hook", event }, { env: { CLAUDE_PLUGIN_DATA: "x" }, readStdin: async () => "{}" }),
+      ).rejects.toMatchObject({
         code: "HOOK_NOT_IMPLEMENTED",
       });
     }
     await expect(executeCommand({ kind: "hook", event: "NotAHook" })).rejects.toMatchObject({
       code: "INVALID_RUNTIME_COMMAND",
     });
+  });
+
+  it("implemented hook events route through the hook runner with CLAUDE_PLUGIN_DATA", async () => {
+    const seen: string[] = [];
+    const result = await executeCommand({ kind: "hook", event: "SessionStart" }, {
+      env: { CLAUDE_PLUGIN_DATA: "D:/tmp/pd" },
+      readStdin: async () => '{"hook_event_name":"SessionStart"}',
+      runHook: async (input) => {
+        seen.push(`${input.event}:${input.raw}:${input.pluginDataRoot}`);
+        return { exitCode: 0, stdout: "" };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(seen).toEqual(["SessionStart:{\"hook_event_name\":\"SessionStart\"}:D:/tmp/pd"]);
+    // Missing CLAUDE_PLUGIN_DATA fails closed before the runner.
+    await expect(
+      executeCommand({ kind: "hook", event: "SessionStart" }, { env: {}, readStdin: async () => "{}" }),
+    ).rejects.toMatchObject({ code: "PLUGIN_DATA_UNAVAILABLE" });
+    expect(HOOK_EVENTS.length).toBe(6);
   });
 
   it("propagates RuntimeError subclasses with stable codes", async () => {

@@ -1,3 +1,72 @@
 {
-  "hooks": {}
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "SessionStart"]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "SessionEnd"]
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "UserPromptSubmit"]
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "phase-plan",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "UserPromptExpansion"]
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PreToolUse"]
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "phase.plan__(start_or_resume|approve_proposal)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PermissionRequest"]
+          }
+        ]
+      }
+    ]
+  }
 }
