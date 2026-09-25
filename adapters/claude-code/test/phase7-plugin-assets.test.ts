@@ -59,8 +59,9 @@ describe("hooks.json (directive §35)", () => {
     );
   });
 
-  it("PermissionRequest matches only the phase-plan approval/recovery tools; UserPromptExpansion only phase-plan", () => {
-    expect(hooks.hooks.UserPromptExpansion![0]!.matcher).toBe("phase-plan");
+  it("PermissionRequest matches only the phase-plan approval/recovery tools; UserPromptExpansion only phase-plan (bare or plugin-namespaced)", () => {
+    // The host expands "/phase-plan" to the namespaced "phase-plan:phase-plan".
+    expect(hooks.hooks.UserPromptExpansion![0]!.matcher).toBe("^phase-plan(:phase-plan)?$");
     const prMatcher = hooks.hooks.PermissionRequest![0]!.matcher!;
     expect(prMatcher).toContain("start_or_resume");
     expect(prMatcher).toContain("approve_proposal");

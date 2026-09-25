@@ -35,7 +35,7 @@
     ],
     "UserPromptExpansion": [
       {
-        "matcher": "phase-plan",
+        "matcher": "^phase-plan(:phase-plan)?$",
         "hooks": [
           {
             "type": "command",
@@ -58,7 +58,7 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "phase.plan__(start_or_resume|approve_proposal)",
+        "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal)$",
         "hooks": [
           {
             "type": "command",

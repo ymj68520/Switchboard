@@ -183,7 +183,9 @@ export function handleUserPromptSubmit(deps: HookHandlerDeps, input: UserPromptS
 // ---------------------------------------------------------------------------
 
 export function handleUserPromptExpansion(deps: HookHandlerDeps, input: UserPromptExpansionInput): HookOutput {
-  if (input.commandName !== "phase-plan") {
+  // The host expands plugin skills to their namespaced command form
+  // ("/phase-plan" → "phase-plan:phase-plan"); accept both spellings.
+  if (input.commandName !== "phase-plan" && input.commandName !== "phase-plan:phase-plan") {
     return emptyOutput();
   }
   if (input.promptId === undefined || input.promptId === "") {

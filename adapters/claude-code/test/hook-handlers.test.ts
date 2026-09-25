@@ -248,6 +248,28 @@ describe("UserPromptExpansion entry token (§10/§11/E3)", () => {
     }
   });
 
+  it("issues the same bound token for the plugin-namespaced command form phase-plan:phase-plan", async () => {
+    const h = await makeHarness();
+    try {
+      const output = handleUserPromptExpansion(h.deps, {
+        sessionId: "S1",
+        promptId: "P2",
+        hookEventName: "UserPromptExpansion",
+        commandName: "phase-plan:phase-plan",
+        expansionType: "slash_command",
+      });
+      expect(output.kind).toBe("json");
+      const payload = (output as { kind: "json"; payload: Record<string, unknown> }).payload;
+      const context = (payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
+      const token = context.split("token: ")[1]!.split("\n")[0]!;
+      const intent = verifyEntryIntent(h.secret, token);
+      expect(intent.sessionId).toBe("S1");
+      expect(intent.promptId).toBe("P2");
+    } finally {
+      h.close();
+    }
+  });
+
   it("missing prompt_id fails closed; other commands are ignored", async () => {
     const h = await makeHarness();
     try {
