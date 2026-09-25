@@ -18,6 +18,13 @@ export const EXIT_CODES = {
   hostCapability: 4,
   /** Storage/environment preflight failure: plugin data unavailable/unwritable. */
   storageEnvironment: 5,
+  /**
+   * Domain state conflict (workspace identity / session binding): refused by
+   * deterministic ownership or identity rules. No Phase 3 CLI path surfaces
+   * these yet — the mapping is declared now so error→exit stays total and
+   * future surfaces cannot improvise.
+   */
+  domainState: 6,
   /** Internal error (unexpected failure — bug). */
   internal: 10,
 } as const;
@@ -49,6 +56,15 @@ const EXIT_CODE_BY_ERROR: Readonly<Record<RuntimeErrorCode, ExitCode>> = {
   STORE_BUSY: EXIT_CODES.storageEnvironment,
   STORE_BACKUP_FAILED: EXIT_CODES.storageEnvironment,
   STORE_MIGRATION_FAILED: EXIT_CODES.storageEnvironment,
+  WORKSPACE_NOT_FOUND: EXIT_CODES.domainState,
+  WORKSPACE_UNAVAILABLE: EXIT_CODES.domainState,
+  WORKSPACE_MISMATCH: EXIT_CODES.domainState,
+  SESSION_ALREADY_BOUND: EXIT_CODES.domainState,
+  RUN_ALREADY_BOUND: EXIT_CODES.domainState,
+  BINDING_NOT_FOUND: EXIT_CODES.domainState,
+  BINDING_DETACHED: EXIT_CODES.domainState,
+  BINDING_CONFLICT: EXIT_CODES.domainState,
+  STALE_SESSION_BINDING: EXIT_CODES.domainState,
 };
 
 export function exitCodeForError(code: RuntimeErrorCode): ExitCode {

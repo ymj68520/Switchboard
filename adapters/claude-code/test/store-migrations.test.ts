@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
+import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import {
   createProductionMigrations,
   validateMigrationRegistry,
@@ -64,17 +65,24 @@ describe("migration failure semantics (E14/§22)", () => {
       createSchema0Database(databasePath, "sentinel-before-failure");
 
       const failingMigration: StoreMigration = {
-        from: 0,
-        to: 1,
+        from: 1,
+        to: 2,
         name: "deliberately-failing",
         apply(tx) {
           tx.exec("CREATE TABLE half_created (x TEXT)");
           throw new Error("injected mid-DDL failure");
         },
       };
+      const clock = fixedClock();
 
       await expect(
-        initializePlanStore({ pluginDataRoot: root, migrations: [failingMigration] }),
+        initializePlanStore({
+          pluginDataRoot: root,
+          migrations: [
+            createInitializeMigration({ generateStoreId: clock.newId, nowIso: clock.nowIso }),
+            failingMigration,
+          ],
+        }),
       ).rejects.toMatchObject({
         code: "STORE_MIGRATION_FAILED",
         causeText: expect.stringContaining("injected mid-DDL failure"),
@@ -100,17 +108,23 @@ describe("migration failure semantics (E14/§22)", () => {
     try {
       const clock = fixedClock();
       const failing: StoreMigration = {
-        from: 0,
-        to: 1,
+        from: 1,
+        to: 2,
         name: "fails-after-ddl",
         apply(tx) {
-          tx.exec("CREATE TABLE store_metadata (id INTEGER PRIMARY KEY)");
-          tx.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
+          tx.exec("CREATE TABLE half_v2 (id INTEGER PRIMARY KEY)");
           throw new Error("boom");
         },
       };
       await expect(
-        initializePlanStore({ pluginDataRoot: root, migrations: [failing], clock }),
+        initializePlanStore({
+          pluginDataRoot: root,
+          migrations: [
+            createInitializeMigration({ generateStoreId: clock.newId, nowIso: clock.nowIso }),
+            failing,
+          ],
+          clock,
+        }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
       // Fresh database: user_version must stay 0 and no tables may persist.
       expect(rawSchemaVersion(storePathsFor(root).databasePath)).toBe(0);

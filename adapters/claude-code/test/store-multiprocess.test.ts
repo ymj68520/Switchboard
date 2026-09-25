@@ -102,7 +102,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // Every caller ends in a valid state reporting the SAME store identity.
       for (const result of results) {
         expect(result.ok, JSON.stringify(result)).toBe(true);
-        expect(result.schemaVersion).toBe(1);
+        expect(result.schemaVersion).toBe(2);
       }
       const storeIds = new Set(results.map((r) => r.storeId));
       expect(storeIds.size).toBe(1);
@@ -111,12 +111,15 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // sentinel preserved, integrity clean, exactly one published backup.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(1);
+        expect(store.getSchemaVersion()).toBe(2);
         expect(store.getStoreMetadata().storeId).toBe(results[0]?.storeId);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
         ) as { version: number; name: string }[];
-        expect(history).toEqual([{ version: 1, name: "initialize-plan-store" }]);
+        expect(history).toEqual([
+          { version: 1, name: "initialize-plan-store" },
+          { version: 2, name: "workspace-and-session-binding" },
+        ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -130,7 +133,14 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       }
       expect(publishedBackups(backupsDir), JSON.stringify({ published: publishedBackups(backupsDir), pending: pendingBackups(backupsDir) })).toHaveLength(1);
       expect(pendingBackups(backupsDir), JSON.stringify({ published: publishedBackups(backupsDir), pending: pendingBackups(backupsDir) })).toEqual([]);
-      expect(tableNames(databasePath).sort()).toEqual(["legacy_marker", "schema_migrations", "store_metadata"]);
+      expect(tableNames(databasePath).sort()).toEqual([
+        "legacy_marker",
+        "repositories",
+        "schema_migrations",
+        "session_bindings",
+        "store_metadata",
+        "workspaces",
+      ]);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });
@@ -143,13 +153,13 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 2);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, 3);
 
       const worker = await bundleWorker(bundledDir);
       const result = await runWorker(worker, root, 2000);
       expect(result).toMatchObject({ ok: false, code: "STORE_SCHEMA_TOO_NEW" });
       // Untouched.
-      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(2);
+      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(3);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });

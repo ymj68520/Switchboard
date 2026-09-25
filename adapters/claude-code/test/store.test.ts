@@ -24,7 +24,7 @@ import {
 } from "./store-helpers.js";
 
 describe("store lifecycle (E5/E7/E20)", () => {
-  it("initializes a fresh store deterministically to schema v1", async () => {
+  it("initializes a fresh store deterministically to the supported schema", async () => {
     const root = makeTempPluginDataRoot();
     try {
       const clock = fixedClock({ nowIso: "2026-09-24T12:00:00.000Z", ids: ["store-uuid-1"] });
@@ -32,14 +32,17 @@ describe("store lifecycle (E5/E7/E20)", () => {
       try {
         expect(store.getSchemaVersion()).toBe(SUPPORTED_SCHEMA_VERSION);
         const metadata = store.getStoreMetadata();
-        expect(metadata.schemaVersion).toBe(1);
+        expect(metadata.schemaVersion).toBe(2);
         expect(metadata.storeId).toBe("store-uuid-1");
         expect(metadata.protocolVersion).toBe(1);
         expect(metadata.createdAt).toBe("2026-09-24T12:00:00.000Z");
         // Schema v1 contains exactly the two infrastructure tables (E6).
         expect(tableNames(storePathsFor(root).databasePath).sort()).toEqual([
+          "repositories",
           "schema_migrations",
+          "session_bindings",
           "store_metadata",
+          "workspaces",
         ]);
       } finally {
         store.close();
@@ -59,7 +62,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
       const reopened = openPlanStore({ pluginDataRoot: root });
       try {
         expect(reopened.getStoreMetadata().storeId).toBe(storeId);
-        expect(reopened.getSchemaVersion()).toBe(1);
+        expect(reopened.getSchemaVersion()).toBe(2);
       } finally {
         reopened.close();
       }
@@ -91,7 +94,10 @@ describe("store lifecycle (E5/E7/E20)", () => {
         const history = second.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
         ) as { version: number; name: string }[];
-        expect(history).toEqual([{ version: 1, name: "initialize-plan-store" }]);
+        expect(history).toEqual([
+          { version: 1, name: "initialize-plan-store" },
+          { version: 2, name: "workspace-and-session-binding" },
+        ]);
       } finally {
         second.close();
       }
@@ -147,7 +153,7 @@ describe("existing schema-0 databases (E11/E12/E13)", () => {
       createSchema0Database(databasePath, "pre-migration-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(1);
+        expect(store.getSchemaVersion()).toBe(2);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -158,7 +164,7 @@ describe("existing schema-0 databases (E11/E12/E13)", () => {
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
       expect(backups[0]).toMatch(
-        /^phase-plan-pre-schema-0-1-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/,
+        /^phase-plan-pre-schema-0-2-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/,
       );
       // The published backup holds the pre-migration state (schema 0).
       const db = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
@@ -244,7 +250,7 @@ describe("schema fencing against newer stores (E17/E18)", () => {
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
         // Simulate a NEWER binary migrating the store under the old process.
-        rawSetSchemaVersion(storePathsFor(root).databasePath, 2);
+        rawSetSchemaVersion(storePathsFor(root).databasePath, 3);
 
         let writeRan = false;
         expect(() =>
@@ -263,7 +269,7 @@ describe("schema fencing against newer stores (E17/E18)", () => {
         expect(() => openPlanStore({ pluginDataRoot: root })).toThrowError(
           expect.objectContaining({ code: "STORE_SCHEMA_TOO_NEW" }),
         );
-        expect(rawSchemaVersion(storePathsFor(root).databasePath)).toBe(2);
+        expect(rawSchemaVersion(storePathsFor(root).databasePath)).toBe(3);
       } finally {
         store.close();
       }

@@ -25,7 +25,17 @@ export type RuntimeErrorCode =
   | "STORE_OPEN_FAILED"
   | "STORE_BUSY"
   | "STORE_BACKUP_FAILED"
-  | "STORE_MIGRATION_FAILED";
+  | "STORE_MIGRATION_FAILED"
+  // Phase 3 — workspace identity / session binding domain (exit 6)
+  | "WORKSPACE_NOT_FOUND"
+  | "WORKSPACE_UNAVAILABLE"
+  | "WORKSPACE_MISMATCH"
+  | "SESSION_ALREADY_BOUND"
+  | "RUN_ALREADY_BOUND"
+  | "BINDING_NOT_FOUND"
+  | "BINDING_DETACHED"
+  | "BINDING_CONFLICT"
+  | "STALE_SESSION_BINDING";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {

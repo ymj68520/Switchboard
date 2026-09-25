@@ -17,7 +17,6 @@
 
 import { readSchemaVersion } from "./schema.js";
 import { storeError, toStoreError } from "./errors.js";
-import type { SUPPORTED_SCHEMA_VERSION } from "./constants.js";
 
 /** Narrow surface handed to operations inside a store transaction. */
 export interface StoreTx {
@@ -33,7 +32,10 @@ export interface StoreTx {
 export type TransactionHost = StoreTx & { exec(sql: string): void };
 
 export interface FenceOptions {
-  supportedSchemaVersion: typeof SUPPORTED_SCHEMA_VERSION;
+  /** The schema version the CALLING binary supports — an old process passes
+   * its own lower floor here, which is exactly how a post-migration schema-1
+   * writer gets fenced (E27). */
+  supportedSchemaVersion: number;
   databasePath: string;
 }
 

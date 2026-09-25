@@ -47,6 +47,9 @@ interface TableRow {
   name: string;
 }
 
+/** Infrastructure tables required once the store has reached schema v2. */
+const SCHEMA_V2_TABLES = ["repositories", "workspaces", "session_bindings"] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -64,10 +67,68 @@ function readHistory(db: StoreConnection | StoreTx): MigrationHistoryRow[] {
 }
 
 /**
+ * Structural checks for the v2 infrastructure tables (frozen plan §42).
+ * Uniqueness/CHECK constraints are DDL-enforced; the validator re-derives
+ * the invariant facts from DATA so a hand-mangled or partially-written store
+ * cannot pass on `user_version = 2` alone.
+ */
+function validateSchemaV2(db: StoreConnection | StoreTx, tables: Set<string>, problems: string[]): void {
+  for (const table of SCHEMA_V2_TABLES) {
+    if (!tables.has(table)) {
+      problems.push(`${table} table missing for schema version >= 2`);
+    }
+  }
+  if (SCHEMA_V2_TABLES.some((table) => !tables.has(table))) {
+    return; // further queries would just cascade errors
+  }
+  const badGenerations = db
+    .prepare("SELECT count(*) AS n FROM session_bindings WHERE generation < 1")
+    .get() as { n: number } | undefined;
+  if ((badGenerations?.n ?? 0) > 0) {
+    problems.push("session_bindings contains generation < 1 rows");
+  }
+  const badStates = db
+    .prepare(
+      "SELECT count(*) AS n FROM session_bindings WHERE state NOT IN ('attached', 'detached')",
+    )
+    .get() as { n: number } | undefined;
+  if ((badStates?.n ?? 0) > 0) {
+    problems.push("session_bindings contains unknown state values");
+  }
+  const duplicateActiveSessions = db
+    .prepare(
+      "SELECT session_id, count(*) AS n FROM session_bindings WHERE state = 'attached' GROUP BY session_id HAVING n > 1 LIMIT 1",
+    )
+    .get() as { session_id?: string; n: number } | undefined;
+  if (duplicateActiveSessions !== undefined) {
+    problems.push(
+      `session '${duplicateActiveSessions.session_id}' holds multiple attached bindings`,
+    );
+  }
+  const orphanWorkspaces = db
+    .prepare(
+      "SELECT count(*) AS n FROM workspaces w WHERE NOT EXISTS (SELECT 1 FROM repositories r WHERE r.repository_id = w.repository_id)",
+    )
+    .get() as { n: number } | undefined;
+  if ((orphanWorkspaces?.n ?? 0) > 0) {
+    problems.push("workspaces reference missing repositories");
+  }
+  const orphanBindings = db
+    .prepare(
+      "SELECT count(*) AS n FROM session_bindings b WHERE NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.workspace_id = b.workspace_id)",
+    )
+    .get() as { n: number } | undefined;
+  if ((orphanBindings?.n ?? 0) > 0) {
+    problems.push("session bindings reference missing workspaces");
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
- * must exist as a singleton.
+ * must exist as a singleton. From version 2 the infrastructure-table
+ * integrity checks apply as well.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   const version = readSchemaVersion(db);
@@ -91,6 +152,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
     if (!tables.has("store_metadata")) {
       problems.push("store_metadata table missing for schema version >= 1");
     }
+  }
+  if (version >= 2) {
+    validateSchemaV2(db, tables, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };
