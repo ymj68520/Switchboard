@@ -13,6 +13,9 @@ coverage/
 *.tmp
 .tmp-*
 
+# Scratch probes (local pre-flight experiments, not part of the repo)
+scratch-*.mjs
+
 # Environment
 .env
 .env.*
