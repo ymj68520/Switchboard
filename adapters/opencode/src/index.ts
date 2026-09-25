@@ -13,10 +13,12 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
 
 import { renderPlanningProtocol } from "./context/protocol.js";
+import { resolveSynthesisFinalization, resolveCurrentFinalProposal } from "./core/controller.js";
 import { getProjectInstance } from "./runtime/instance.js";
 import { ObservationIDs, nextSequence } from "./core/ids.js";
 import type { Observation, ObservationLedger, SourceLocator } from "./repository/observations.js";
 import { getUltraPlanInstance } from "./runtime/instance.js";
+import { SEMANTIC_VALIDATION_PROTOCOL } from "./validation/protocol.js";
 import { createUltraPlanTools } from "./tools/registry.js";
 
 /**
@@ -57,10 +59,17 @@ async function recordObservation(
 
 /**
  * Build the Ultra Plan plugin hooks. Input-free factory so embedders and tests
- * can wire the hooks without an OpenCode server connection.
+ * can wire the hooks without an OpenCode server connection. When the host's
+ * SDK client is provided, the isolated OpenCode semantic validator (Phase 2G)
+ * is bound to the controller.
  */
-export function createUltraPlanHooks(project?: { projectID: string }): Hooks {
-  const instance = project ? getProjectInstance(project.projectID) : getUltraPlanInstance();
+export function createUltraPlanHooks(project?: {
+  projectID: string;
+  client?: import("@opencode-ai/plugin").PluginInput["client"];
+}): Hooks {
+  const instance = project
+    ? getProjectInstance(project.projectID, { ...(project.client ? { client: project.client } : {}) })
+    : getUltraPlanInstance();
   const { runtime, controller, ledger, store } = instance;
   return {
     config: async (config) => {
@@ -81,10 +90,128 @@ export function createUltraPlanHooks(project?: { projectID: string }): Hooks {
       if (isHarnessTool(input.tool)) return;
       await recordObservation(ledger, input.sessionID, input.tool, input.args);
     },
+    /**
+     * Phase 2J §36/§78: the deterministic runtime-handoff trigger. When the
+     * session goes idle with a handoff_pending run, the Harness recovery
+     * path performs the runtime Build handoff — no planning-model turn or
+     * decision is involved. All other events (and any failure) are no-ops:
+     * the durable delivery record carries the state.
+     */
+    event: async (input) => {
+      if (input.event.type !== "session.idle") return;
+      const sessionID = input.event.properties.sessionID;
+      if (!sessionID) return;
+      // Guarded: acts only on a handoff_pending run; never throws.
+      await controller.maybeRecoverHandoff(sessionID);
+    },
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return;
       const run = await store.findActiveRunBySession(input.sessionID);
-      if (run) output.system.push(renderPlanningProtocol({ run }));
+      if (run) {
+        // Phase 2D/2E1/2E2: identify the active Section (id/title/objective/
+        // dependencies/revision state/validation) plus each direct
+        // dependency's contract availability and approval status, and the
+        // first deterministic completion blocker — for the L0 protocol.
+        let activeSection: import("./context/protocol.js").PlanningProtocolInput["activeSection"];
+        if (run.activeWork?.type === "section") {
+          const section = await store.getSection(run.id, run.activeWork.id);
+          if (section) {
+            const dependencyContracts: { id: string; revision?: number; approved?: boolean }[] = [];
+            let completionBlocked: string | undefined;
+            for (const depID of section.dependencies) {
+              const dep = await store.getSection(run.id, depID);
+              dependencyContracts.push({
+                id: depID,
+                ...(dep?.approvedRevision !== undefined ? { revision: dep.approvedRevision } : {}),
+                ...(dep ? { approved: dep.status === "approved" } : {}),
+              });
+              if (dep?.status !== "approved" && completionBlocked === undefined) {
+                completionBlocked = `dependency ${depID} not approved`;
+              }
+            }
+            if (completionBlocked === undefined && section.validation !== "valid") {
+              completionBlocked = `validation ${section.validation}`;
+            }
+            activeSection = {
+              id: section.id,
+              title: section.title,
+              objective: section.objective,
+              dependencies: section.dependencies,
+              ...(section.currentRevision !== undefined ? { currentRevision: section.currentRevision } : {}),
+              validation: section.validation,
+              dependencyContracts,
+              ...(section.currentRevision !== undefined && completionBlocked !== undefined
+                ? { completionBlocked }
+                : {}),
+            };
+          }
+        }
+        // Phase 2F §46 + Phase 2G + Phase 2H: the minimal synthesis projection
+        // for the L0 protocol — current input identity/base/hash, manifest
+        // ref/hash, staleness, the CURRENT validation result, the
+        // deterministic finalization state, and the open blocker count.
+        let synthesis: import("./context/protocol.js").PlanningProtocolInput["synthesis"];
+        if (run.stage === "synthesis") {
+          const [latestInput, manifests] = await Promise.all([
+            store.getLatestSynthesisInput(run.id),
+            store.listSynthesisManifests(run.id),
+          ]);
+          const latestManifest = latestInput
+            ? manifests
+                .filter((manifest) => manifest.input.id === latestInput.id)
+                .reduce<import("./synthesis/types.js").SynthesisManifest | undefined>(
+                  (latest, manifest) => (latest === undefined || manifest.revision > latest.revision ? manifest : latest),
+                  undefined,
+                )
+            : undefined;
+          const report =
+            latestInput && latestManifest
+              ? ((await store.findValidationReportByIdentity(run.id, {
+                  inputHash: latestInput.hash,
+                  manifestHash: latestManifest.hash,
+                  validatorProtocol: SEMANTIC_VALIDATION_PROTOCOL,
+                })) ?? undefined)
+              : undefined;
+          const finalization = await resolveSynthesisFinalization(store, run, latestInput ?? undefined, latestManifest, report ?? undefined);
+          // Phase 2I §86: the current final_plan Proposal selects the
+          // final-boundary L0 guidance.
+          const finalProposal = await resolveCurrentFinalProposal(store, run, {
+            candidateCurrent: finalization.candidate?.current === true,
+          });
+          synthesis = {
+            ...(latestInput
+              ? {
+                  inputID: latestInput.id,
+                  baseSnapshot: latestInput.baseSnapshot.id,
+                  inputHash: latestInput.hash,
+                  stale: run.headSnapshot !== latestInput.baseSnapshot.id,
+                }
+              : {}),
+            ...(latestManifest
+              ? { manifestRef: `${latestManifest.id}@${latestManifest.revision}`, manifestHash: latestManifest.hash }
+              : {}),
+            ...(report ? { validationResult: report.result } : {}),
+            finalization: {
+              state: finalization.state,
+              ...(finalization.candidate ? { candidate: finalization.candidate } : {}),
+            },
+            ...(finalProposal
+              ? {
+                  finalProposal: {
+                    ref: finalProposal.proposal.id,
+                    status: finalProposal.proposal.status as "ready" | "awaiting_approval",
+                  },
+                }
+              : {}),
+            blockerCount:
+              run.openQuestions.filter((q) => q.blocking && q.status === "open").length +
+              run.conflicts.filter((c) => c.severity === "blocking" && c.status === "open").length,
+          };
+        }
+        output.system.push(
+          renderPlanningProtocol({ run, ...(activeSection ? { activeSection } : {}), ...(synthesis ? { synthesis } : {}) }),
+        );
+      }
     },
     dispose: async () => {
       instance.dispose();
@@ -98,7 +225,7 @@ export function createUltraPlanHooks(project?: { projectID: string }): Hooks {
  * (no silent in-memory fallback — that would destroy recovery guarantees).
  */
 export const UltraPlanPlugin: Plugin = async (input) =>
-  createUltraPlanHooks({ projectID: input.project.id });
+  createUltraPlanHooks({ projectID: input.project.id, client: input.client });
 
 export default UltraPlanPlugin;
 
@@ -121,10 +248,84 @@ export type {
   ProposedDecisionInput,
   PromoteEvidenceInput,
   PreparedProposal,
+  RequestCompletionInput,
+  SectionCheckpointInput,
+  SectionFocusInput,
   SynthesisRequestResult,
 } from "./core/controller.js";
 export { buildMemoryRef } from "./core/controller.js";
 export { UltraPlanError, isUltraPlanError } from "./core/errors.js";
+export type {
+  BeginSynthesisResult,
+  SubmitSynthesisManifestResult,
+  SynthesisManifestDraftInput,
+  SynthesisSourceRefInput,
+  RunSemanticValidationResult,
+  RequestReopenInput,
+  RequestFinalizationResult,
+  PrepareFinalPlanResult,
+} from "./core/controller.js";
+export * from "./synthesis/types.js";
+export * from "./validation/types.js";
+export { SEMANTIC_VALIDATION_PROTOCOL, SEMANTIC_VALIDATION_SYSTEM_PROMPT } from "./validation/protocol.js";
+export { computeValidationReportHash, computeValidationReportHashFromRecord } from "./validation/hash.js";
+export { parseValidatorOutput } from "./validation/parse.js";
+export { validateValidatorOutput } from "./validation/validate.js";
+export { buildValidationCapsule } from "./validation/capsule.js";
+export { OpenCodeSemanticValidator } from "./validation/opencode-validator.js";
+export {
+  computeSynthesisInputHash,
+  computeSynthesisManifestHash,
+  computeSynthesisManifestHashFromRecord,
+} from "./synthesis/hash.js";
+export { assertSynthesisEntryReady, buildSynthesisAuthorityPayload } from "./synthesis/entry.js";
+export { validateManifestDraft, sourceRefResolves } from "./synthesis/validate.js";
+export { renderSynthesisCapsule } from "./synthesis/capsule.js";
+export * from "./finalization/types.js";
+export {
+  computeEvidenceStateHash,
+  computeEvidenceAuditHash,
+  computeEvidenceAuditHashFromRecord,
+  computeFinalPlanCandidateHash,
+  computeFinalPlanCandidateHashFromRecord,
+  evidenceSourceIdentity,
+} from "./finalization/hash.js";
+export {
+  buildEvidenceAudit,
+  collectReachableEvidence,
+  computeCurrentEvidenceStateHash,
+  computeEvidenceAuditCounts,
+  evaluateEvidenceEntryRules,
+  assertEvidenceAuditInternallyConsistent,
+} from "./finalization/audit.js";
+export { evaluateFinalizationGate } from "./finalization/gate.js";
+export type { FinalizationGateDeps, ResolvedGateSection } from "./finalization/gate.js";
+export {
+  assembleFinalPlanCandidate,
+  renderFinalPlanCandidatePreview,
+} from "./finalization/candidate.js";
+export {
+  buildFinalPlanFromCandidate,
+  computeFinalPlanHashFromContent,
+  renderFinalPlanBody,
+  finalizationIdentityMatchesCandidate,
+} from "./finalization/plan.js";
+export type { FinalPlanContent } from "./finalization/plan.js";
+export { resolveSynthesisFinalization, resolveCurrentFinalProposal } from "./core/controller.js";
+export type { HandoffRecoveryResult } from "./core/controller.js";
+export * from "./handoff/types.js";
+export { computeExecutionHandoffHash, computeExecutionHandoffHashFromRecord } from "./handoff/hash.js";
+export {
+  assembleExecutionHandoff,
+  renderExecutionHandoffPrompt,
+  HANDOFF_VALIDATION_REQUIREMENTS,
+} from "./handoff/assemble.js";
+export { OpenCodeExecutionAdapter } from "./runtime/opencode-execution-adapter.js";
+export type {
+  ExecutionRuntimeAdapter,
+  ExecutionHandoffDispatchInput,
+  HostDeliveryReceipt,
+} from "./runtime/types.js";
 export * from "./core/ids.js";
 export * from "./core/refs.js";
 export * from "./core/types.js";
@@ -147,9 +348,16 @@ export type {
   PlanCommit,
   CommittedChange,
   ProposalChange,
+  ProposalChangeKind,
   QuestionResolution,
   ApprovedDecision,
   ApprovedSectionRevision,
+  ApprovedArchitecture,
+  ApprovedConstraint,
+  ApprovedSectionRoot,
+  ArchitectureDraft,
+  ConstraintDraft,
+  SectionDecompositionDraft,
   SectionRevisionDraft,
 } from "./transaction/types.js";
 export type { CommitResult } from "./core/controller.js";
@@ -165,6 +373,9 @@ export * from "./memory/events.js";
 export * from "./memory/snapshots.js";
 export { renderStatus, renderNoRunStatus } from "./memory/renderer.js";
 export type { StatusDetails } from "./memory/renderer.js";
+export { renderProposalForApproval } from "./memory/approval-view.js";
+export type { SectionRootSnapshot } from "./memory/snapshots.js";
+export type { SectionDecompositionInput } from "./core/controller.js";
 export { renderPlanningProtocol } from "./context/protocol.js";
 export * from "./context/trace.js";
 export * from "./repository/evidence.js";

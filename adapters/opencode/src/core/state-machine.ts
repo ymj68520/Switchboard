@@ -21,10 +21,13 @@ import {
  *   discovery → architecture → detail → synthesis → final
  *                                        └─→ detail (conflict/reopen)
  *
- * VALIDATION in the lifecycle diagram is realized as the finalization
- * predicate (core/invariants.ts checkFinalization) gating synthesis → final;
- * the frozen stage union has no separate `validation` stage. See the Phase 1
- * report.
+ * VALIDATION in the lifecycle diagram is realized as the deterministic
+ * Evidence Audit + Finalization Gate (finalization/gate.ts, Phase 2H — the
+ * successor of the Phase 1 checkFinalization placeholder) evaluating the
+ * synthesis state; the frozen stage union has no separate `validation` stage.
+ * The synthesis → final edge itself is performed ONLY by the Final PlanCommit
+ * (Phase 2I) — a FinalPlanCandidate never transitions the stage. See the
+ * Phase 1 report.
  */
 export const STAGE_TRANSITIONS: Readonly<Record<PlanningStage, readonly PlanningStage[]>> = {
   discovery: ["architecture"],

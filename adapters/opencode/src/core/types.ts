@@ -14,6 +14,7 @@ import type {
   ConflictID,
   ConstraintID,
   DecisionID,
+  FinalPlanID,
   PlanID,
   QuestionID,
   SectionID,
@@ -26,6 +27,7 @@ import type {
   FinalPlanRef,
   MemoryRef,
   SectionRef,
+  SectionRevisionRef,
   Timestamp,
   WorkRef,
 } from "./refs.js";
@@ -196,11 +198,23 @@ export interface FailureMode {
   mitigation?: string;
 }
 
-/** Minimal Phase 1 shape — spec references Dependency (§6.1) but does not define it. */
+/**
+ * Minimal Phase 1 shape — spec references Dependency (§6.1) but does not
+ * define it. Phase 2E1 refines the smallest coherent v0.1 shape needed for
+ * Section checkpoint dependency binding (agent protocol §6.5).
+ */
 export interface Dependency {
   sectionID: SectionID;
   /** What this revision consumes from the dependency (contract `provides` names). */
   consumes: string[];
+  /**
+   * Phase 2E1: the exact approved SectionContract revision this revision was
+   * designed against, resolved and assigned BY THE HARNESS at checkpoint
+   * freeze time (never model-supplied, never "latest"). Undefined means the
+   * dependency had no approved contract when the revision was frozen — the
+   * dependent Section commits as `needs_review` (protocol §6.6).
+   */
+  contractRevision?: number;
 }
 
 /** Spec §6.1 — immutable content revision of a section. */
@@ -281,4 +295,67 @@ export interface Conflict {
     action: "revise_proposal" | "amend_decision" | "amend_architecture";
     ref: MemoryRef;
   };
+}
+
+/**
+ * Phase 2I — the immutable, formally user-approved Final Plan (committed Plan
+ * Memory). It is the EXACT snapshot of the approved design the FinalPlanCandidate
+ * projected (never "latest" refs — a FinalPlan stays stable after later runtime
+ * activity), bound to the full derived-artifact provenance chain so it is
+ * provable what exact planning state the user approved:
+ *
+ *   FinalPlanCandidate (hash) → SynthesisManifest (hash) → SynthesisInput (hash)
+ *   → ValidationReport (hash, clean) → EvidenceAuditSnapshot (hash, pass)
+ *   → pre-commit HEAD Snapshot.
+ *
+ * AUTHORITY: a FinalPlan exists ONLY through an approved `final_plan` Proposal's
+ * `add_final_plan` PlanCommit (spec invariant 8). There is no awaiting_approval
+ * FinalPlan object — the immutable Proposal represents the pending plan (the
+ * Architecture-freeze interpretation); a committed FinalPlan is `approved` by
+ * definition, with `approvedAt` = the exact user Approval's createdAt (system
+ * transaction metadata, never model-authored). `body` is the deterministic
+ * projection of the structured payload (never a second source of truth — it is
+ * hash-bound and re-verified on load).
+ */
+export interface FinalPlan {
+  id: FinalPlanID;
+  /** Initial FinalPlan only (Phase 2I): always 1. Amendment is later-phase work. */
+  revision: number;
+  planID: PlanID;
+  status: "approved";
+
+  /** Exact approved design refs (brief §13) — never resolved to latest. */
+  architecture: ArchitectureRef;
+  /** Exact approved SectionRevisions, canonical DAG order. */
+  sections: SectionRevisionRef[];
+  /** Exact committed Decision revisions HEAD bound at candidate freeze. */
+  decisions: DecisionRef[];
+  /** Committed constraints (identity-only domain, brief §36). */
+  constraints: Constraint[];
+
+  /** EXACT copies of the validated manifest's derived output (brief §11). */
+  implementationOrder: import("../synthesis/types.js").ImplementationStep[];
+  limitations: import("../synthesis/types.js").DerivedStatement[];
+
+  /** Provenance chain (brief §12) — exact derived-artifact bindings. */
+  finalPlanCandidate: {
+    id: import("./ids.js").FinalPlanCandidateID;
+    revision: number;
+    hash: string;
+  };
+  synthesisInput: { id: import("./ids.js").SynthesisInputID; hash: string };
+  synthesisManifest: { id: import("./ids.js").SynthesisManifestID; revision: number; hash: string };
+  semanticValidation: { reportID: import("./ids.js").ValidationReportID; hash: string; result: "clean" };
+  evidenceAudit: { id: import("./ids.js").EvidenceAuditID; hash: string; result: "pass" };
+  /** The PRE-Final-commit HEAD Snapshot the candidate was frozen against (brief §12). */
+  baseSnapshot: import("./refs.js").SnapshotRef;
+  baseCommit: CommitID | null;
+
+  /** = the exact user Approval's createdAt (brief §15/§40) — stamped at commit. */
+  approvedAt: Timestamp;
+  /** Deterministic Markdown projection of the structured payload (brief §14). */
+  body: string;
+
+  /** Canonical content hash over every field above except `hash` itself. */
+  hash: string;
 }

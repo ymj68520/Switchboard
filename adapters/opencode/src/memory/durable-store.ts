@@ -24,8 +24,10 @@
  *    stale-lock theft) plus RELOAD-FROM-DISK INSIDE THE LOCK before every
  *    mutation. Two writers can never both validate the same HEAD and publish
  *    divergent commits: writer B reloads under the lock and fails
- *    `head_snapshot_mismatch` against the new durable HEAD. Reads may be
- *    per-instance cached; the write path is the authority.
+ *    `head_snapshot_mismatch` against the new durable HEAD. Out-of-lock reads
+ *    also REFRESH FROM DISK (Phase 2D §42): allocation-critical reads must see
+ *    the latest durable state so a second instance cannot freeze an id another
+ *    instance already took.
  *
  * Chosen over SQLite because the Phase 2B2 backend gate proved `node:sqlite`
  * does NOT exist inside the real OpenCode host (Bun runtime), while
@@ -157,6 +159,29 @@ export class DurablePlanStore extends InMemoryPlanStore {
     return Promise.resolve();
   }
 
+  /**
+   * Phase 2D §42 narrow stale-read fix: reads that feed authoritative
+   * allocation (proposal/approval/section id sequences, scope resolution) must
+   * see the latest durable state, not this instance's cache — otherwise a
+   * second writer instance could allocate an id another instance already
+   * froze. The document is one small file, so re-reading on every out-of-lock
+   * read is cheap and safe (the atomic rename never exposes partial content).
+   * NEVER refreshes inside the writer lock (lockDepth > 0): there, memory IS
+   * the authoritative state, and re-hydrating from disk mid-mutation would
+   * wipe un-persisted changes (the Phase 2B2 open()-flag lesson).
+   */
+  private refreshFromDisk(): void {
+    if (this.lockDepth > 0 || this.closed) return;
+    try {
+      const raw = readFileSync(this.filePath, "utf8");
+      const parsed = JSON.parse(raw) as StoreDocument;
+      validateStoreDocument(parsed);
+      this.hydrateDocument(parsed);
+    } catch {
+      /* missing/unreadable file — keep the current cache; open() handles creation */
+    }
+  }
+
   private assertOpenForWrites(): void {
     if (this.closed) {
       throw new UltraPlanError("store_corrupt", "Durable store is closed", { filePath: this.filePath });
@@ -269,6 +294,20 @@ export class DurablePlanStore extends InMemoryPlanStore {
     for (const [planID, map] of this.commits) doc.commits[planID] = Object.fromEntries(map);
     for (const [planID, map] of this.snapshots) doc.snapshots[planID] = Object.fromEntries(map);
     for (const [planID, registry] of this.evidence) doc.evidence[planID] = Object.fromEntries(registry.byKey);
+    // Phase 2F derived synthesis artifacts (additive families).
+    for (const [planID, map] of this.synthesisInputs) doc.synthesisInputs![planID] = Object.fromEntries(map);
+    for (const [planID, map] of this.synthesisManifests) doc.synthesisManifests![planID] = Object.fromEntries(map);
+    // Phase 2G semantic validation (additive families).
+    for (const [planID, map] of this.validationReports) doc.validationReports![planID] = Object.fromEntries(map);
+    for (const [planID, map] of this.validationAdmissions) doc.validationAdmissions![planID] = Object.fromEntries(map);
+    // Phase 2H finalization (additive families).
+    for (const [planID, map] of this.evidenceAudits) doc.evidenceAudits![planID] = Object.fromEntries(map);
+    for (const [planID, map] of this.finalPlanCandidates) doc.finalPlanCandidates![planID] = Object.fromEntries(map);
+    // Phase 2I committed FinalPlans (additive family).
+    for (const [planID, map] of this.finalPlans) doc.finalPlans![planID] = Object.fromEntries(map);
+    // Phase 2J runtime handoff (additive families).
+    for (const [planID, map] of this.executionHandoffs) doc.executionHandoffs![planID] = Object.fromEntries(map);
+    for (const [planID, map] of this.handoffDeliveries) doc.handoffDeliveries![planID] = Object.fromEntries(map);
     return doc;
   }
 
@@ -317,6 +356,69 @@ export class DurablePlanStore extends InMemoryPlanStore {
     for (const [planID, family] of Object.entries(doc.evidence)) {
       this.evidence.set(planID as PlanID, registryFromRecords(family));
     }
+    this.synthesisInputs.clear();
+    for (const [planID, family] of Object.entries(doc.synthesisInputs ?? {})) {
+      this.synthesisInputs.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [import("../core/ids.js").SynthesisInputID, import("../synthesis/types.js").SynthesisInput][]),
+      );
+    }
+    this.synthesisManifests.clear();
+    for (const [planID, family] of Object.entries(doc.synthesisManifests ?? {})) {
+      this.synthesisManifests.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [string, import("../synthesis/types.js").SynthesisManifest][]),
+      );
+    }
+    this.validationReports.clear();
+    for (const [planID, family] of Object.entries(doc.validationReports ?? {})) {
+      this.validationReports.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [import("../core/ids.js").ValidationReportID, import("../validation/types.js").ValidationReport][]),
+      );
+    }
+    this.validationAdmissions.clear();
+    for (const [planID, family] of Object.entries(doc.validationAdmissions ?? {})) {
+      this.validationAdmissions.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [string, import("../validation/types.js").SemanticValidationAdmission][]),
+      );
+    }
+    this.evidenceAudits.clear();
+    for (const [planID, family] of Object.entries(doc.evidenceAudits ?? {})) {
+      this.evidenceAudits.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [import("../core/ids.js").EvidenceAuditID, import("../finalization/types.js").EvidenceAuditSnapshot][]),
+      );
+    }
+    this.finalPlanCandidates.clear();
+    for (const [planID, family] of Object.entries(doc.finalPlanCandidates ?? {})) {
+      this.finalPlanCandidates.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [string, import("../finalization/types.js").FinalPlanCandidate][]),
+      );
+    }
+    this.finalPlans.clear();
+    for (const [planID, family] of Object.entries(doc.finalPlans ?? {})) {
+      this.finalPlans.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [string, import("../core/types.js").FinalPlan][]),
+      );
+    }
+    this.executionHandoffs.clear();
+    for (const [planID, family] of Object.entries(doc.executionHandoffs ?? {})) {
+      this.executionHandoffs.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [import("../core/ids.js").HandoffID, import("../handoff/types.js").ExecutionHandoff][]),
+      );
+    }
+    this.handoffDeliveries.clear();
+    for (const [planID, family] of Object.entries(doc.handoffDeliveries ?? {})) {
+      this.handoffDeliveries.set(
+        planID as PlanID,
+        new Map(Object.entries(family) as [import("../core/ids.js").HandoffID, import("../handoff/types.js").HandoffDelivery][]),
+      );
+    }
   }
 
   /**
@@ -355,6 +457,17 @@ export class DurablePlanStore extends InMemoryPlanStore {
 
   override async saveRun(run: Parameters<InMemoryPlanStore["saveRun"]>[0]) {
     return this.withLock(() => super.saveRun(run));
+  }
+
+  // Phase 2E2: the workflow-focus transition revalidates the expected focus
+  // INSIDE the lock (after rehydration) — a stale cross-instance transition
+  // fails closed with stale_active_work, never last-writer-wins.
+  override async transitionActiveWork(
+    planID: Parameters<InMemoryPlanStore["transitionActiveWork"]>[0],
+    expected: Parameters<InMemoryPlanStore["transitionActiveWork"]>[1],
+    next: Parameters<InMemoryPlanStore["transitionActiveWork"]>[2],
+  ) {
+    return this.withLock(() => super.transitionActiveWork(planID, expected, next));
   }
 
   override async appendEvent(planID: Parameters<InMemoryPlanStore["appendEvent"]>[0], detail: PlanEventDetail) {
@@ -397,6 +510,119 @@ export class DurablePlanStore extends InMemoryPlanStore {
     return this.withLock(() => super.commitTransaction(input));
   }
 
+  // Phase 2F: derived-artifact writes go through the same locked durable
+  // publication as every other mutation (no PlanCommit/HEAD involvement);
+  // freeze/manifest revalidation then runs under the write lock after
+  // rehydration, which makes cross-instance races serialize into ONE
+  // canonical input / non-colliding manifest revisions (brief §55).
+  override async freezeSynthesisInput(
+    planID: Parameters<InMemoryPlanStore["freezeSynthesisInput"]>[0],
+    payload: Parameters<InMemoryPlanStore["freezeSynthesisInput"]>[1],
+  ) {
+    return this.withLock(() => super.freezeSynthesisInput(planID, payload));
+  }
+
+  override async saveSynthesisManifest(
+    planID: Parameters<InMemoryPlanStore["saveSynthesisManifest"]>[0],
+    draft: Parameters<InMemoryPlanStore["saveSynthesisManifest"]>[1],
+  ) {
+    return this.withLock(() => super.saveSynthesisManifest(planID, draft));
+  }
+
+  // Phase 2G: report persistence and the single-flight admission all run under
+  // the same locked durable publication — the admission registers/releases
+  // under the lock (never held across the model call itself), and the report
+  // save revalidates identity + anti-laundering in-lock after rehydration, so
+  // two instances converge on ONE report (brief §30/§31/§64).
+  override async saveValidationReport(
+    planID: Parameters<InMemoryPlanStore["saveValidationReport"]>[0],
+    report: Parameters<InMemoryPlanStore["saveValidationReport"]>[1],
+  ): ReturnType<InMemoryPlanStore["saveValidationReport"]> {
+    return this.withLock(() => super.saveValidationReport(planID, report));
+  }
+
+  override async admitSemanticValidation(
+    planID: Parameters<InMemoryPlanStore["admitSemanticValidation"]>[0],
+    identity: Parameters<InMemoryPlanStore["admitSemanticValidation"]>[1],
+    options: Parameters<InMemoryPlanStore["admitSemanticValidation"]>[2],
+  ): ReturnType<InMemoryPlanStore["admitSemanticValidation"]> {
+    return this.withLock(() => super.admitSemanticValidation(planID, identity, options));
+  }
+
+  override async releaseSemanticValidation(
+    planID: Parameters<InMemoryPlanStore["releaseSemanticValidation"]>[0],
+    identityKey: Parameters<InMemoryPlanStore["releaseSemanticValidation"]>[1],
+  ): Promise<void> {
+    return this.withLock(() => super.releaseSemanticValidation(planID, identityKey));
+  }
+
+  // Phase 2H: the audit/candidate saves run under the same locked durable
+  // publication — every §48/§49/§50/§68/§69 currency revalidation executes
+  // in-lock AFTER rehydration, so a racing evidence write or live blocker
+  // fails `finalization_stale` instead of freezing a diverged candidate.
+  override async saveEvidenceAudit(
+    planID: Parameters<InMemoryPlanStore["saveEvidenceAudit"]>[0],
+    audit: Parameters<InMemoryPlanStore["saveEvidenceAudit"]>[1],
+  ): ReturnType<InMemoryPlanStore["saveEvidenceAudit"]> {
+    return this.withLock(() => super.saveEvidenceAudit(planID, audit));
+  }
+
+  override async saveFinalPlanCandidate(
+    planID: Parameters<InMemoryPlanStore["saveFinalPlanCandidate"]>[0],
+    candidate: Parameters<InMemoryPlanStore["saveFinalPlanCandidate"]>[1],
+  ): ReturnType<InMemoryPlanStore["saveFinalPlanCandidate"]> {
+    return this.withLock(() => super.saveFinalPlanCandidate(planID, candidate));
+  }
+
+  // -- Phase 2J runtime handoff mutations (locked + durable) -------------------
+  // Every handoff workflow transition runs under the write lock AFTER
+  // rehydration, so two instances converge on one dispatch admission and the
+  // lifecycle completion preconditions bind to durable state (§119/§121). The
+  // runtime adapter call itself happens OUTSIDE these locks (§40 — the
+  // coordinator never holds the store lock across the host call).
+
+  override async saveExecutionHandoff(
+    planID: Parameters<InMemoryPlanStore["saveExecutionHandoff"]>[0],
+    handoff: Parameters<InMemoryPlanStore["saveExecutionHandoff"]>[1],
+  ): ReturnType<InMemoryPlanStore["saveExecutionHandoff"]> {
+    return this.withLock(() => super.saveExecutionHandoff(planID, handoff));
+  }
+
+  override async prepareHandoffDelivery(
+    planID: Parameters<InMemoryPlanStore["prepareHandoffDelivery"]>[0],
+    input: Parameters<InMemoryPlanStore["prepareHandoffDelivery"]>[1],
+  ): ReturnType<InMemoryPlanStore["prepareHandoffDelivery"]> {
+    return this.withLock(() => super.prepareHandoffDelivery(planID, input));
+  }
+
+  override async beginHandoffDispatch(
+    planID: Parameters<InMemoryPlanStore["beginHandoffDispatch"]>[0],
+    handoffID: Parameters<InMemoryPlanStore["beginHandoffDispatch"]>[1],
+  ): ReturnType<InMemoryPlanStore["beginHandoffDispatch"]> {
+    return this.withLock(() => super.beginHandoffDispatch(planID, handoffID));
+  }
+
+  override async reclaimHandoffDispatch(
+    planID: Parameters<InMemoryPlanStore["reclaimHandoffDispatch"]>[0],
+    handoffID: Parameters<InMemoryPlanStore["reclaimHandoffDispatch"]>[1],
+  ): ReturnType<InMemoryPlanStore["reclaimHandoffDispatch"]> {
+    return this.withLock(() => super.reclaimHandoffDispatch(planID, handoffID));
+  }
+
+  override async recordHandoffDelivered(
+    planID: Parameters<InMemoryPlanStore["recordHandoffDelivered"]>[0],
+    handoffID: Parameters<InMemoryPlanStore["recordHandoffDelivered"]>[1],
+    receipt: Parameters<InMemoryPlanStore["recordHandoffDelivered"]>[2],
+  ): ReturnType<InMemoryPlanStore["recordHandoffDelivered"]> {
+    return this.withLock(() => super.recordHandoffDelivered(planID, handoffID, receipt));
+  }
+
+  override async completeHandoffRun(
+    planID: Parameters<InMemoryPlanStore["completeHandoffRun"]>[0],
+  ): ReturnType<InMemoryPlanStore["completeHandoffRun"]> {
+    return this.withLock(() => super.completeHandoffRun(planID));
+  }
+
   /** TEST/FIXTURE ONLY (see base class). Wrapped so seeding is durable. */
   override seedCommittedState(
     planID: Parameters<InMemoryPlanStore["seedCommittedState"]>[0],
@@ -422,106 +648,327 @@ export class DurablePlanStore extends InMemoryPlanStore {
     });
   }
 
-  // -- Reads (lazy open; may be per-instance cached across instances) --------
+  // -- Reads (lazy open + refresh-from-disk: allocation-critical reads must
+  //    see the latest durable state across instances; suppressed in-lock) ----
 
   override async findActiveRunBySession(sessionID: string) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.findActiveRunBySession(sessionID);
   }
 
   override async findLatestRunBySession(sessionID: string) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.findLatestRunBySession(sessionID);
   }
 
   override async getRun(planID: Parameters<InMemoryPlanStore["getRun"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getRun(planID);
   }
 
   override async nextPlanSequence(): Promise<number> {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.nextPlanSequence();
   }
 
   override async listEvents(planID: Parameters<InMemoryPlanStore["listEvents"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listEvents(planID);
   }
 
   override async getHeadSnapshot(planID: Parameters<InMemoryPlanStore["getHeadSnapshot"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getHeadSnapshot(planID);
   }
 
   override async getArchitecture(planID: Parameters<InMemoryPlanStore["getArchitecture"]>[0], revision?: number) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getArchitecture(planID, revision);
   }
 
   override async getSection(planID: Parameters<InMemoryPlanStore["getSection"]>[0], sectionID: Parameters<InMemoryPlanStore["getSection"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getSection(planID, sectionID);
   }
 
   override async listSections(planID: Parameters<InMemoryPlanStore["listSections"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listSections(planID);
   }
 
   override async getSectionRevision(planID: Parameters<InMemoryPlanStore["getSectionRevision"]>[0], ref: Parameters<InMemoryPlanStore["getSectionRevision"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getSectionRevision(planID, ref);
   }
 
   override async getDecision(planID: Parameters<InMemoryPlanStore["getDecision"]>[0], ref: Parameters<InMemoryPlanStore["getDecision"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getDecision(planID, ref);
   }
 
   override async listDecisions(planID: Parameters<InMemoryPlanStore["listDecisions"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listDecisions(planID);
   }
 
   override async getProposal(planID: Parameters<InMemoryPlanStore["getProposal"]>[0], proposalID: Parameters<InMemoryPlanStore["getProposal"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getProposal(planID, proposalID);
   }
 
   override async getCommit(planID: Parameters<InMemoryPlanStore["getCommit"]>[0], commitID: Parameters<InMemoryPlanStore["getCommit"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getCommit(planID, commitID);
   }
 
   override async listCommits(planID: Parameters<InMemoryPlanStore["listCommits"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listCommits(planID);
+  }
+
+  override async listProposals(planID: Parameters<InMemoryPlanStore["listProposals"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listProposals(planID);
   }
 
   override async getApproval(planID: Parameters<InMemoryPlanStore["getApproval"]>[0], approvalID: Parameters<InMemoryPlanStore["getApproval"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getApproval(planID, approvalID);
   }
 
   override async findApprovalForProposal(planID: Parameters<InMemoryPlanStore["findApprovalForProposal"]>[0], proposalID: Parameters<InMemoryPlanStore["findApprovalForProposal"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.findApprovalForProposal(planID, proposalID);
   }
 
   override async listApprovals(planID: Parameters<InMemoryPlanStore["listApprovals"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listApprovals(planID);
   }
 
   override async listEvidence(planID: Parameters<InMemoryPlanStore["listEvidence"]>[0]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.listEvidence(planID);
   }
 
   override async getEvidence(planID: Parameters<InMemoryPlanStore["getEvidence"]>[0], ref: Parameters<InMemoryPlanStore["getEvidence"]>[1]) {
     await this.ensureOpen();
+    this.refreshFromDisk();
     return super.getEvidence(planID, ref);
+  }
+
+  // -- Phase 2F derived-artifact reads (refresh-from-disk: another instance's
+  //    frozen input/manifest must be visible immediately) --------------------
+
+  override async getSynthesisInput(planID: Parameters<InMemoryPlanStore["getSynthesisInput"]>[0], inputID: Parameters<InMemoryPlanStore["getSynthesisInput"]>[1]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getSynthesisInput(planID, inputID);
+  }
+
+  override async listSynthesisInputs(planID: Parameters<InMemoryPlanStore["listSynthesisInputs"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listSynthesisInputs(planID);
+  }
+
+  override async getLatestSynthesisInput(planID: Parameters<InMemoryPlanStore["getLatestSynthesisInput"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getLatestSynthesisInput(planID);
+  }
+
+  override async getSynthesisManifest(
+    planID: Parameters<InMemoryPlanStore["getSynthesisManifest"]>[0],
+    manifestID: Parameters<InMemoryPlanStore["getSynthesisManifest"]>[1],
+    revision?: Parameters<InMemoryPlanStore["getSynthesisManifest"]>[2],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getSynthesisManifest(planID, manifestID, revision);
+  }
+
+  override async getLatestSynthesisManifest(planID: Parameters<InMemoryPlanStore["getLatestSynthesisManifest"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getLatestSynthesisManifest(planID);
+  }
+
+  override async listSynthesisManifests(planID: Parameters<InMemoryPlanStore["listSynthesisManifests"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listSynthesisManifests(planID);
+  }
+
+  // -- Phase 2G semantic-validation reads (refresh-from-disk) -----------------
+
+  override async getValidationReport(
+    planID: Parameters<InMemoryPlanStore["getValidationReport"]>[0],
+    reportID: Parameters<InMemoryPlanStore["getValidationReport"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getValidationReport(planID, reportID);
+  }
+
+  override async getCurrentValidationReport(planID: Parameters<InMemoryPlanStore["getCurrentValidationReport"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getCurrentValidationReport(planID);
+  }
+
+  override async listValidationReports(planID: Parameters<InMemoryPlanStore["listValidationReports"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listValidationReports(planID);
+  }
+
+  override async findValidationReportByIdentity(
+    planID: Parameters<InMemoryPlanStore["findValidationReportByIdentity"]>[0],
+    identity: Parameters<InMemoryPlanStore["findValidationReportByIdentity"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findValidationReportByIdentity(planID, identity);
+  }
+
+  override async getSemanticValidationAdmission(
+    planID: Parameters<InMemoryPlanStore["getSemanticValidationAdmission"]>[0],
+    identityKey: Parameters<InMemoryPlanStore["getSemanticValidationAdmission"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getSemanticValidationAdmission(planID, identityKey);
+  }
+
+  // -- Phase 2H finalization reads (refresh-from-disk) -------------------------
+
+  override async getEvidenceAudit(
+    planID: Parameters<InMemoryPlanStore["getEvidenceAudit"]>[0],
+    auditID: Parameters<InMemoryPlanStore["getEvidenceAudit"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getEvidenceAudit(planID, auditID);
+  }
+
+  override async getCurrentEvidenceAudit(planID: Parameters<InMemoryPlanStore["getCurrentEvidenceAudit"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getCurrentEvidenceAudit(planID);
+  }
+
+  override async listEvidenceAudits(planID: Parameters<InMemoryPlanStore["listEvidenceAudits"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listEvidenceAudits(planID);
+  }
+
+  override async findEvidenceAuditByIdentity(
+    planID: Parameters<InMemoryPlanStore["findEvidenceAuditByIdentity"]>[0],
+    identity: Parameters<InMemoryPlanStore["findEvidenceAuditByIdentity"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findEvidenceAuditByIdentity(planID, identity);
+  }
+
+  override async getFinalPlanCandidate(
+    planID: Parameters<InMemoryPlanStore["getFinalPlanCandidate"]>[0],
+    candidateID: Parameters<InMemoryPlanStore["getFinalPlanCandidate"]>[1],
+    revision?: Parameters<InMemoryPlanStore["getFinalPlanCandidate"]>[2],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getFinalPlanCandidate(planID, candidateID, revision);
+  }
+
+  override async getCurrentFinalPlanCandidate(planID: Parameters<InMemoryPlanStore["getCurrentFinalPlanCandidate"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getCurrentFinalPlanCandidate(planID);
+  }
+
+  override async listFinalPlanCandidates(planID: Parameters<InMemoryPlanStore["listFinalPlanCandidates"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listFinalPlanCandidates(planID);
+  }
+
+  override async findFinalPlanCandidateByIdentity(
+    planID: Parameters<InMemoryPlanStore["findFinalPlanCandidateByIdentity"]>[0],
+    identity: Parameters<InMemoryPlanStore["findFinalPlanCandidateByIdentity"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findFinalPlanCandidateByIdentity(planID, identity);
+  }
+
+  // -- Phase 2I committed-FinalPlan reads (refresh-from-disk) -----------------
+
+  override async getFinalPlan(
+    planID: Parameters<InMemoryPlanStore["getFinalPlan"]>[0],
+    finalPlanID: Parameters<InMemoryPlanStore["getFinalPlan"]>[1],
+    revision?: Parameters<InMemoryPlanStore["getFinalPlan"]>[2],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getFinalPlan(planID, finalPlanID, revision);
+  }
+
+  override async getCurrentFinalPlan(planID: Parameters<InMemoryPlanStore["getCurrentFinalPlan"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getCurrentFinalPlan(planID);
+  }
+
+  override async listFinalPlans(planID: Parameters<InMemoryPlanStore["listFinalPlans"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listFinalPlans(planID);
+  }
+
+  // -- Phase 2J runtime handoff reads (refresh-from-disk) ----------------------
+
+  override async getExecutionHandoff(
+    planID: Parameters<InMemoryPlanStore["getExecutionHandoff"]>[0],
+    handoffID: Parameters<InMemoryPlanStore["getExecutionHandoff"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionHandoff(planID, handoffID);
+  }
+
+  override async findExecutionHandoffForPlan(planID: Parameters<InMemoryPlanStore["findExecutionHandoffForPlan"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionHandoffForPlan(planID);
+  }
+
+  override async getHandoffDelivery(planID: Parameters<InMemoryPlanStore["getHandoffDelivery"]>[0], handoffID: Parameters<InMemoryPlanStore["getHandoffDelivery"]>[1]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getHandoffDelivery(planID, handoffID);
   }
 }
 

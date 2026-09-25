@@ -5,10 +5,9 @@
  * store and reusable by the Phase 2 transaction engine. Prompt instructions
  * never carry these rules; the harness enforces them.
  */
-import type { Evidence } from "../repository/evidence.js";
 import { UltraPlanError } from "./errors.js";
 import type { SectionID } from "./ids.js";
-import type { Architecture, Conflict, OpenQuestion, PlanningRun, Section } from "./types.js";
+import type { PlanningRun, Section } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Revision discipline (spec §35 invariants 7, 11, 12)
@@ -164,76 +163,38 @@ export function propagateNeedsReview(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Finalization predicate (spec §33 preconditions, §30 evidence audit)
-// ---------------------------------------------------------------------------
-
-export type FinalizationFailure =
-  | "architecture_not_approved"
-  | "sections_not_approved"
-  | "sections_not_valid"
-  | "blocking_questions_open"
-  | "blocking_conflicts_open"
-  | "critical_evidence_not_fresh";
-
-export interface FinalizationInput {
-  architecture: Architecture | undefined;
-  sections: readonly Section[];
-  openQuestions: readonly OpenQuestion[];
-  conflicts: readonly Conflict[];
-  evidence: readonly Evidence[];
+/**
+ * Phase 2E1 dependency-validation rule for committed Section checkpoints
+ * (agent protocol §6.6): a section whose checkpoint just committed is `valid`
+ * only when EVERY structural direct dependency of the Section root has an
+ * approved contract at commit time. A dependency still missing its first
+ * approved SectionRevision/Contract leaves the dependent `needs_review` —
+ * the checkpoint itself may commit either way (design may proceed ahead of
+ * dependency completion; COMPLETION gating is Phase 2E2). The rule is
+ * evaluated by the transaction engine over STAGED state, never taken from
+ * approved proposal content.
+ */
+export function sectionValidationFromDependencyContracts(
+  dependencies: readonly SectionID[],
+  dependencyState: ReadonlyMap<SectionID, Pick<Section, "approvedRevision">>,
+): "valid" | "needs_review" {
+  return dependencies.every((dep) => dependencyState.get(dep)?.approvedRevision !== undefined)
+    ? "valid"
+    : "needs_review";
 }
 
-export interface FinalizationCheck {
-  ok: boolean;
-  /** Deterministic: failures appear in the fixed order of FinalizationFailure. */
-  failures: FinalizationFailure[];
-}
+// ---------------------------------------------------------------------------
+// Finalization — see finalization/gate.ts (Phase 2H)
+// ---------------------------------------------------------------------------
 
 /**
- * Finalization is valid only when:
- *
- *   architecture approved
- *   AND all required sections approved
- *   AND all required sections valid
- *   AND blocking questions == 0
- *   AND blocking conflicts == 0
- *   AND critical evidence is fresh
- *
- * Zero sections is treated as "not approved": after architecture approval the
- * plan must have been decomposed (spec §6) before synthesis/final.
+ * The legacy infrastructure placeholder `checkFinalization` (and its
+ * FinalizationInput/FinalizationCheck/FinalizationFailure types) was REPLACED
+ * in Phase 2H by the authoritative deterministic gate:
+ * `finalization/gate.ts evaluateFinalizationGate` + the Evidence Audit
+ * (`finalization/audit.ts buildEvidenceAudit`). There is ONE finalization
+ * authority; do not reintroduce a second predicate here.
  */
-export function checkFinalization(input: FinalizationInput): FinalizationCheck {
-  const failures: FinalizationFailure[] = [];
-
-  if (!input.architecture || input.architecture.status !== "approved") {
-    failures.push("architecture_not_approved");
-  }
-  if (
-    input.sections.length === 0 ||
-    input.sections.some((section) => section.status !== "approved")
-  ) {
-    failures.push("sections_not_approved");
-  }
-  if (input.sections.some((section) => section.validation !== "valid")) {
-    failures.push("sections_not_valid");
-  }
-  if (input.openQuestions.some((q) => q.blocking && q.status === "open")) {
-    failures.push("blocking_questions_open");
-  }
-  if (input.conflicts.some((c) => c.severity === "blocking" && c.status === "open")) {
-    failures.push("blocking_conflicts_open");
-  }
-  if (
-    input.evidence.some(
-      (e) => e.criticality === "critical" && !(e.status === "active" && e.freshness === "fresh"),
-    )
-  ) {
-    failures.push("critical_evidence_not_fresh");
-  }
-
-  return { ok: failures.length === 0, failures };
-}
 
 // ---------------------------------------------------------------------------
 // Committed run fields (spec §35 invariant 8: only a PlanCommit may mutate
@@ -243,13 +204,19 @@ export function checkFinalization(input: FinalizationInput): FinalizationCheck {
 /**
  * PlanningRun fields that mirror committed Plan Memory. They advance only
  * atomically with a PlanCommit — never through the run-header mutation path.
- * (openQuestions/conflicts/constraints are working state raised during
- * discussion; they do not require a commit to exist.)
+ * (openQuestions/conflicts are working state raised during discussion; they do
+ * not require a commit to exist. Constraints ARE commit-gated since Phase 2C:
+ * a committed Constraint enters Plan Memory only through an approved
+ * add_constraint PlanCommit. activeWork is commit-gated since Phase 2D: the
+ * initial Section focus is bound by the decomposition Proposal hash and may
+ * only be established by its PlanCommit — never forced through the header.)
  */
 const COMMIT_GATED_RUN_FIELDS = [
   "architecture",
+  "constraints",
   "sections",
   "decisions",
+  "activeWork",
   "finalPlan",
   "headCommit",
   "headSnapshot",

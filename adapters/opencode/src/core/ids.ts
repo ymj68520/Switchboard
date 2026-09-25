@@ -25,6 +25,35 @@ export type FinalPlanID = Brand<string, "FinalPlanID">;
 export type EvidenceID = Brand<string, "EvidenceID">;
 export type ObservationID = Brand<string, "ObservationID">;
 export type ContextTraceID = Brand<string, "ContextTraceID">;
+/**
+ * Phase 2F — derived synthesis artifacts. These are NOT committed design:
+ * Harness-frozen workflow artifacts anchored to exact HEAD state (see
+ * synthesis/types.ts). "SYN-IN" for inputs, "SYN" for manifests (the short
+ * prefix keeps manifest revisions readable: SYN-001@2).
+ */
+export type SynthesisInputID = Brand<string, "SynthesisInputID">;
+export type SynthesisManifestID = Brand<string, "SynthesisManifestID">;
+/**
+ * Phase 2G — read-only semantic validation artifacts (see validation/types.ts).
+ * Reports are "VAL-###"; findings inside a report are "VF-###" (Harness-assigned
+ * per report — the validator never names them).
+ */
+export type ValidationReportID = Brand<string, "ValidationReportID">;
+export type ValidationFindingID = Brand<string, "ValidationFindingID">;
+/**
+ * Phase 2H — finalization derived artifacts (see finalization/types.ts). The
+ * Evidence Audit is "AUD-###" (one immutable id per distinct audited state);
+ * the FinalPlanCandidate family is "FPC-###" with per-gate-identity revisions
+ * (FPC-001@1, FPC-001@2, …) mirroring the SynthesisManifest revision model.
+ */
+export type EvidenceAuditID = Brand<string, "EvidenceAuditID">;
+export type FinalPlanCandidateID = Brand<string, "FinalPlanCandidateID">;
+/**
+ * Phase 2J — the ExecutionHandoff derived artifact ("HANDOFF-###"). ONE
+ * canonical handoff exists per approved FinalPlan (§16): recovery reuses the
+ * same id forever — there is no HANDOFF-002 for the same plan.
+ */
+export type HandoffID = Brand<string, "HandoffID">;
 
 /**
  * The Architecture artifact is a singleton per planning run; the frozen spec
@@ -46,7 +75,14 @@ export type UltraPlanIDBrand =
   | "FinalPlanID"
   | "EvidenceID"
   | "ObservationID"
-  | "ContextTraceID";
+  | "ContextTraceID"
+  | "SynthesisInputID"
+  | "SynthesisManifestID"
+  | "ValidationReportID"
+  | "ValidationFindingID"
+  | "EvidenceAuditID"
+  | "FinalPlanCandidateID"
+  | "HandoffID";
 
 export interface IDFactory<B extends UltraPlanIDBrand> {
   /** Canonical display prefix, e.g. "PLAN" for PLAN-001. */
@@ -91,6 +127,13 @@ export const FinalPlanIDs: IDFactory<"FinalPlanID"> = idFactory("FINAL");
 export const EvidenceIDs: IDFactory<"EvidenceID"> = idFactory("EVD");
 export const ObservationIDs: IDFactory<"ObservationID"> = idFactory("OBS");
 export const ContextTraceIDs: IDFactory<"ContextTraceID"> = idFactory("TRACE");
+export const SynthesisInputIDs: IDFactory<"SynthesisInputID"> = idFactory("SYN-IN");
+export const SynthesisManifestIDs: IDFactory<"SynthesisManifestID"> = idFactory("SYN");
+export const ValidationReportIDs: IDFactory<"ValidationReportID"> = idFactory("VAL");
+export const ValidationFindingIDs: IDFactory<"ValidationFindingID"> = idFactory("VF");
+export const EvidenceAuditIDs: IDFactory<"EvidenceAuditID"> = idFactory("AUD");
+export const FinalPlanCandidateIDs: IDFactory<"FinalPlanCandidateID"> = idFactory("FPC");
+export const HandoffIDs: IDFactory<"HandoffID"> = idFactory("HANDOFF");
 
 /**
  * Next free sequence number for a `PREFIX-###` id family, given the ids

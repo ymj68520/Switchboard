@@ -15,7 +15,8 @@ import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin
 
 import { isUltraPlanError } from "../core/errors.js";
 import type { UltraPlanController } from "../core/controller.js";
-import { PREPARED_CHANGE_KINDS } from "../core/controller.js";
+import { PREPARED_CHANGE_KINDS, type SectionCheckpointInput } from "../core/controller.js";
+import { renderProposalForApproval } from "../memory/approval-view.js";
 import { ULTRA_PLAN_START_TOOL, createUltraPlanStartTool } from "./ultra-plan.js";
 
 /** Structured error surface for the model: code in output + metadata. */
@@ -30,11 +31,23 @@ function asToolResult(error: unknown): { title: string; output: string; metadata
 
 const flatRefShape = {
   kind: tool.schema
-    .enum(["architecture", "section", "decision", "constraint", "question", "conflict", "evidence", "proposal", "snapshot", "commit", "final_plan"])
+    .enum(["architecture", "section", "decision", "constraint", "question", "conflict", "evidence", "proposal", "snapshot", "commit", "final_plan", "synthesis_input", "synthesis_manifest", "validation_report", "evidence_audit", "final_plan_candidate", "execution_handoff"])
     .describe("Kind of memory object being referenced"),
   id: tool.schema.string().optional().describe("Artifact id (e.g. SEC-001, DEC-014, Q-007)"),
   revision: tool.schema.number().optional().describe("Exact revision — required for decisions; never resolved to latest"),
 };
+
+/** Flat exact source ref for derived synthesis statements (Phase 2F). */
+const sourceRefShape = tool.schema.object({
+  kind: tool.schema
+    .enum(["architecture", "section", "decision", "constraint", "question", "conflict", "evidence"])
+    .describe("Source kind inside the frozen SynthesisInput"),
+  id: tool.schema.string().optional().describe("Artifact id (SEC-001, DEC-014, CON-001, Q-001, CONF-001, EVD-001)"),
+  revision: tool.schema
+    .number()
+    .optional()
+    .describe("Exact revision — REQUIRED for section/decision/evidence sources"),
+});
 
 export function createUltraPlanTools(controller: UltraPlanController): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
@@ -61,9 +74,11 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
 
     plan_memory: tool({
       description:
-        "Read-only access to committed Plan Memory (spec §20). Reads an artifact by exact " +
-        "reference, the current run summary, or the dependency contracts of a section. " +
-        "Never mutates state; explicit revisions are never silently resolved to latest.",
+        "Read-only access to committed Plan Memory (spec §20) and derived synthesis/validation artifacts " +
+        "(Phases 2F/2G). Reads an artifact by exact reference, the current run summary, or the dependency " +
+        "contracts of a section. kind=synthesis_input reads a frozen input by exact id; kind=synthesis_manifest " +
+        "reads a manifest by id (+ optional exact revision — historical revisions are never resolved to latest); " +
+        "kind=validation_report reads a semantic-validation report by exact id. Never mutates state.",
       args: {
         kind: flatRefShape.kind.optional(),
         id: flatRefShape.id.optional(),
@@ -302,20 +317,250 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
       },
     }),
 
+    ultraplan_request_architecture: tool({
+      description:
+        "Request the transition from DISCOVERY to the ARCHITECTURE stage. Call this when repository/task " +
+        "discovery is sufficient to start top-level design. The Harness validates structural readiness " +
+        "(discovery stage, structured goal set) and performs the transition — you cannot set stages directly.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          const result = await controller.requestArchitecture(context.sessionID);
+          return {
+            title: `Ultra Plan ${result.run.id} entered architecture`,
+            output: result.statusText,
+            metadata: { planID: result.run.id, stage: result.run.stage },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
     ultraplan_request_completion: tool({
       description:
-        "Request completion of a section: prepares a section_completion proposal declaring the " +
-        "section's committed design complete. Requires the section to exist and all dependencies to be approved.",
+        "Request artifact completion. kind='architecture' prepares the architecture_completion proposal: the " +
+        "approved top-level architecture becomes the basis for Detail decomposition and the run transitions " +
+        "architecture -> detail atomically with the commit. kind='section' (Detail stage) prepares a " +
+        "section_completion proposal for the ACTIVE section's exact current approved checkpoint — you supply no " +
+        "revision or design content; the Harness resolves the exact target and returns precise blocker errors " +
+        "(dependency_incomplete, section_needs_review, ...) when deterministic gates fail. Either way the USER " +
+        "must approve the prepared proposal before anything commits.",
       args: {
-        sectionID: tool.schema.string().describe("Section id (e.g. SEC-001)"),
+        kind: tool.schema.enum(["architecture", "section"]).describe("What is being completed"),
       },
       async execute(args, context: ToolContext) {
         try {
-          const prepared = await controller.requestCompletion(context.sessionID, { sectionID: args.sectionID });
+          const prepared = await controller.requestCompletion(context.sessionID, { kind: args.kind });
           return {
-            title: `Completion requested for ${args.sectionID}`,
-            output: `section_completion proposal ${prepared.proposal.id} prepared (hash ${prepared.hash}). Awaiting USER approval.`,
-            metadata: { proposalID: prepared.proposal.id, sectionID: args.sectionID },
+            title: `Completion requested (${args.kind})`,
+            output: `${prepared.proposal.type} proposal ${prepared.proposal.id} prepared (hash ${prepared.hash}). Awaiting USER approval.`,
+            metadata: {
+              proposalID: prepared.proposal.id,
+              proposalType: prepared.proposal.type,
+              kind: args.kind,
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_request_section_focus: tool({
+      description:
+        "Request moving the workflow focus to another committed Section (Detail stage). Discussion may run " +
+        "ahead of dependency completion, so you may focus pending or active sections even when they cannot yet " +
+        "complete. The Harness validates deterministically and performs the durable focus transition — this is " +
+        "workflow state, NOT a design Proposal and NOT user-approved; set_active_work does not exist.",
+      args: {
+        sectionID: tool.schema.string().describe("Target section id (e.g. SEC-002); must be pending or active"),
+      },
+      async execute(args, context: ToolContext) {
+        try {
+          const result = await controller.requestSectionFocus(context.sessionID, { sectionID: args.sectionID });
+          return {
+            title: `Focus moved to ${args.sectionID}`,
+            output: result.statusText,
+            metadata: {
+              planID: result.run.id,
+              stage: result.run.stage,
+              activeWork: result.run.activeWork,
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_prepare_section_decomposition: tool({
+      description:
+        "Freeze the COMPLETE initial Section DAG as one atomic proposal (Detail stage, before any sections " +
+        "exist). Submit every section with a draft-local key (yours, not authoritative), title, objective, " +
+        "dependsOn keys (dependencies must appear EARLIER in the list), and the initial focus key. The Harness " +
+        "assigns authoritative SEC ids, resolves all edges, validates the DAG, and freezes one proposal for " +
+        "USER approval. You can NEVER approve or commit it, and the initial decomposition happens exactly once.",
+      args: {
+        sections: tool.schema
+          .array(
+            tool.schema.object({
+              key: tool.schema.string().describe("Draft-local key, e.g. \"plan-memory\" (never persisted as an id)"),
+              title: tool.schema.string().describe("Short section title"),
+              objective: tool.schema.string().describe("What this design scope must solve"),
+              dependsOn: tool.schema
+                .array(tool.schema.string())
+                .optional()
+                .describe("Draft-local keys this section depends on (must appear earlier in the array)"),
+            }),
+          )
+          .describe("The complete initial decomposition, in canonical order"),
+        initialSection: tool.schema
+          .string()
+          .describe("Draft-local key of the section where Detail work begins"),
+      },
+      async execute(args, context: ToolContext) {
+        try {
+          const prepared = await controller.prepareSectionDecomposition(context.sessionID, {
+            sections: args.sections,
+            initialSection: args.initialSection,
+          });
+          return {
+            title: `Section decomposition ${prepared.proposal.id} prepared`,
+            output: [
+              `Proposal ${prepared.proposal.id} (${prepared.proposal.type}, revision ${prepared.proposal.revision}) is READY.`,
+              renderProposalForApproval(prepared.proposal),
+              "Awaiting USER approval via the approval boundary — you cannot approve or commit it.",
+            ].join("\n"),
+            metadata: {
+              proposalID: prepared.proposal.id,
+              hash: prepared.hash,
+              status: prepared.proposal.status,
+              sections: prepared.proposal.impact.affectedSections,
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_prepare_section_checkpoint: tool({
+      description:
+        "Freeze the ACTIVE section's detailed design into the next exact SectionRevision checkpoint " +
+        "Proposal (Detail stage). The target is always the run's active work — you cannot choose a " +
+        "section id, revision number, or status. Record the exact dependency context (every " +
+        "structural dependency, with the consumes names its approved contract provides), committed " +
+        "decisions, referenced questions, and BOTH stable projections (compact + dependency-facing " +
+        "contract). A dependency without an approved contract does not block the checkpoint — the " +
+        "section is marked needs_review until a revalidated checkpoint lands. The user approves the " +
+        "full design + projections as one payload; you can NEVER approve or commit it.",
+      args: {
+        problem: tool.schema.string().describe("Precise problem definition this revision solves"),
+        design: tool.schema.string().describe("The concrete design of this revision"),
+        interfaces: tool.schema
+          .array(
+            tool.schema.object({
+              name: tool.schema.string(),
+              description: tool.schema.string(),
+              signature: tool.schema.string().optional(),
+            }),
+          )
+          .describe("Interfaces this revision defines (names must be unique)"),
+        invariants: tool.schema.array(tool.schema.string()).describe("Invariants this revision establishes"),
+        failureModes: tool.schema
+          .array(
+            tool.schema.object({
+              description: tool.schema.string(),
+              mitigation: tool.schema.string().optional(),
+            }),
+          )
+          .describe("Failure modes this revision anticipates"),
+        dependencies: tool.schema
+          .array(
+            tool.schema.object({
+              sectionID: tool.schema.string().describe("Structural dependency section (e.g. SEC-001)"),
+              consumes: tool.schema
+                .array(tool.schema.string())
+                .describe("Names this revision consumes from the dependency's approved contract"),
+            }),
+          )
+          .describe("The exact dependency context: every structural dependency of the section, once"),
+        decisions: tool.schema
+          .array(tool.schema.string())
+          .describe("Committed decision ids this revision stands on (must already exist)"),
+        openQuestions: tool.schema
+          .array(tool.schema.string())
+          .describe("Open question ids this revision references (must already exist)"),
+        impacts: tool.schema
+          .array(tool.schema.string())
+          .describe("Committed section ids this design affects (design metadata only)"),
+        compactProjection: tool.schema
+          .string()
+          .describe("Stable compact projection — frozen into the revision, never regenerated"),
+        contract: tool.schema.object({
+          provides: tool.schema.array(tool.schema.string()).describe("Names this section provides to dependents"),
+          requires: tool.schema.array(tool.schema.string()).describe("Names this section requires from dependencies"),
+          invariants: tool.schema
+            .array(tool.schema.string())
+            .describe("Contract invariants (must restate invariants of this revision)"),
+          interfaces: tool.schema
+            .array(
+              tool.schema.object({
+                name: tool.schema.string().describe("Interface name (must be defined by this revision)"),
+                providedBy: tool.schema.string().optional(),
+              }),
+            )
+            .describe("Interfaces exposed by this contract"),
+          decisions: tool.schema
+            .array(
+              tool.schema.object({
+                id: tool.schema.string().describe("Decision id (must be referenced by this revision)"),
+                revision: tool.schema.number().describe("Exact committed decision revision"),
+              }),
+            )
+            .describe("Decisions the contract cites, exactly"),
+        }),
+      },
+      async execute(args, context: ToolContext) {
+        try {
+          // Transport layer: raw model strings ride in the tool args; the
+          // controller validates every field and assigns the branded
+          // identities (nothing authoritative is accepted from the model).
+          const input = {
+            problem: args.problem,
+            design: args.design,
+            interfaces: args.interfaces ?? [],
+            invariants: args.invariants ?? [],
+            failureModes: args.failureModes ?? [],
+            dependencies: args.dependencies ?? [],
+            decisions: args.decisions ?? [],
+            openQuestions: args.openQuestions ?? [],
+            impacts: args.impacts ?? [],
+            projection: { compact: args.compactProjection, contract: args.contract },
+          } as unknown as SectionCheckpointInput;
+          const prepared = await controller.prepareSectionCheckpoint(context.sessionID, input);
+          return {
+            title: `Section checkpoint ${prepared.proposal.id} prepared`,
+            output: [
+              `Proposal ${prepared.proposal.id} (${prepared.proposal.type}, revision ${prepared.proposal.revision}) is READY.`,
+              renderProposalForApproval(prepared.proposal),
+              "Awaiting USER approval via the approval boundary — you cannot approve or commit it.",
+            ].join("\n"),
+            metadata: {
+              proposalID: prepared.proposal.id,
+              hash: prepared.hash,
+              status: prepared.proposal.status,
+              sections: prepared.proposal.impact.affectedSections,
+            },
           };
         } catch (error) {
           const structured = asToolResult(error);
@@ -342,7 +587,10 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
             // One-shot structured user decision point. The `always` list is
             // deliberately EMPTY — a persistent permission must never become a
             // standing approval authority. The exact proposal binding rides in
-            // the permission string and metadata.
+            // the permission string and metadata; the rendered view is a
+            // deterministic projection of the FROZEN proposal (§19), never
+            // model-generated approval prose.
+            const approvalView = renderProposalForApproval(begun.proposal);
             await context.ask({
               permission: `ultraplan.approval:${begun.request.proposalID}@${begun.request.proposalRevision}:${begun.request.proposalHash.slice(0, 16)}`,
               patterns: [],
@@ -356,6 +604,7 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
                 proposalType: begun.proposal.type,
                 title: begun.proposal.title,
                 summary: begun.proposal.summary,
+                approvalView,
               },
             });
           } catch (error) {
@@ -382,6 +631,7 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
               `User APPROVED proposal ${result.commit.proposalID}.`,
               `PlanCommit ${result.commit.id} applied ${result.commit.changes.length} change(s); parent=${result.commit.parentCommit ?? "none"}.`,
               `Snapshot ${result.commit.resultingSnapshot} is the new HEAD.`,
+              ...(result.run ? [`Run stage: ${result.run.stage}.`] : []),
             ].join("\n"),
             metadata: {
               commitID: result.commit.id,
@@ -389,6 +639,7 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
               proposalID: result.commit.proposalID,
               approvalID: result.commit.approvalID,
               status: "approved",
+              ...(result.run ? { stage: result.run.stage, architecture: result.run.architecture } : {}),
             },
           };
         } catch (error) {
@@ -401,22 +652,185 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
 
     ultraplan_request_reopen: tool({
       description:
-        "Request reopening an approved section or decision because later work invalidated it. " +
-        "Prepares an amendment proposal; approved design is never silently edited.",
+        "Request reopening an APPROVED section (the sanctioned way back to design). In SYNTHESIS: only after " +
+        "semantic validation produced a FINDINGS report — name the target section and the report's finding ids " +
+        "affecting it; the Harness resolves the exact revision and binds the report hash. In DETAIL: a " +
+        "dependency_review of an approved but needs_review section — supply only the section id. This freezes an " +
+        "amendment Proposal; the USER must approve it, and only then does a reopen_section PlanCommit set " +
+        "status approved -> reopened, validation -> needs_review, active work -> the target (and stage synthesis " +
+        "-> detail). You can never set Section status, stage, activeWork, validation, or revision directly, and " +
+        "the approved revision stays immutable — reopen means the design must earn a NEW approved checkpoint.",
       args: {
-        kind: tool.schema.enum(["section", "decision"]).describe("What to reopen"),
-        id: tool.schema.string().describe("Artifact id (e.g. SEC-003)"),
-        revision: tool.schema.number().optional().describe("Exact revision being amended, if known"),
+        sectionID: tool.schema.string().describe("Target section id (e.g. SEC-002); must be approved with agreeing revision pointers"),
+        findingIDs: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Semantic-validation finding ids (e.g. VF-001) from the CURRENT findings report — synthesis-stage reopens only; omit for detail-stage dependency review"),
       },
       async execute(args, context: ToolContext) {
         try {
           const prepared = await controller.requestReopen(context.sessionID, {
-            ref: { kind: args.kind, id: args.id, ...(args.revision !== undefined ? { revision: args.revision } : {}) },
+            sectionID: args.sectionID,
+            ...(args.findingIDs && args.findingIDs.length > 0 ? { findingIDs: args.findingIDs } : {}),
           });
           return {
-            title: `Reopen requested for ${args.id}`,
-            output: `amendment proposal ${prepared.proposal.id} prepared to reopen ${args.kind} ${args.id}. Awaiting USER approval.`,
-            metadata: { proposalID: prepared.proposal.id, target: args.id },
+            title: `Reopen requested for ${args.sectionID}`,
+            output: [
+              `amendment proposal ${prepared.proposal.id} prepared to reopen ${args.sectionID} (hash ${prepared.hash}).`,
+              renderProposalForApproval(prepared.proposal),
+              "Awaiting USER approval via the approval boundary — you cannot approve or commit it.",
+            ].join("\n"),
+            metadata: { proposalID: prepared.proposal.id, target: args.sectionID, hash: prepared.hash },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_run_semantic_validation: tool({
+      description:
+        "Request SEMANTIC VALIDATION of the current synthesis output (Synthesis stage, after begin_synthesis + " +
+        "submit_synthesis_manifest). You supply NOTHING: the Harness resolves the exact SynthesisInput + " +
+        "SynthesisManifest pair, invokes the isolated read-only validator, strictly parses its structured " +
+        "output, and persists an immutable ValidationReport. You can NEVER declare the manifest clean yourself " +
+        "and no validator output can mutate committed memory. Anti-re-roll: the same exact manifest identity " +
+        "always returns its existing report — to obtain another judgment the manifest must actually change. " +
+        "result=findings exposes the sanctioned reopen path (ultraplan_request_reopen); result=clean does NOT " +
+        "grant finalization. Nothing is committed and HEAD never moves.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          const result = await controller.runSemanticValidation(context.sessionID);
+          const report = result.report;
+          return {
+            title: `ValidationReport ${report.id}: ${report.result}${result.idempotent ? " (existing report returned)" : ""}`,
+            output: [
+              `ValidationReport ${report.id} — result: ${report.result.toUpperCase()}.`,
+              `Identity: input ${report.input.id} (hash ${report.inputHash.slice(0, 16)}…) + manifest ${report.manifest.id}@${report.manifest.revision} (hash ${report.manifestHash.slice(0, 16)}…), protocol ${report.validatorProtocol}.`,
+              `Findings: ${report.findings.length}.`,
+              ...report.findings.map(
+                (finding) => `  ${finding.id} ${finding.category} — ${finding.statement}`,
+              ),
+              ...(report.result === "findings"
+                ? ["The synthesis output is BLOCKED. Inspect the report (plan_memory kind=validation_report) and request a sanctioned Section reopen (ultraplan_request_reopen) for an exact affected section."]
+                : ["Semantic validation is clean — this proves ONLY the semantic-validation component. Finalization has NOT run and design mutation remains forbidden."]),
+              "The report is an immutable derived artifact: nothing was committed, HEAD did not move, and the stage remains synthesis.",
+            ].join("\n"),
+            metadata: {
+              reportID: report.id,
+              result: report.result,
+              findings: report.findings.length,
+              inputID: report.input.id,
+              manifestID: report.manifest.id,
+              manifestRevision: report.manifest.revision,
+              idempotent: result.idempotent,
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_request_finalization: tool({
+      description:
+        "Request DETERMINISTIC FINALIZATION of the plan (Synthesis stage, after a CURRENT clean semantic validation). " +
+        "You supply NOTHING — no force flags, no manifest/report/evidence references: the Harness resolves the exact " +
+        "current synthesis identity, builds the immutable Evidence Audit over every reachable Evidence record, and " +
+        "evaluates the deterministic Finalization Gate (no model call, no bypass). Outcomes: blocked/stale return the " +
+        "exact machine blockers or staleness reasons (resolve them through normal planning/evidence workflows — never " +
+        "claim the plan is final); pass freezes an immutable FinalPlanCandidate assembled from approved Plan Memory + " +
+        "the validated manifest + the clean report + the passing audit. The candidate is NOT user approval, does NOT " +
+        "authorize Build, never sets PlanningRun.finalPlan, never moves HEAD, and the stage REMAINS synthesis. " +
+        "Idempotent: the same successful identity returns the same candidate.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          const result = await controller.requestFinalization(context.sessionID);
+          if (result.gate.result === "stale") {
+            return {
+              title: "Finalization stale — re-resolve from current state",
+              output: [
+                "Finalization is STALE: the authoritative state moved on. Nothing was frozen; re-resolve from current state.",
+                ...result.gate.stale.map((entry) => `  stale: ${entry.code}${entry.detail ? ` — ${entry.detail}` : ""}`),
+                ...(result.audit ? [`Evidence audit: ${result.audit.id} ${result.audit.result} (persisted for the evidence term).`] : []),
+                "Do not rebase an old candidate; re-run ultraplan_request_finalization after re-resolving (a genuinely changed manifest requires a new submission).",
+              ].join("\n"),
+              metadata: { gate: "stale", stale: result.gate.stale.map((entry) => entry.code), ...(result.audit ? { auditID: result.audit.id } : {}) },
+            };
+          }
+          if (result.gate.result === "blocked") {
+            return {
+              title: "Finalization blocked",
+              output: [
+                "Finalization is BLOCKED. Inspect the exact machine blockers; do not claim the plan is final.",
+                ...result.gate.blockers.map((blocker) => `  blocker: ${blocker.code}${blocker.sectionID ? ` ${blocker.sectionID}` : ""}${blocker.questionIDs ? ` ${blocker.questionIDs.join(",")}` : ""}${blocker.conflictIDs ? ` ${blocker.conflictIDs.join(",")}` : ""}${blocker.detail ? ` — ${blocker.detail}` : ""}`),
+                ...(result.audit ? [`Evidence audit: ${result.audit.id} ${result.audit.result} (persisted for the evidence term).`] : []),
+                "Resolve through normal planning/evidence workflows; you cannot bypass these checks.",
+              ].join("\n"),
+              metadata: { gate: "blocked", blockers: result.gate.blockers.map((blocker) => blocker.code), ...(result.audit ? { auditID: result.audit.id } : {}) },
+            };
+          }
+          const candidate = result.candidate!.candidate;
+          return {
+            title: `Finalization passed — FinalPlanCandidate ${candidate.id}@${candidate.revision}${result.candidate!.idempotent ? " (existing candidate returned)" : ""}`,
+            output: [
+              result.candidate!.preview,
+              "",
+              `Gate identity: HEAD ${result.gate.identity.headSnapshot.id} + input ${result.gate.identity.synthesisInput.id} + manifest ${result.gate.identity.synthesisManifest.id}@${result.gate.identity.synthesisManifest.revision} + report ${result.gate.identity.validationReport.id} + audit ${result.gate.identity.evidenceAudit.id}.`,
+              "Nothing was committed: zero PlanCommits, zero Snapshots, HEAD unchanged, PlanningRun.finalPlan unset, stage remains synthesis.",
+              "Formal Final Approval is a later workflow — this candidate is NOT user authorization and does NOT authorize Build.",
+            ].join("\n"),
+            metadata: {
+              gate: "pass",
+              candidateID: candidate.id,
+              candidateRevision: candidate.revision,
+              candidateHash: candidate.hash,
+              auditID: candidate.evidenceAudit.id,
+              idempotent: result.candidate!.idempotent,
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_prepare_final_plan: tool({
+      description:
+        "Freeze the FORMAL FINAL PLAN PROPOSAL from the current FinalPlanCandidate (Synthesis, candidate-ready). " +
+        "You supply NOTHING — no candidate/manifest/report refs, no plan content: the Harness reruns the " +
+        "deterministic Finalization Gate, requires the current candidate's exact identity, projects the FinalPlan " +
+        "from the candidate, Harness-assigns FINAL-###@1, and freezes a Proposal with exactly one add_final_plan " +
+        "change. The Proposal is NOT approval: nothing is committed, HEAD does not move, and the stage REMAINS " +
+        "synthesis until the user approves and the Final PlanCommit succeeds. Idempotent: the same current " +
+        "candidate returns its existing ready/awaiting Proposal. If the candidate is stale or the gate blocks, " +
+        "re-resolve through the normal workflows first — never rebase an old candidate.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          const prepared = await controller.prepareFinalPlan(context.sessionID);
+          return {
+            title: `Final Proposal ${prepared.proposal.id} prepared${prepared.idempotent ? " (existing Proposal returned)" : ""}`,
+            output: [
+              prepared.preview,
+              "",
+              "The Proposal is frozen but NOT approved. Approval is USER authority via ultraplan_request_user_approval; the Harness commits only after approval AND a passing second Finalization Gate.",
+            ].join("\n"),
+            metadata: {
+              proposalID: prepared.proposal.id,
+              proposalType: prepared.proposal.type,
+              hash: prepared.hash,
+              status: prepared.proposal.status,
+              idempotent: prepared.idempotent,
+            },
           };
         } catch (error) {
           const structured = asToolResult(error);
@@ -428,9 +842,9 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
 
     ultraplan_request_synthesis: tool({
       description:
-        "Request the synthesis → final gate. The Harness runs the deterministic finalization " +
-        "predicate: architecture approved, all sections approved and valid, zero blocking " +
-        "questions/conflicts, critical evidence fresh. Blocked requests fail with the exact failures.",
+        "WITHHELD legacy gate. request_synthesis is not granted in any reachable state: the real Synthesis " +
+        "workflow (ultraplan_begin_synthesis + ultraplan_submit_synthesis_manifest) must not be bypassed, and " +
+        "synthesis → final is a later phase. Calling this fails deterministically.",
       args: {},
       async execute(_args, context: ToolContext) {
         try {
@@ -439,6 +853,135 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
             title: `Ultra Plan ${result.run.id} entered final`,
             output: result.statusText,
             metadata: { planID: result.run.id, stage: result.run.stage },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_begin_synthesis: tool({
+      description:
+        "Freeze the SynthesisInput (Synthesis stage). You supply NO references or selections: the Harness " +
+        "validates the structural entry gates and resolves EVERYTHING authoritative from the exact HEAD " +
+        "Snapshot — the approved Architecture ref, every approved Section at its exact revision (canonical " +
+        "order), committed decisions/constraints, frozen blocker state, and the reachable Evidence chain. " +
+        "Returns the immutable input identity/hash plus a deterministic synthesis capsule. Idempotent: " +
+        "calling it again at the same HEAD returns the SAME input. This never changes the stage, never " +
+        "commits, and never moves HEAD.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          const result = await controller.beginSynthesis(context.sessionID);
+          return {
+            title: `SynthesisInput ${result.input.id} frozen`,
+            output: [
+              result.capsule,
+              "",
+              "Reason over approved/frozen design ONLY. Submit derived output with ultraplan_submit_synthesis_manifest.",
+            ].join("\n"),
+            metadata: {
+              inputID: result.input.id,
+              baseSnapshot: result.input.baseSnapshot.id,
+              hash: result.input.hash,
+              sections: result.input.sections.map((section) => `${section.ref.id}@${section.ref.revision}`),
+            },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_submit_synthesis_manifest: tool({
+      description:
+        "Submit derived synthesis output as the next immutable SynthesisManifest revision (Synthesis stage, " +
+        "after ultraplan_begin_synthesis). You supply ONLY derived content: cross-section links (each citing " +
+        "at least two DISTINCT Sections), the implementation order (covering every approved Section, " +
+        "respecting Section dependencies — step numbers come from array order), limitations, and findings. " +
+        "EVERY statement needs exact source provenance inside the frozen input. The Harness validates " +
+        "structure (provenance, coverage, DAG order) and rejects violations deterministically; identity, " +
+        "revision, input binding, and hash are Harness-assigned. Creating a manifest never approves anything, " +
+        "never commits, never moves HEAD, and is structurally — not semantically — validated.",
+      args: {
+        crossSectionLinks: tool.schema
+          .array(
+            tool.schema.object({
+              statement: tool.schema.string().describe("The derived connection between approved Section designs"),
+              sources: tool.schema
+                .array(sourceRefShape)
+                .describe("Exact source refs (at least two DISTINCT Sections through exact section refs)"),
+            }),
+          )
+          .describe("Derived connections between approved Section designs"),
+        implementationOrder: tool.schema
+          .array(
+            tool.schema.object({
+              title: tool.schema.string().describe("Step title"),
+              description: tool.schema.string().describe("What this step delivers"),
+              sections: tool.schema
+                .array(
+                  tool.schema.object({
+                    id: tool.schema.string().describe("Section id (e.g. SEC-001)"),
+                    revision: tool.schema.number().describe("Exact approved revision from the frozen input"),
+                  }),
+                )
+                .describe("Sections this step implements (exact frozen revisions)"),
+              sources: tool.schema.array(sourceRefShape).describe("Exact source provenance for this step"),
+            }),
+          )
+          .describe("The derived implementation order (array order IS the step order; every approved Section must appear)"),
+        limitations: tool.schema
+          .array(
+            tool.schema.object({
+              statement: tool.schema.string().describe("The limitation (uncertainty, trade-off, missing certainty)"),
+              sources: tool.schema.array(sourceRefShape).describe("Exact source provenance"),
+            }),
+          )
+          .describe("Derived limitations of the approved design"),
+        unresolvedFindings: tool.schema
+          .array(
+            tool.schema.object({
+              category: tool.schema
+                .enum(["contradiction", "missing_design", "missing_dependency", "coverage_gap"])
+                .describe("Finding category"),
+              statement: tool.schema.string().describe("What was discovered"),
+              sources: tool.schema
+                .array(sourceRefShape)
+                .optional()
+                .describe("Exact source refs where applicable (may cite blockers raised after the freeze)"),
+            }),
+          )
+          .describe("Synthesis-discovered issues (a report — never a design mutation)"),
+      },
+      async execute(args, context: ToolContext) {
+        try {
+          const result = await controller.submitSynthesisManifest(context.sessionID, {
+            crossSectionLinks: args.crossSectionLinks ?? [],
+            implementationOrder: args.implementationOrder ?? [],
+            limitations: args.limitations ?? [],
+            unresolvedFindings: args.unresolvedFindings ?? [],
+          });
+          return {
+            title: `SynthesisManifest ${result.manifest.id}@${result.manifest.revision} ${result.idempotent ? "replayed" : "saved"}`,
+            output: [
+              `SynthesisManifest ${result.manifest.id}@${result.manifest.revision} is STRUCTURALLY valid (provenance, coverage, Section-DAG order).${result.idempotent ? " Exact resubmission — the existing revision was returned." : ""}`,
+              `Input: ${result.manifest.input.id} (hash ${result.manifest.inputHash.slice(0, 16)}…)`,
+              `Hash: ${result.manifest.hash}`,
+              `Cross-section links: ${result.manifest.crossSectionLinks.length}; implementation steps: ${result.manifest.implementationOrder.length}; limitations: ${result.manifest.limitations.length}; findings: ${result.manifest.unresolvedFindings.length}.`,
+              "Semantic validation has NOT run; the stage remains synthesis; nothing was committed and HEAD did not move.",
+            ].join("\n"),
+            metadata: {
+              manifestID: result.manifest.id,
+              revision: result.manifest.revision,
+              hash: result.manifest.hash,
+              inputID: result.manifest.input.id,
+              idempotent: result.idempotent,
+            },
           };
         } catch (error) {
           const structured = asToolResult(error);
