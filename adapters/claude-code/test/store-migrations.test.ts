@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
+import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import {
   createProductionMigrations,
   validateMigrationRegistry,
@@ -81,6 +82,7 @@ describe("migration failure semantics (E14/§22)", () => {
           migrations: [
             createInitializeMigration({ generateStoreId: clock.newId, nowIso: clock.nowIso }),
             failingMigration,
+            createPlanningRunMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -122,6 +124,7 @@ describe("migration failure semantics (E14/§22)", () => {
           migrations: [
             createInitializeMigration({ generateStoreId: clock.newId, nowIso: clock.nowIso }),
             failing,
+            createPlanningRunMigration(),
           ],
           clock,
         }),

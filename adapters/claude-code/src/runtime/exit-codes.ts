@@ -65,6 +65,12 @@ const EXIT_CODE_BY_ERROR: Readonly<Record<RuntimeErrorCode, ExitCode>> = {
   BINDING_DETACHED: EXIT_CODES.domainState,
   BINDING_CONFLICT: EXIT_CODES.domainState,
   STALE_SESSION_BINDING: EXIT_CODES.domainState,
+  RUN_NOT_FOUND: EXIT_CODES.domainState,
+  RUN_TERMINAL: EXIT_CODES.domainState,
+  INVALID_RUN_TRANSITION: EXIT_CODES.domainState,
+  STALE_RUN_REVISION: EXIT_CODES.domainState,
+  INVALID_RUN_GOAL: EXIT_CODES.domainState,
+  RUN_STATE_INVALID: EXIT_CODES.domainState,
 };
 
 export function exitCodeForError(code: RuntimeErrorCode): ExitCode {

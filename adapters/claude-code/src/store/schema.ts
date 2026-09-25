@@ -50,6 +50,9 @@ interface TableRow {
 /** Infrastructure tables required once the store has reached schema v2. */
 const SCHEMA_V2_TABLES = ["repositories", "workspaces", "session_bindings"] as const;
 
+/** Planning-domain tables required once the store has reached schema v3. */
+const SCHEMA_V3_TABLES = ["planning_runs"] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -124,6 +127,74 @@ function validateSchemaV2(db: StoreConnection | StoreTx, tables: Set<string>, pr
 }
 
 /**
+ * PlanningRun data-integrity checks for schema v3 (frozen plan §40). Legacy
+ * opaque bindings (run_id with no planning_runs row) are legal and skipped —
+ * schema-2 history is preserved, never fabricated into runs.
+ */
+function validateSchemaV3(db: StoreConnection | StoreTx, tables: Set<string>, problems: string[]): void {
+  for (const table of SCHEMA_V3_TABLES) {
+    if (!tables.has(table)) {
+      problems.push(`${table} table missing for schema version >= 3`);
+    }
+  }
+  if (SCHEMA_V3_TABLES.some((table) => !tables.has(table))) {
+    return;
+  }
+  const badVocabulary = db
+    .prepare(
+      "SELECT count(*) AS n FROM planning_runs WHERE lifecycle NOT IN ('active','completed','aborted') OR stage NOT IN ('discovery','architecture','detail','synthesis','validation','final')",
+    )
+    .get() as { n: number } | undefined;
+  if ((badVocabulary?.n ?? 0) > 0) {
+    problems.push("planning_runs contains illegal lifecycle/stage values");
+  }
+  const badRevisions = db
+    .prepare("SELECT count(*) AS n FROM planning_runs WHERE revision < 1")
+    .get() as { n: number } | undefined;
+  if ((badRevisions?.n ?? 0) > 0) {
+    problems.push("planning_runs contains revision < 1 rows");
+  }
+  const badGoals = db
+    .prepare("SELECT count(*) AS n FROM planning_runs WHERE length(trim(goal)) = 0")
+    .get() as { n: number } | undefined;
+  if ((badGoals?.n ?? 0) > 0) {
+    problems.push("planning_runs contains empty goals");
+  }
+  const badCompleted = db
+    .prepare(
+      "SELECT count(*) AS n FROM planning_runs WHERE lifecycle = 'completed' AND stage != 'final'",
+    )
+    .get() as { n: number } | undefined;
+  if ((badCompleted?.n ?? 0) > 0) {
+    problems.push("completed planning runs must be at stage final");
+  }
+  const terminalAttached = db
+    .prepare(
+      "SELECT count(*) AS n FROM planning_runs r JOIN session_bindings b ON b.run_id = r.run_id WHERE r.lifecycle != 'active' AND b.state = 'attached'",
+    )
+    .get() as { n: number } | undefined;
+  if ((terminalAttached?.n ?? 0) > 0) {
+    problems.push("terminal runs still hold attached bindings");
+  }
+  const workspaceDrift = db
+    .prepare(
+      "SELECT count(*) AS n FROM session_bindings b JOIN planning_runs r ON r.run_id = b.run_id WHERE b.workspace_id != r.workspace_id",
+    )
+    .get() as { n: number } | undefined;
+  if ((workspaceDrift?.n ?? 0) > 0) {
+    problems.push("bindings disagree with their planning run's workspace");
+  }
+  const orphanRuns = db
+    .prepare(
+      "SELECT count(*) AS n FROM planning_runs r WHERE NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.workspace_id = r.workspace_id)",
+    )
+    .get() as { n: number } | undefined;
+  if ((orphanRuns?.n ?? 0) > 0) {
+    problems.push("planning runs reference missing workspaces");
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -155,6 +226,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 2) {
     validateSchemaV2(db, tables, problems);
+  }
+  if (version >= 3) {
+    validateSchemaV3(db, tables, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

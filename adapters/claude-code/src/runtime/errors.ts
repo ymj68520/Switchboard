@@ -35,7 +35,14 @@ export type RuntimeErrorCode =
   | "BINDING_NOT_FOUND"
   | "BINDING_DETACHED"
   | "BINDING_CONFLICT"
-  | "STALE_SESSION_BINDING";
+  | "STALE_SESSION_BINDING"
+  // Phase 4 — PlanningRun / state machine domain (exit 6)
+  | "RUN_NOT_FOUND"
+  | "RUN_TERMINAL"
+  | "INVALID_RUN_TRANSITION"
+  | "STALE_RUN_REVISION"
+  | "INVALID_RUN_GOAL"
+  | "RUN_STATE_INVALID";
 
 /** Plain serializable envelope (frozen plan §13). */
 export interface RuntimeErrorEnvelope {

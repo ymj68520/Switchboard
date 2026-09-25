@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createBindingService } from "../src/session/binding-service.js";
 import { discoverWorkspace, registerWorkspace } from "../src/workspace/identity.js";
 import { initializePlanStore } from "../src/store/sqlite-store.js";
-import { rawConnection, rawSetSchemaVersion, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
+import { rawConnection, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
 import { fixedClock, makeTempPluginDataRoot } from "./store-helpers.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -390,7 +390,6 @@ describe("session binding semantics (E9–E15/§16–§29)", () => {
         bindings.reattach({ runId: "RUN-X", sessionId: "S1", workspaceId });
         expect(bindings.getBinding("RUN-X")?.generation).toBe(5);
         // DB-level CHECK: no row can ever hold generation < 1.
-        rawSetSchemaVersion(storePathsFor(root).databasePath, 2);
         const raw = rawConnection(storePathsFor(root).databasePath, 500);
         expect(() =>
           raw.exec("UPDATE session_bindings SET generation = 0 WHERE run_id = 'RUN-X'"),
