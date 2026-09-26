@@ -492,15 +492,20 @@ describe("no-mutation guarantees (E35/E36/E37, §49/§50/§52/§53/§73)", () =>
     }
   });
 
-  it("no freshness machinery exists to leak (E38–E40, §1)", async () => {
+  it("no freshness machinery beyond the Phase 10 foundation exists to leak (E38–E40, §1; Phase 10 §4)", async () => {
     const f = await makePhase9Fixture();
     try {
       const db = rawConnection(storePathsFor(f.root).databasePath, 500);
       try {
         const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((t) => t.name);
-        for (const banned of ["evidence_current_state", "evidence_validation_events", "evidence_invalidation_events", "file_change_events"]) {
+        // The frozen Phase 9 bans hold: no invalidation-events shadow table,
+        // no host file-change event log, no freshness-bypass machinery.
+        for (const banned of ["evidence_current_state", "evidence_invalidation_events", "file_change_events"]) {
           expect(tables).not.toContain(banned);
         }
+        // Phase 10 adds exactly two freshness structures; nothing else leaked.
+        expect(tables).toContain("evidence_validation_events");
+        expect(tables).toContain("evidence_current_states");
       } finally {
         db.close();
       }

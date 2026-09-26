@@ -228,7 +228,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
       const raw = rawConnection(storePathsFor(fixture.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(6);
+        expect(Object.values(row)[0]).toBe(7);
       } finally {
         raw.close();
       }
@@ -237,7 +237,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
 });
 
 describe("Phase 8 tool surface (§42, E31)", () => {
-  it("Phase 9 (§58): exposes exactly seven tools — the Phase 8 set plus the two observation/evidence tools", () => {
+  it("Phase 10 (§50): exposes exactly eight tools — revalidate_evidence joins the Phase 9 set", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
@@ -245,10 +245,11 @@ describe("Phase 8 tool surface (§42, E31)", () => {
       "read_memory",
       "list_observations",
       "promote_evidence",
+      "revalidate_evidence",
       "approve_proposal",
     ]);
     const joined = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
-    for (const banned of ["prepare", "takeover", "abort", "revalidate"]) {
+    for (const banned of ["prepare", "takeover", "abort", "submit_synthesis", "request_finalization", "set_evidence_state"]) {
       expect(joined).not.toContain(banned);
     }
   });

@@ -32,9 +32,12 @@ import {
   type ProposalType,
   type RawProposalChange,
 } from "../core/proposal.js";
-import { buildProposalCanonical, canonicalProposalHash } from "../core/proposal-canonical.js";
+import { buildProposalCanonical, canonicalProposalHash, requiredEvidenceOf, type ProposalEvidenceRef } from "../core/proposal-canonical.js";
 import { parsePlanningRunRow, type PlanningRun } from "../core/planning-run.js";
 import { RuntimeError } from "../runtime/errors.js";
+import { evidenceNeedsValidationError } from "./evidence-gate.js";
+import { evaluateCriticalEvidenceGateInTx } from "./evidence-freshness-service.js";
+import { insertProposalEvidenceRefsInTx } from "../store/evidence-freshness.js";
 import { getSnapshotRefsInTx } from "../store/plan-memory.js";
 import { appendAuditEventInTx, getHeadPairInTx, type HeadPair } from "../store/plan-commits.js";
 import { runStateError } from "../store/planning-runs.js";
@@ -70,6 +73,12 @@ export interface PrepareProposalInput {
   changes: RawProposalChange[];
   /** Exact base-snapshot refs this proposal depends on (§20). */
   dependencies?: ArtifactRef[];
+  /**
+   * Exact Evidence revisions this proposal depends on (Phase 10 §30/§31) —
+   * bound into ProposalCanonicalV2 and hashed. Critical refs must be fresh
+   * at prepare time (§35).
+   */
+  requiredEvidence?: ProposalEvidenceRef[];
   /** Planning metadata; carries no authority but joins the hash (§21). */
   impact?: { affected?: ArtifactIdentityRef[]; notes?: string[] };
   /** Caller operation identity for prepare retry idempotency (§83). */
@@ -241,8 +250,45 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       summary: input.summary,
       changes: input.changes,
       dependencies: input.dependencies ?? [],
+      requiredEvidence: input.requiredEvidence ?? [],
       impact: input.impact ?? { affected: [], notes: [] },
     });
+  }
+
+  /**
+   * Phase 10 §35 prepare-time Evidence gate: refs must exist, be same-run,
+   * and every CRITICAL ref must currently be fresh — a proposal whose
+   * critical basis is already known-unresolved never reaches formal approval.
+   * Deterministic re-checks happen at commit time (§36), not here.
+   */
+  function gateRequiredEvidenceInTx(
+    tx: StoreTx,
+    input: { runId: string; workspaceId: string; requiredEvidence: ProposalEvidenceRef[] },
+  ): void {
+    const missing = input.requiredEvidence.find(
+      (ref) =>
+        tx
+          .prepare("SELECT 1 AS one FROM evidence_revisions WHERE run_id = ? AND evidence_id = ? AND revision = ?")
+          .get(input.runId, ref.evidenceId, ref.revision) === undefined,
+    );
+    if (missing !== undefined) {
+      throw new RuntimeError(
+        "EVIDENCE_STATE_INVALID",
+        `required Evidence ${missing.evidenceId}@${missing.revision} does not exist in this run`,
+        { detail: { evidenceId: missing.evidenceId, revision: missing.revision } },
+      );
+    }
+    if (input.requiredEvidence.length === 0) return;
+    const gate = evaluateCriticalEvidenceGateInTx(tx, {
+      runId: input.runId,
+      workspaceId: input.workspaceId,
+      requiredRefs: input.requiredEvidence,
+      recheck: false,
+      clock,
+    });
+    if (!gate.ok) {
+      throw evidenceNeedsValidationError(gate.failures);
+    }
   }
 
   function freezeRevisionInTx(
@@ -259,12 +305,17 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       summary: string;
       changes: ReturnType<typeof normalizeProposalChanges>["changes"];
       dependencies: ArtifactRef[];
+      requiredEvidence: ProposalEvidenceRef[];
       impact: { affected: ArtifactIdentityRef[]; notes: string[] };
     },
   ): ProposalRevisionStatusView {
     const now = clock.nowIso();
     const baseHeadSnapshotId = input.head === null ? null : input.head.headSnapshotId;
     const baseHeadCommitId = input.head === null ? null : input.head.headCommitId;
+    // §33: every proposal frozen after Phase 10 is canonical V2 — even with
+    // an empty requiredEvidence set. Refs are deterministically sorted by the
+    // builder and mirrored into proposal_evidence_refs (§34: the relational
+    // index must equal the canonical content — one authority).
     const canonical = buildProposalCanonical({
       runId: input.runId,
       proposalId: input.proposalId,
@@ -279,6 +330,7 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       changes: input.changes,
       dependencies: input.dependencies,
       impact: input.impact,
+      requiredEvidence: input.requiredEvidence,
     });
     const canonicalJsonText = canonicalJson(canonical);
     const hash = canonicalProposalHash(canonical);
@@ -304,6 +356,12 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       },
       now,
     );
+    insertProposalEvidenceRefsInTx(tx, {
+      runId: input.runId,
+      proposalId: input.proposalId,
+      proposalRevision: input.revision,
+      requiredEvidence: requiredEvidenceOf(canonical),
+    });
     insertProposalStateInTx(tx, { runId: input.runId, proposalId: input.proposalId, revision: input.revision }, now);
     return {
       runId: input.runId,
@@ -392,6 +450,12 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           changes: input.changes,
           dependencies: input.dependencies,
         });
+        // §35: critical required Evidence must be fresh before freezing.
+        gateRequiredEvidenceInTx(tx, {
+          runId: input.runId,
+          workspaceId: input.workspaceId,
+          requiredEvidence: input.requiredEvidence ?? [],
+        });
         if (findAwaitingProposalStateInTx(tx, input.runId) !== null) {
           throw new RuntimeError("PROPOSAL_ALREADY_AWAITING", `run '${input.runId}' already has an awaiting proposal`, {
             detail: { runId: input.runId },
@@ -423,6 +487,9 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           summary: input.summary,
           changes: normalized.changes,
           dependencies: canonicalDependencies((input.dependencies ?? []).map((ref) => ({ runId: input.runId, ...ref }))),
+          requiredEvidence: [...(input.requiredEvidence ?? [])].sort(
+            (a, b) => a.evidenceId.localeCompare(b.evidenceId) || a.revision - b.revision,
+          ),
           impact: canonicalImpact(input.impact),
         });
         appendAuditEventInTx(
@@ -475,6 +542,12 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           changes: input.changes,
           dependencies: input.dependencies,
         });
+        // §35: the revised proposal passes the same prepare-time Evidence gate.
+        gateRequiredEvidenceInTx(tx, {
+          runId: input.runId,
+          workspaceId: input.workspaceId,
+          requiredEvidence: input.requiredEvidence ?? [],
+        });
 
         // ONE transaction: @N awaiting → superseded, then @N+1 frozen awaiting.
         const supersedes = transitionProposalStateInTx(
@@ -499,6 +572,9 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           summary: input.summary,
           changes: normalized.changes,
           dependencies: canonicalDependencies((input.dependencies ?? []).map((ref) => ({ runId: input.runId, ...ref }))),
+          requiredEvidence: [...(input.requiredEvidence ?? [])].sort(
+            (a, b) => a.evidenceId.localeCompare(b.evidenceId) || a.revision - b.revision,
+          ),
           impact: canonicalImpact(input.impact),
         });
         appendAuditEventInTx(

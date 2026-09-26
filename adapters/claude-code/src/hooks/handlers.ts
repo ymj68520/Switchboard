@@ -101,6 +101,7 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "read_memory" ||
     logical === "list_observations" ||
     logical === "promote_evidence" ||
+    logical === "revalidate_evidence" ||
     logical === "approve_proposal"
   );
 }
@@ -416,14 +417,18 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
-  // approve_proposal and promote_evidence require an owned active run for
-  // their write contexts; reads (get_state/get_context/read_memory/
-  // list_observations) degrade to a run-less outcome: nothing is signed, so
-  // the MCP layer fails closed and never reaches a workspace-wide run
-  // selection (Phase 8 §40/§41 — no auto-takeover).
+  // approve_proposal, promote_evidence, and revalidate_evidence require an
+  // owned active run for their write contexts; reads (get_state/get_context/
+  // read_memory/list_observations) degrade to a run-less outcome: nothing is
+  // signed, so the MCP layer fails closed and never reaches a workspace-wide
+  // run selection (Phase 8 §40/§41 — no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
-    if (logical === "approve_proposal" || logical === "promote_evidence") {
+    if (
+      logical === "approve_proposal" ||
+      logical === "promote_evidence" ||
+      logical === "revalidate_evidence"
+    ) {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
     // get_state/get_context/read_memory without a run: no read context is

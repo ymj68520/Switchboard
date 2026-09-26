@@ -102,7 +102,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // Every caller ends in a valid state reporting the SAME store identity.
       for (const result of results) {
         expect(result.ok, JSON.stringify(result)).toBe(true);
-        expect(result.schemaVersion).toBe(6);
+        expect(result.schemaVersion).toBe(7);
       }
       const storeIds = new Set(results.map((r) => r.storeId));
       expect(storeIds.size).toBe(1);
@@ -111,7 +111,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // sentinel preserved, integrity clean, exactly one published backup.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(6);
+        expect(store.getSchemaVersion()).toBe(7);
         expect(store.getStoreMetadata().storeId).toBe(results[0]?.storeId);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
@@ -123,6 +123,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
           { version: 4, name: "plan-memory-foundation" },
           { version: 5, name: "proposal-approval-plan-commit" },
           { version: 6, name: "observation-evidence-foundation" },
+          { version: 7, name: "evidence-freshness-foundation" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
@@ -141,9 +142,11 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "approvals",
         "audit_events",
         "evidence_artifacts",
+        "evidence_current_states",
         "evidence_derived_refs",
         "evidence_observation_refs",
         "evidence_revisions",
+        "evidence_validation_events",
         "legacy_marker",
         "memory_artifacts",
         "memory_revisions",
@@ -152,6 +155,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "plan_heads",
         "plan_snapshots",
         "planning_runs",
+        "proposal_evidence_refs",
         "proposal_revisions",
         "proposal_states",
         "proposals",
@@ -175,13 +179,13 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 7);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, 8);
 
       const worker = await bundleWorker(bundledDir);
       const result = await runWorker(worker, root, 2000);
       expect(result).toMatchObject({ ok: false, code: "STORE_SCHEMA_TOO_NEW" });
       // Untouched.
-      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(7);
+      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(8);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });

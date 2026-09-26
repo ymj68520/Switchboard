@@ -37,6 +37,7 @@ import type { NormalizedProposalChange, ProposalType } from "../core/proposal.js
 import { changeTarget } from "../core/proposal.js";
 import { parsePlanningRunRow } from "../core/planning-run.js";
 import { RuntimeError } from "../runtime/errors.js";
+import { evidenceNeedsValidationError, isEvidenceNeedsValidationError, runProposalEvidenceGateInTx } from "./evidence-gate.js";
 import {
   insertArtifactIdentityInTx,
   insertMemoryRevisionInTx,
@@ -141,9 +142,13 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
     return JSON.parse(row.contentJson) as Record<string, unknown>;
   }
 
-  return {
-    commitAuthorizedProposal(input: CommitAuthorizedProposalInput): PlanCommitResult {
-      return store.withWrite((tx) => {
+  /**
+   * The whole authorized commit inside ONE store transaction (§34). The
+   * Phase 10 Evidence gate (step 12.5) throws EVIDENCE_NEEDS_VALIDATION from
+   * inside this transaction when critical required Evidence is not fresh —
+   * the caller persists the gate's discovered facts separately (§37).
+   */
+  function commitAuthorizedInTx(tx: StoreTx, input: CommitAuthorizedProposalInput): PlanCommitResult {
         // [fence] withWrite re-read PRAGMA user_version happened before this
         // operation — schema compatibility is already enforced in-tx.
 
@@ -355,6 +360,24 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           }
         }
 
+        // 12.5 Phase 10 §36/§39 — post-authorization Evidence freshness gate:
+        // freshness is checked AGAIN after user authorization and BEFORE
+        // PlanCommit, with deterministic re-checks over each critical ref's
+        // provenance closure (§40). Precedence is preserved: ownership/
+        // hash/HEAD failures above already threw, so stale bindings still
+        // answer STALE_SESSION_BINDING, never an Evidence error.
+        const evidenceGate = runProposalEvidenceGateInTx(tx, {
+          runId: input.runId,
+          workspaceId: run.workspaceId,
+          proposalId: proposal.proposalId,
+          proposalRevision: proposal.revision,
+          recheck: true,
+          clock,
+        });
+        if (!evidenceGate.ok) {
+          throw evidenceNeedsValidationError(evidenceGate.failures);
+        }
+
         // 13/14. Re-simulate + revalidate the candidate snapshot.
         const simulation = simulateCandidateSnapshot({
           runId: input.runId,
@@ -509,7 +532,39 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           runRevision: finalRun.revision,
           stage: finalRun.stage,
         };
-      });
+  }
+
+  return {
+    commitAuthorizedProposal(input: CommitAuthorizedProposalInput): PlanCommitResult {
+      try {
+        return store.withWrite((tx) => commitAuthorizedInTx(tx, input));
+      } catch (err) {
+        if (isEvidenceNeedsValidationError(err)) {
+          // §37: Evidence system facts discovered at commit time are an
+          // independent, durable record — they persist even though this
+          // commit is blocked. The blocked attempt itself leaves NO Approval,
+          // NO PlanCommit, and an unchanged HEAD (the failed transaction
+          // rolled everything back); only the Evidence state events are
+          // re-discovered and appended here.
+          try {
+            store.withWrite((tx) => {
+              runProposalEvidenceGateInTx(tx, {
+                runId: input.runId,
+                workspaceId: input.workspaceId,
+                proposalId: input.authorization.proposalId,
+                proposalRevision: input.authorization.proposalRevision,
+                recheck: true,
+                clock,
+              });
+              return null;
+            });
+          } catch {
+            // Concurrent drift re-failing the re-check is acceptable — the
+            // blocking error below is the authoritative answer either way.
+          }
+        }
+        throw err;
+      }
     },
   };
 }

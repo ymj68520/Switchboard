@@ -48,6 +48,7 @@ export type HostContextLogicalTool =
   | "read_memory"
   | "list_observations"
   | "promote_evidence"
+  | "revalidate_evidence"
   | "approve_proposal";
 
 export interface BuildHostContextInput {

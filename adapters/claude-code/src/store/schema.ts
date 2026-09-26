@@ -142,6 +142,31 @@ const SCHEMA_V6_INDEXES = [
   "idx_observations_run_seq",
 ] as const;
 
+/** Freshness/Proposal-V2 tables required once the store has reached v7 (Phase 10 §4). */
+const SCHEMA_V7_TABLES = [
+  "evidence_validation_events",
+  "evidence_current_states",
+  "proposal_evidence_refs",
+] as const;
+
+/** Immutability + terminal-state triggers required once the store has reached v7.
+ * evidence_current_states is the materialized projection — UPDATE is its normal
+ * operation (§7), so only its deletion is fenced. */
+const SCHEMA_V7_TRIGGERS = [
+  "evidence_validation_events_no_update",
+  "evidence_validation_events_no_delete",
+  "evidence_current_states_no_delete",
+  "proposal_evidence_refs_no_update",
+  "proposal_evidence_refs_no_delete",
+  "evidence_validation_events_no_revival",
+] as const;
+
+/** Constraint indexes backing v7 freshness/derived lookups. */
+const SCHEMA_V7_INDEXES = [
+  "idx_evidence_validation_events_revision",
+  "idx_evidence_derived_refs_upstream",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -380,6 +405,36 @@ function validateSchemaV6(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural freshness/Proposal-V2 checks for schema v7 (Phase 10 §4/§5/§7):
+ * table presence, immutability + terminal-state triggers, and the validation
+ * history / derived-upstream lookup indexes. Cheap sqlite_master lookups only.
+ */
+function validateSchemaV7(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V7_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 7`);
+    }
+  }
+  for (const trigger of SCHEMA_V7_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 7`);
+    }
+  }
+  for (const index of SCHEMA_V7_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 7`);
+    }
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -387,7 +442,7 @@ function validateSchemaV6(db: StoreConnection | StoreTx, problems: string[]): vo
  * integrity checks apply as well; from version 4 the structural Plan Memory
  * checks apply; from version 5 the Proposal/Approval/PlanCommit structural
  * checks apply; from version 6 the Observation/Evidence structural checks
- * apply.
+ * apply; from version 7 the Evidence freshness structural checks apply.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   const version = readSchemaVersion(db);
@@ -426,6 +481,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 6) {
     validateSchemaV6(db, problems);
+  }
+  if (version >= 7) {
+    validateSchemaV7(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

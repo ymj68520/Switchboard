@@ -31,6 +31,9 @@ import type { StoreClock } from "../store/migration-runner.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { BlobStore } from "../store/blob-store.js";
 import { getObservationRecord } from "../store/observations.js";
+import { initializePromotionFreshnessInTx } from "./evidence-freshness-service.js";
+import { getValidationHistoryInTx } from "../store/evidence-freshness.js";
+import { deriveValidationStrategy } from "../evidence/strategy.js";
 import {
   getEvidenceRevisionRecord,
   insertEvidenceRevisionInTx,
@@ -41,7 +44,6 @@ import {
   type EvidenceKind,
   type EvidenceRevisionView,
   type EvidenceScope,
-  type EvidenceValidationStrategy,
   type ListEvidenceFilter,
 } from "../store/evidence.js";
 import { getPlanningRunRecord } from "../store/planning-runs.js";
@@ -78,6 +80,8 @@ export interface PromoteEvidenceResult {
   evidence: EvidenceRevisionView;
   /** True when this exact operation id had already promoted (idempotent replay). */
   idempotent: boolean;
+  /** §10 initial freshness state computed in the promotion transaction. */
+  freshness: { state: "fresh" | "needs_validation" | "stale" | "invalidated"; reasonCode: string };
 }
 
 function evidenceError(
@@ -231,30 +235,16 @@ export function createEvidenceService(store: PlanStore, blobs: BlobStore, clock:
       }
     }
 
-    // Server-derived validation strategy (documented rule above): only a
+    // Server-derived validation strategy (shared Phase 9/10 rule): only a
     // DIRECT claim resting entirely on fingerprint-carrying source
     // observations validates by fingerprint; anything derived, uncertain, or
     // citing locator/execution observations validates by reobserve.
     const sourceFingerprints = collectSourceFingerprints(observations);
-    let validationStrategy: EvidenceValidationStrategy;
-    if (derivedFrom.length > 0) {
-      validationStrategy = "reobserve";
-    } else if (
-      request.confidence === "direct" &&
-      observations.length > 0 &&
-      observations.every((observation) => observation.observationClass === "source")
-    ) {
-      if (observations.some((observation) => observation.sourceFingerprint === null)) {
-        throw evidenceError(
-          "EVIDENCE_SOURCE_FINGERPRINT_UNAVAILABLE",
-          "a fingerprint-validated claim requires source observations captured with a whole-file fingerprint",
-          { observationIds: observationRefs },
-        );
-      }
-      validationStrategy = "fingerprint";
-    } else {
-      validationStrategy = "reobserve";
-    }
+    const validationStrategy = deriveValidationStrategy({
+      confidence: request.confidence,
+      derivedFromCount: derivedFrom.length,
+      observations,
+    });
 
     const claim = request.claim.trim();
     const requestHash = createHash("sha256")
@@ -294,6 +284,22 @@ export function createEvidenceService(store: PlanStore, blobs: BlobStore, clock:
         createdAt,
       });
       if (inserted.status === "inserted") {
+        // Phase 10 §10: the promotion transaction also initializes freshness.
+        // Fingerprint strategy re-checks the CURRENT whole-file hashes against
+        // the observation-time fingerprints; reobserve provenance starts fresh
+        // as last-known observation state; derived starts fresh only when all
+        // exact upstream revisions are fresh.
+        const freshness = initializePromotionFreshnessInTx(tx, {
+          runId: input.runId,
+          workspaceId: input.workspaceId,
+          evidenceId: inserted.evidence.evidenceId,
+          revision: inserted.evidence.revision,
+          validationStrategy,
+          derivedFrom,
+          sourceFingerprints,
+          requestId: input.operationId,
+          clock,
+        });
         tx.prepare(
           `INSERT INTO audit_events (event_id, run_id, event_type, subject_json, payload_json, created_at)
            VALUES (?, ?, 'EVIDENCE_PROMOTED', ?, ?, ?)`,
@@ -314,8 +320,19 @@ export function createEvidenceService(store: PlanStore, blobs: BlobStore, clock:
           }),
           createdAt,
         );
+        return {
+          evidence: inserted.evidence,
+          idempotent: false,
+          freshness: { state: freshness.state, reasonCode: freshness.reasonCode },
+        };
       }
-      return { evidence: inserted.evidence, idempotent: inserted.status === "duplicate" };
+      return {
+        evidence: inserted.evidence,
+        idempotent: true,
+        // The recorded promotion (not live state) answers a retry: the
+        // promotion-time INITIALIZED event carries the initial freshness.
+        freshness: initialFreshnessFromEventsInTx(tx, input.runId, inserted.evidence.evidenceId, inserted.evidence.revision),
+      };
     });
   }
 
@@ -346,4 +363,21 @@ function collectSourceFingerprints(observations: CapturedObservation[]): SourceF
     fingerprints.push(fingerprint);
   }
   return fingerprints.sort((a, b) => a.path.localeCompare(b.path) || a.sha256.localeCompare(b.sha256));
+}
+
+/** The promotion-time INITIALIZED event answers an idempotent promotion retry. */
+function initialFreshnessFromEventsInTx(
+  tx: Parameters<Parameters<PlanStore["withWrite"]>[0]>[0],
+  runId: string,
+  evidenceId: string,
+  revision: number,
+): { state: "fresh" | "needs_validation" | "stale" | "invalidated"; reasonCode: string } {
+  const events = getValidationHistoryInTx(tx, runId, evidenceId, revision);
+  const initialized = events.find((event) => event.eventType === "INITIALIZED");
+  if (initialized === undefined) {
+    throw new RuntimeError("STORE_SCHEMA_INVALID", "promoted revision has no freshness initialization", {
+      detail: { runId, evidenceId, revision },
+    });
+  }
+  return { state: initialized.toState, reasonCode: initialized.reasonCode };
 }

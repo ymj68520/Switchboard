@@ -40,6 +40,7 @@ import { createBindingService } from "../session/binding-service.js";
 import { createPlanningRunService } from "../application/planning-run-service.js";
 import { createPlanCommitEngine } from "../application/plan-commit-engine.js";
 import { createEvidenceService, type PromoteEvidenceRequest } from "../application/evidence-service.js";
+import { createEvidenceFreshnessService, type RevalidationAssessment } from "../application/evidence-freshness-service.js";
 import { listObservationSummaries } from "../application/observation-service.js";
 import { OBSERVATION_CLASSES, type ObservationClass } from "../observations/types.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
@@ -206,6 +207,49 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
       required: ["claim", "kind", "scope", "confidence", "criticality", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "revalidate_evidence",
+    description:
+      "Revalidate one exact Evidence revision. mode=check deterministically re-compares the current whole-file source "
+      + "hashes against the capture-time fingerprints (fingerprint-validated Evidence only). mode=assess records a "
+      + "semantic assessment (confirmed/contradicted/uncertain) backed by NEW provenance: confirmed supersedes the old "
+      + "revision with a fresh replacement, contradicted invalidates, uncertain keeps it needing validation. "
+      + "There is no state-setting primitive: Core derives every state change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        evidence_id: { type: "string", description: "Evidence identity (ev_…) to revalidate." },
+        revision: { type: "integer", minimum: 1, description: "Exact revision; must be the lineage-current one." },
+        mode: { type: "string", enum: ["check", "assess"], description: "Deterministic fingerprint check, or semantic assessment." },
+        assessment: {
+          type: "string",
+          enum: ["confirmed", "contradicted", "uncertain"],
+          description: "Required for mode=assess; ignored (rejected) for mode=check.",
+        },
+        observation_refs: {
+          type: "array",
+          items: { type: "string" },
+          description: "New Observation ids backing the assessment (required for mode=assess).",
+        },
+        derived_from: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              evidence_id: { type: "string" },
+              revision: { type: "integer", minimum: 1 },
+            },
+            required: ["evidence_id", "revision"],
+            additionalProperties: false,
+          },
+          description: "Alternative provenance: exact upstream Evidence revisions backing the assessment.",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["evidence_id", "revision", "mode", "_hostContext"],
       additionalProperties: false,
     },
   },
@@ -717,6 +761,87 @@ export function handlePromoteEvidence(ctx: PhasePlanToolContext, rawArgs: Record
       source_fingerprints: result.evidence.sourceFingerprints,
       created_at: result.evidence.createdAt,
     },
+    freshness: {
+      state: result.freshness.state,
+      reason: result.freshness.reasonCode,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// revalidate_evidence (Phase 10 §20–§29) — freshness revalidation
+// ---------------------------------------------------------------------------
+
+export function handleRevalidateEvidence(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["evidence_id", "revision", "mode", "assessment", "observation_refs", "derived_from"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "revalidate_evidence", businessInput: rawArgs });
+
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  if (typeof rawArgs.evidence_id !== "string" || rawArgs.evidence_id === "") {
+    throw inputInvalid("evidence_id must be a non-empty string");
+  }
+  if (typeof rawArgs.revision !== "number" || !Number.isInteger(rawArgs.revision) || rawArgs.revision < 1) {
+    throw inputInvalid("revision must be a positive integer");
+  }
+  if (rawArgs.mode !== "check" && rawArgs.mode !== "assess") {
+    throw inputInvalid("mode must be 'check' or 'assess'");
+  }
+  const observationRefs =
+    rawArgs.observation_refs === undefined ? [] : rawArgs.observation_refs;
+  if (!Array.isArray(observationRefs) || observationRefs.some((ref) => typeof ref !== "string")) {
+    throw inputInvalid("observation_refs must be an array of observation ids");
+  }
+  const derivedFromRaw = rawArgs.derived_from === undefined ? [] : rawArgs.derived_from;
+  if (!Array.isArray(derivedFromRaw)) {
+    throw inputInvalid("derived_from must be an array of {evidence_id, revision}");
+  }
+  const derivedFrom = derivedFromRaw.map((ref) => {
+    if (typeof ref !== "object" || ref === null) {
+      throw inputInvalid("derived_from entries must be {evidence_id, revision} objects");
+    }
+    const record = ref as Record<string, unknown>;
+    if (typeof record.evidence_id !== "string" || record.evidence_id === "") {
+      throw inputInvalid("derived_from entries must carry a non-empty evidence_id");
+    }
+    if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 1) {
+      throw inputInvalid("derived_from revision must be a positive integer");
+    }
+    return { evidenceId: record.evidence_id, revision: record.revision };
+  });
+
+  const service = createEvidenceFreshnessService(ctx.store, ctx.blobs, ctx.clock);
+  const result = service.revalidateEvidence({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    request: {
+      evidenceId: rawArgs.evidence_id,
+      revision: rawArgs.revision,
+      mode: rawArgs.mode,
+      ...(rawArgs.assessment === undefined ? {} : { assessment: rawArgs.assessment as RevalidationAssessment }),
+      observationRefs: observationRefs as string[],
+      derivedFrom,
+    },
+    operationId: `revalidate:${envelope.toolUseId}`,
+  });
+  return {
+    status: result.status,
+    idempotent: result.idempotent,
+    target: result.target,
+    ...(result.replacement === undefined ? {} : { replacement: result.replacement }),
+    ...(result.affected_derived === undefined
+      ? {}
+      : {
+          affected_derived: result.affected_derived.map((ref) => ({
+            evidence_id: ref.evidenceId,
+            revision: ref.revision,
+          })),
+        }),
+    reason: result.reason,
   };
 }
 
@@ -793,6 +918,8 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleListObservations(ctx, rawArgs);
     case "promote_evidence":
       return handlePromoteEvidence(ctx, rawArgs);
+    case "revalidate_evidence":
+      return handleRevalidateEvidence(ctx, rawArgs);
     case "approve_proposal":
       return handleApproveProposal(ctx, rawArgs);
     default:

@@ -92,7 +92,7 @@ function hostToken(
 }
 
 describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", () => {
-  it("exposes exactly the Phase 9 tool set; approve_proposal carries real boolean requiresUserInteraction", () => {
+  it("exposes exactly the Phase 10 tool set (§50, eight tools); approve_proposal carries real boolean requiresUserInteraction", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
@@ -100,6 +100,7 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
       "read_memory",
       "list_observations",
       "promote_evidence",
+      "revalidate_evidence",
       "approve_proposal",
     ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
@@ -529,7 +530,7 @@ describe("approve_proposal → Phase 6 engine (E28–E35, E55–E59)", () => {
   });
 });
 
-describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61: v6)", () => {
+describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61: v6; Phase 10 §4: v7)", () => {
   it("entry + approve leave PRAGMA user_version == 5", async () => {
     const h = await makeToolHarness();
     try {
@@ -550,7 +551,7 @@ describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61:
       const raw = rawConnection(storePathsFor(h.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(6);
+        expect(Object.values(row)[0]).toBe(7);
       } finally {
         raw.close();
       }

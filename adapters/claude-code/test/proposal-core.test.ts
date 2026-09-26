@@ -226,11 +226,12 @@ describe("proposal canonical representation and hash (§22/§23/§24)", () => {
     });
   }
 
-  it("same semantic object with different key insertion order → same hash", () => {
+  it("same semantic object with different key insertion order → same hash (V2 incl. requiredEvidence)", () => {
     const a = buildCanonical();
     // Rebuild by parsing + re-stringifying through a different object order.
     const scrambled = JSON.parse(canonicalJson(a));
     const reordered = {
+      requiredEvidence: scrambled.requiredEvidence,
       impact: scrambled.impact,
       changes: scrambled.changes,
       summary: scrambled.summary,
@@ -270,10 +271,48 @@ describe("proposal canonical representation and hash (§22/§23/§24)", () => {
     expect(canonicalProposalHash(buildCanonical({ changes: otherChanges.changes }))).not.toBe(base);
   });
 
-  it("canonical marker parse round-trips; foreign markers rejected", () => {
+  it("canonical marker parse round-trips; V1 readable, foreign markers rejected (Phase 10 §31/§32)", () => {
     const canonical = buildCanonical();
     expect(parseProposalCanonical(JSON.parse(canonicalJson(canonical)))).toEqual(canonical);
-    expect(() => parseProposalCanonical({ ...JSON.parse(canonicalJson(canonical)), version: 2 })).toThrowError(/marker/);
+    // V1 historical canonicals remain fully readable — never rehashed, never
+    // given inferred evidence refs.
+    const v1Parsed = JSON.parse(canonicalJson(canonical));
+    const v1 = { ...v1Parsed, version: 1 } as Record<string, unknown>;
+    delete v1.requiredEvidence;
+    expect(() => parseProposalCanonical(v1)).not.toThrow();
+    expect(parseProposalCanonical(v1).version).toBe(1);
+    expect(() => parseProposalCanonical({ ...v1Parsed, version: 3 })).toThrowError(/marker/);
+    expect(() =>
+      parseProposalCanonical({ ...v1Parsed, version: 2, requiredEvidence: "not-an-array" }),
+    ).toThrowError(/requiredEvidence/);
+  });
+
+  it("Phase 10 §62: requiredEvidence participates in the canonical hash", () => {
+    const base = buildCanonical();
+    const withRefs = buildCanonical({ requiredEvidence: [{ evidenceId: "ev_a", revision: 1 }] });
+    expect(canonicalProposalHash(withRefs)).not.toBe(canonicalProposalHash(base));
+    // Same set, different insertion order → same canonical hash.
+    const reordered = buildCanonical({
+      requiredEvidence: [
+        { evidenceId: "ev_b", revision: 2 },
+        { evidenceId: "ev_a", revision: 1 },
+      ],
+    });
+    const sameSet = buildCanonical({
+      requiredEvidence: [
+        { evidenceId: "ev_a", revision: 1 },
+        { evidenceId: "ev_b", revision: 2 },
+      ],
+    });
+    expect(canonicalProposalHash(reordered)).toBe(canonicalProposalHash(sameSet));
+    // Different exact revision → different hash.
+    expect(
+      canonicalProposalHash(buildCanonical({ requiredEvidence: [{ evidenceId: "ev_a", revision: 2 }] })),
+    ).not.toBe(canonicalProposalHash(buildCanonical({ requiredEvidence: [{ evidenceId: "ev_a", revision: 1 }] })));
+    // Different evidence id → different hash.
+    expect(
+      canonicalProposalHash(buildCanonical({ requiredEvidence: [{ evidenceId: "ev_z", revision: 1 }] })),
+    ).not.toBe(canonicalProposalHash(buildCanonical({ requiredEvidence: [{ evidenceId: "ev_a", revision: 1 }] })));
   });
 
   it("hash format is sha256:<lowercase hex>", () => {
