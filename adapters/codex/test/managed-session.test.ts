@@ -63,6 +63,7 @@ class ScriptedServerProcess implements AppServerProcess {
   readonly pid: number = 424242;
   readonly exits: Promise<ChildExitStatus>;
   private readonly exitControl = deferred<ChildExitStatus>();
+  readonly terminateCalls: string[] = [];
 
   constructor(private readonly endpointUrl: string) {
     this.exits = this.exitControl.promise;
@@ -79,15 +80,17 @@ class ScriptedServerProcess implements AppServerProcess {
   }
 
   requestTerminate(): void {
+    this.terminateCalls.push("request");
     this.exitControl.resolve({ exitCode: 0, signal: null });
   }
 
   forceKill(): void {
+    this.terminateCalls.push("force");
     this.exitControl.resolve({ exitCode: null, signal: "SIGKILL" });
   }
 
   killImmediate(): void {
-    this.exitControl.resolve({ exitCode: null, signal: "SIGKILL" });
+    this.terminateCalls.push("immediate");
   }
 
   crash(exitCode: number): void {
@@ -435,5 +438,99 @@ describe("ManagedCodexSession (Phase 5)", () => {
     await waitFor(() => runtime.state === "stopped", "runtime stop");
     await waitFor(() => late.length === 1, "exit listener fired");
     detach();
+  });
+
+  // ---- Phase 6 §20 lifecycle audit: pre-TUI bootstrap failure paths ----
+
+  it("readyz failure is a bootstrap failure: no TUI, child cleaned up (§20, P6-E20)", async () => {
+    const server = await startFakeAppServer();
+    try {
+      const serverProcess = new ScriptedServerProcess(server.url);
+      let tuiSpawned = false;
+      const outcome = await new ManagedCodexSession({
+        phaseModel: PHASE_MODEL,
+        resolvedCommand: RESOLVED,
+        runtimeOptions: {
+          processFactory: () => serverProcess,
+          readyzProbe: async () => 503,
+          timeouts: {
+            endpointDiscoveryTimeoutMs: 1_000,
+            readyzTimeoutMs: 1_000,
+            readyzPollIntervalMs: 25,
+            readyzRequestTimeoutMs: 200,
+            terminateGraceMs: 200,
+            terminateForceGraceMs: 200,
+          },
+        },
+        tuiFactory: (request) => {
+          tuiSpawned = true;
+          return new FakeTuiProcess(request);
+        },
+        warn: () => {},
+      }).run();
+      expect(outcome.kind).toBe("bootstrap-failure");
+      if (outcome.kind === "bootstrap-failure") {
+        expect(outcome.message).toContain("app-server bootstrap failed");
+      }
+      expect(tuiSpawned).toBe(false);
+      // The runtime terminated the child before the failure was reported.
+      expect(serverProcess.terminateCalls.length).toBeGreaterThan(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("controller connect failure is a bootstrap failure: runtime child terminated, no TUI (§20, P6-E20)", async () => {
+    // Endpoint advertises a CLOSED port — the controller WebSocket cannot
+    // connect, which must fail the bootstrap before any TUI exists.
+    const serverProcess = new ScriptedServerProcess("ws://127.0.0.1:1");
+    let tuiSpawned = false;
+    const outcome = await new ManagedCodexSession({
+      phaseModel: PHASE_MODEL,
+      resolvedCommand: RESOLVED,
+      runtimeOptions: {
+        processFactory: () => serverProcess,
+        readyzProbe: readyzAlwaysOk,
+      },
+      tuiFactory: (request) => {
+        tuiSpawned = true;
+        return new FakeTuiProcess(request);
+      },
+      warn: () => {},
+    }).run();
+    expect(outcome.kind).toBe("bootstrap-failure");
+    if (outcome.kind === "bootstrap-failure") {
+      expect(outcome.message).toContain("controller bootstrap failed");
+    }
+    expect(tuiSpawned).toBe(false);
+    expect(serverProcess.terminateCalls.length).toBeGreaterThan(0);
+  });
+
+  it("a TUI spawn failure is reported with actionable Codex-missing guidance (Phase 6 §18)", async () => {
+    const server = await startFakeAppServer();
+    try {
+      const serverProcess = new ScriptedServerProcess(server.url);
+      const outcome = await new ManagedCodexSession({
+        phaseModel: PHASE_MODEL,
+        resolvedCommand: RESOLVED,
+        runtimeOptions: {
+          processFactory: () => serverProcess,
+          readyzProbe: readyzAlwaysOk,
+        },
+        tuiFactory: () => {
+          const error = new Error("spawn codex ENOENT") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error; // Node reports spawn failures through exits rejection.
+        },
+        warn: () => {},
+      }).run();
+      expect(outcome.kind).toBe("bootstrap-failure");
+      if (outcome.kind === "bootstrap-failure") {
+        expect(outcome.message).toContain("Codex CLI");
+        expect(outcome.message).toContain("does not install");
+      }
+    } finally {
+      await server.close();
+    }
   });
 });

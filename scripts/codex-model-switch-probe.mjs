@@ -216,11 +216,14 @@ try {
   );
 
   // 6. server-side verification. With DISTINCT models the update is a real
-  // change → the authoritative echo must report the new model. In same-model
-  // mode the update is a no-op (the server does not echo unchanged state),
-  // so acceptance is proven by modelApplied + the absence of failure.
+  // change → the authoritative echo must report the new model. If the thread
+  // already STARTED at executionModel (observed on 0.156.1 once a local API
+  // key login exists — the server derives the default from the account), the
+  // initial write is a NO-OP (change-dedup emits no echo) and acceptance is
+  // proven by modelApplied + the absence of failure.
   const initialEffort = thread?.thread?.reasoningEffort ?? null;
-  if (distinctModelsExercised) {
+  const initialModelIsTarget = (thread?.thread?.model ?? null) === executionModel;
+  if (distinctModelsExercised && !initialModelIsTarget) {
     await waitFor(
       () =>
         driverEchoes.some(
@@ -239,10 +242,18 @@ try {
     );
   } else {
     const failed = switcherEvents.some((e) => e.type === "automationDisabled");
+    if (initialModelIsTarget) {
+      console.log(
+        "  NOTE: thread already starts at executionModel — initial write is a no-op",
+      );
+      console.log("        (change-dedup: no echo expected for the initial application)");
+    } else {
+      console.log("  NOTE: only one usable model ID — running SAME-MODEL smoke");
+    }
     report(
-      "6. model update accepted (same-model smoke: no echo on no-op change)",
+      "6. model update accepted (no-op write: no echo expected)",
       !failed && controller.observedMode === "default",
-      `mode=${controller.observedMode ?? "unknown"}`,
+      `mode=${controller.observedMode ?? "unknown"} initialModel=${JSON.stringify(initialModelIsTarget ? executionModel : currentModel)}`,
     );
   }
 

@@ -1,8 +1,8 @@
 {
   "name": "@switchboard/codex",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
-  "description": "Switchboard adapter for Codex CLI: Phase Model Switcher managed session launcher.",
+  "description": "Switchboard adapter for Codex CLI: phase-model managed session launcher (pre-alpha).",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,14 +10,26 @@
     "phase-model": "./bin/phase-model.js"
   },
   "files": [
-    "dist"
+    "bin",
+    "dist",
+    "docs"
   ],
+  "engines": {
+    "node": ">=22.4.0"
+  },
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ymj68520/Switchboard.git",
+    "directory": "adapters/codex"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "vitest run",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "test:live": "node ../../scripts/codex-live-smoke.mjs && node ../../scripts/codex-controller-probe.mjs && node ../../scripts/codex-model-switch-probe.mjs && node ../../scripts/codex-managed-tui-smoke.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

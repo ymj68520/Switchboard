@@ -62,17 +62,19 @@ const VALUE_FLAGS: ReadonlyMap<string, keyof PartialPhaseModelConfig | "config">
 export const LAUNCHER_USAGE = `usage: phase-model [phase-model flags] [codex args...]
 
 phase-model flags:
-  ${CLI_PLANNING_MODEL} <model-id>       model applied in Codex Plan mode
-  ${CLI_EXECUTION_MODEL} <model-id>      model applied in Codex Default mode and at startup
-  ${CLI_REASONING_EFFORT} <level>   unified startup reasoning effort (default: xhigh)
-  ${CLI_CONFIG_FILE} <path>           config file (default: ./.codex-phase-model.json)
+  --planning-model <model-id>    model applied in Codex Plan mode
+  --execution-model <model-id>   model applied in Default mode and at startup
+  --reasoning-effort <level>     unified startup effort (default: xhigh)
+  --config <path>                config file (default: ./.codex-phase-model.json)
   -h, --help
 
-Config file (JSON): { "planning_model": "...", "execution_model": "...", "reasoning_effort": "..." }
+Config file (JSON): {"planningModel": "...", "executionModel": "...",
+"reasoningEffort": "xhigh"} — snake_case keys are also accepted.
 Precedence: defaults < config file < environment < these flags.
-All other arguments are passed through to the Codex TUI. The managed
-launcher owns --remote, --model/-m and the model / model_reasoning_effort /
-plan_mode_reasoning_effort config overrides for the session it starts.`;
+All other arguments are passed through to the Codex TUI. Reserved startup
+arguments (--remote, --model/-m, -c model / model_reasoning_effort /
+plan_mode_reasoning_effort) are rejected — the launcher owns them for the
+session it starts.`;
 
 /**
  * Split launcher argv into phase-model flags and codex passthrough args.
@@ -143,6 +145,17 @@ export interface RunLauncherOptions {
 /** Run one managed session; resolves with the process exit code. */
 export async function runLauncher(argv: readonly string[], options: RunLauncherOptions = {}): Promise<number> {
   const warn = options.warn ?? ((message: string) => process.stderr.write(`${message}\n`));
+
+  // Runtime guard (same convention as the Claude adapter): the controller
+  // transport needs Node's built-in WebSocket client, unflagged since
+  // Node 22.4.0 — engines.node documents the same floor.
+  if (typeof globalThis.WebSocket !== "function") {
+    warn(
+      "error: phase-model requires Node.js >= 22.4.0 — the built-in WebSocket " +
+        "client is unavailable in this runtime",
+    );
+    return 1;
+  }
 
   let parsed: LauncherArgParse;
   try {

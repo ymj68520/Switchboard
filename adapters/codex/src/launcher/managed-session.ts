@@ -179,7 +179,7 @@ export class ManagedCodexSession {
       await runtime.shutdown();
       return {
         kind: "bootstrap-failure",
-        message: `TUI launch failed: ${describeError(error)}`,
+        message: `TUI launch failed: ${describeSpawnFailure(error)}`,
       };
     }
 
@@ -251,7 +251,7 @@ export class ManagedCodexSession {
       await runtime.shutdown();
       return {
         kind: "bootstrap-failure",
-        message: `TUI launch failed: ${describeError(winner.error)}`,
+        message: `TUI launch failed: ${describeSpawnFailure(winner.error)}`,
       };
     }
 
@@ -367,4 +367,19 @@ function describeError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+/**
+ * Spawn failures must be actionable (Phase 6 §18): a missing Codex CLI is
+ * the single most likely user-facing bootstrap error on a fresh machine.
+ * The launcher never installs/upgrades Codex itself (§9).
+ */
+function describeSpawnFailure(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (code === "ENOENT") {
+    return "the Codex CLI executable could not be found on PATH — install the " +
+      "OpenAI Codex CLI first; phase-model does not install, download, or " +
+      "upgrade Codex";
+  }
+  return describeError(error);
 }
