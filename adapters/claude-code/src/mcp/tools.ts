@@ -1,12 +1,13 @@
 /**
- * Phase 12 MCP tool surface (Phase 12 directive §41/§52/§59/§95).
+ * Phase 13 MCP tool surface (Phase 12 §95 + Phase 13 §87).
  *
- * Exactly thirteen tools — the Phase 11 set plus the three synthesis/
- * validation workflow tools:
+ * Exactly fourteen tools — the Phase 12 set plus request_finalization:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
- *   get_state        (read-only, session-scoped)
+ *   get_state        (read-only, session-scoped; final-stage FinalPlan +
+ *                     handoff authorization projection, §61)
  *   get_context      (read-only structured context projection + epoch;
- *                     detail=validation returns the frozen bundle, §32–§34)
+ *                     detail=validation returns the frozen bundle, §32–§34;
+ *                     detail=final returns the FinalPlanCandidate world, §43)
  *   read_memory      (read-only exact MemoryRef retrieval)
  *   list_observations(read-only Observation ledger summaries, §21/§22)
  *   promote_evidence (explicit Observation→Evidence promotion, §28/§44/§45)
@@ -14,11 +15,15 @@
  *   select_section   (durable active-Section selection, Detail stage)
  *   prepare_proposal (the production model-facing prepare surface, §21)
  *   approve_proposal (the Formal Approval bridge into the Phase 6 engine,
- *                     marked anthropic/requiresUserInteraction=true)
+ *                     marked anthropic/requiresUserInteraction=true; also the
+ *                     sole Final Approval path, §46)
  *   submit_synthesis (main-agent manifest submission, §41–§45)
  *   submit_validation(VALIDATOR-ONLY report submission, §52–§58 — the signed
  *                     HostContext must attest agent_type=phase-plan:validator)
- *   request_reopen   (main-agent reopen from synthesis/validation, §59–§67)
+ *   request_reopen   (main-agent reopen from synthesis/validation/final,
+ *                     §59–§67/§65)
+ *   request_finalization (main-agent deterministic FinalizationGate + frozen
+ *                     FinalPlanCandidate + final Proposal, Phase 13 §26–§29)
  *
  * Authority model: every handler verifies the hook-signed HostContext first
  * (signature → tool binding → business-input hash). The MCP process's own
@@ -32,6 +37,8 @@
  * the signed session + workspace, never from model input. prepare_proposal
  * carries NO human approval (§21/§61): Formal Approval still happens only
  * through approve_proposal, and validator findings never need one (§52).
+ * request_finalization carries NO human approval either (§28): the REAL user
+ * interaction stays with approve_proposal on the exact final Proposal (§46).
  */
 
 import { getWorkspaceById } from "../store/repositories.js";
@@ -41,6 +48,9 @@ import { getPlanningRunRecord, listPlanningRunsForWorkspaceRecord } from "../sto
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import { createSectionWorkflowService } from "../application/section-workflow-service.js";
 import { createSynthesisService } from "../application/synthesis-service.js";
+import { createFinalizationService, loadFinalizationContextInTx } from "../application/finalization-service.js";
+import { getFinalPlanInTx } from "../store/finalization.js";
+import { renderFinalPlanCandidateMarkdown } from "../core/finalization.js";
 import {
   getLatestSynthesisInputInTx,
   getSynthesisManifestByInputInTx,
@@ -424,10 +434,11 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
   {
     name: "request_reopen",
     description:
-      "Reopen the planning run from synthesis/validation back into the normal design workflow (target: detail | architecture). " +
+      "Reopen the planning run from synthesis/validation/final back into the normal design workflow (target: detail | architecture). " +
       "Main-agent capability; needs no formal approval. Moves the stage and run revision exactly once and marks the affected " +
-      "completed Sections needs_review; committed Plan Memory and the historical synthesis records are never touched. At " +
-      "validation stage you may pass finding_ids to scope the review to the findings' Sections (omit for full review).",
+      "completed Sections needs_review; committed Plan Memory and the historical synthesis/candidate records are never touched. At " +
+      "validation stage you may pass finding_ids to scope the review to the findings' Sections (omit for full review). From final " +
+      "this is legal only while the FinalPlan is NOT yet approved; it supersedes the awaiting final Proposal.",
     inputSchema: {
       type: "object",
       properties: {
@@ -441,6 +452,23 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
       required: ["target", "reason", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "request_finalization",
+    description:
+      "Run the deterministic FinalizationGate over the current planning world (validation stage only). On pass, the server " +
+      "atomically freezes the immutable FinalPlanCandidate, the pre-approval Evidence Audit snapshot, and the exact final_plan " +
+      "Proposal, and advances validation → final. This is NOT the human approval: present the candidate to the user, then call " +
+      "approve_proposal with the exact final proposal id/revision/hash. Takes no business input — the gate cannot be bypassed " +
+      "or configured (no force/skip flags exist).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
       additionalProperties: false,
     },
   },
@@ -648,6 +676,13 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
     completed: workflowStates.filter((state) => state.status === "completed").length,
     needsReview: workflowStates.filter((state) => state.status === "needs_review").length,
   };
+  // Phase 13 §61 — the final-stage projection is a DERIVED read view: an
+  // approved FinalPlan deterministically authorizes handoff; Phase 13 itself
+  // never delivers it and never creates a Handoff table (§59).
+  const stageRunId = preferred.run.runId;
+  const stage = preferred.run.stage;
+  const finalPlanRow =
+    stage === "final" ? ctx.store.withRead((tx) => getFinalPlanInTx(tx, stageRunId)) : null;
   return {
     run: {
       id: preferred.run.runId,
@@ -679,6 +714,21 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
             title: awaiting.title,
           },
         }),
+    ...(stage === "final"
+      ? {
+          ...(finalPlanRow !== null
+            ? {
+                finalPlan: {
+                  id: finalPlanRow.finalPlanId,
+                  revision: finalPlanRow.revision,
+                  hash: finalPlanRow.finalPlanHash,
+                  approved: true,
+                },
+              }
+            : {}),
+          handoff: { authorized: finalPlanRow !== null, delivered: false },
+        }
+      : {}),
   };
 }
 
@@ -769,6 +819,89 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
       status: "ok",
       context_epoch: context.epoch,
       bundle,
+    };
+  }
+  if (detail === "final") {
+    // §43 — the FinalPlanCandidate world at stage final: candidate + hash +
+    // pre-approval Evidence Audit summary + the exact final Proposal +
+    // validation summary + implementation order + limitations. The Markdown
+    // block is a deterministic PROJECTION for user review — never authority
+    // (§44/§80).
+    if (context.run.stage !== "final") {
+      throw domainError(
+        "CAPABILITY_NOT_AVAILABLE",
+        `detail="final" is only available at stage final (run is at '${context.run.stage}')`,
+      );
+    }
+    const finalRunId = preferred.run.runId;
+    const finalization = ctx.store.withRead((tx) => loadFinalizationContextInTx(tx, finalRunId));
+    if (finalization.candidate === null) {
+      throw domainError("FINAL_PLAN_CANDIDATE_REQUIRED", "this run has no FinalPlanCandidate at stage final");
+    }
+    const candidate = finalization.candidate.canonical;
+    const approvedPlan = ctx.store.withRead((tx) => getFinalPlanInTx(tx, finalRunId));
+    const finalProposal =
+      approvedPlan !== null
+        ? {
+            proposal_id: approvedPlan.proposalId,
+            revision: approvedPlan.proposalRevision,
+            hash: approvedPlan.proposalHash,
+            status: "approved" as const,
+          }
+        : context.working.awaitingProposal !== null
+          ? {
+              proposal_id: context.working.awaitingProposal.proposalId,
+              revision: context.working.awaitingProposal.revision,
+              hash: context.working.awaitingProposal.hash,
+              status: "awaiting_approval" as const,
+            }
+          : null;
+    return {
+      status: "ok",
+      context_epoch: context.epoch,
+      finalization: {
+        candidate: {
+          candidate_id: finalization.candidate.candidateId,
+          candidate_seq: finalization.candidate.candidateSeq,
+          candidate_hash: finalization.candidate.candidateHash,
+          base_head: { snapshot_id: candidate.baseHeadSnapshot, commit_id: candidate.baseHeadCommit },
+          synthesis_input: candidate.synthesisInput,
+          synthesis_manifest: candidate.synthesisManifest,
+          semantic_validation: candidate.semanticValidation,
+          architecture: candidate.architecture,
+          sections: candidate.sections,
+          decisions: candidate.decisions,
+          constraints: candidate.constraints,
+          implementation_order: candidate.implementationOrder,
+          limitations: candidate.limitations,
+          evidence_scope: candidate.evidenceScope,
+        },
+        evidence_audit:
+          finalization.audit === null
+            ? null
+            : {
+                audit_id: finalization.audit.auditId,
+                audit_hash: finalization.audit.auditHash,
+                purpose: finalization.audit.purpose,
+                entries: finalization.audit.entries,
+              },
+        final_proposal: finalProposal,
+        final_plan:
+          approvedPlan === null
+            ? null
+            : { id: approvedPlan.finalPlanId, revision: approvedPlan.revision, hash: approvedPlan.finalPlanHash },
+        ...(finalProposal !== null
+          ? {
+              markdown: renderFinalPlanCandidateMarkdown(candidate, {
+                candidateId: finalization.candidate.candidateId,
+                candidateHash: finalization.candidate.candidateHash,
+                proposalId: finalProposal.proposal_id,
+                proposalRevision: finalProposal.revision,
+                proposalHash: finalProposal.hash,
+              }),
+            }
+          : {}),
+      },
     };
   }
   return {
@@ -1319,10 +1452,20 @@ export function handleApproveProposal(ctx: PhasePlanToolContext, rawArgs: Record
 // submit_synthesis / submit_validation / request_reopen (Phase 12 §41–§67)
 // ---------------------------------------------------------------------------
 
-/** §73/§74 — main-mutation capabilities the later stages shut off entirely. */
-const STAGE_BLOCKED_MAIN_TOOLS = ["promote_evidence", "revalidate_evidence", "approve_proposal"] as const;
+/** §73/§74/§88 — main-mutation capabilities the later stages shut off. */
+const STAGE_BLOCKED_MAIN_TOOLS = ["promote_evidence", "revalidate_evidence"] as const;
 
 function assertMainCapabilityForStage(stage: string, tool: string): void {
+  if (tool === "approve_proposal") {
+    // §42/§88: ordinary design approval shuts off once the run leaves Detail;
+    // at stage final the ONLY approvable Proposal is the server-frozen
+    // final_plan one — the engine's type gates enforce that, so the Formal
+    // Final Approval (§46) reuses this exact tool.
+    if (stage === "synthesis" || stage === "validation") {
+      throw domainError("CAPABILITY_NOT_AVAILABLE", `${tool} is not available at stage '${stage}'`);
+    }
+    return;
+  }
   if ((STAGE_BLOCKED_MAIN_TOOLS as readonly string[]).includes(tool) && (stage === "synthesis" || stage === "validation" || stage === "final")) {
     throw domainError("CAPABILITY_NOT_AVAILABLE", `${tool} is not available at stage '${stage}'`);
   }
@@ -1440,7 +1583,7 @@ export function handleSubmitValidation(ctx: PhasePlanToolContext, rawArgs: Recor
     stage: current.stage,
     run_revision: current.revision,
     next: result.isClean
-      ? "validation clean — finalization is NOT performed by this phase; await Phase 13 finalization authority"
+      ? "validation clean — call request_finalization to freeze the Final Plan Candidate (then present it and, on user authorization, approve_proposal)"
       : "call request_reopen to bring the affected sections back into review",
   };
 }
@@ -1491,6 +1634,56 @@ export function handleRequestReopen(ctx: PhasePlanToolContext, rawArgs: Record<s
   };
 }
 
+export function handleRequestFinalization(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  // §27 — ZERO business fields: the deterministic gate cannot be bypassed,
+  // configured, or steered (no force/skip_evidence/ignore_conflicts/
+  // allow_partial/assume_clean/head/run_id/candidate_id exist to reject).
+  assertExactBusinessFields(rawArgs, []);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "request_finalization", businessInput: rawArgs });
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  {
+    const stageRun = getPlanningRunRecord(ctx.store, envelope.runId);
+    if (stageRun !== null) assertMainCapabilityForStage(stageRun.stage, "request_finalization");
+  }
+  const service = createFinalizationService(ctx.store, ctx.clock);
+  const result = service.requestFinalization({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    // §72 — the operation identity derives from the SIGNED tool use.
+    requestId: `finalize:${envelope.toolUseId}`,
+    // §26 — from the signed envelope only; absent agent ⇒ main-session call.
+    callerAgent: envelope.version === 2 ? (envelope.agent ?? null) : null,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    candidate: {
+      candidate_id: result.candidateId,
+      candidate_seq: result.candidateSeq,
+      candidate_hash: result.candidateHash,
+    },
+    evidence_audit: {
+      audit_id: result.auditId,
+      audit_hash: result.auditHash,
+    },
+    final_proposal: {
+      proposal_id: result.proposalId,
+      revision: result.proposalRevision,
+      proposal_hash: result.proposalHash,
+    },
+    stage: result.stage,
+    run_revision: result.runRevision,
+    next: result.idempotent
+      ? "the final Proposal is already frozen — present it and call approve_proposal after the user authorizes it"
+      : "finalization passed — present the Final Plan Candidate (get_context detail=final) and call approve_proposal ONLY after the user authorizes that exact proposal",
+  };
+}
+
 // ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
@@ -1521,6 +1714,8 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleSubmitValidation(ctx, rawArgs);
     case "request_reopen":
       return handleRequestReopen(ctx, rawArgs);
+    case "request_finalization":
+      return handleRequestFinalization(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

@@ -226,6 +226,40 @@ const SCHEMA_V9_INDEXES = [
   "idx_validation_reports_manifest",
 ] as const;
 
+/** Finalization/final-plan tables required once the store has reached v10 (Phase 13 §4). */
+const SCHEMA_V10_TABLES = [
+  "evidence_audit_snapshots",
+  "evidence_audit_entries",
+  "final_plan_candidates",
+  "final_plan_candidate_refs",
+  "proposal_final_plan_refs",
+  "final_plans",
+] as const;
+
+/** Immutability triggers required once the store has reached v10: every
+ * finalization record is append-only history (§6/§21/§22/§48/§55). */
+const SCHEMA_V10_TRIGGERS = [
+  "evidence_audit_snapshots_no_update",
+  "evidence_audit_snapshots_no_delete",
+  "evidence_audit_entries_no_update",
+  "evidence_audit_entries_no_delete",
+  "final_plan_candidates_no_update",
+  "final_plan_candidates_no_delete",
+  "final_plan_candidate_refs_no_update",
+  "final_plan_candidate_refs_no_delete",
+  "proposal_final_plan_refs_no_update",
+  "proposal_final_plan_refs_no_delete",
+  "final_plans_no_update",
+  "final_plans_no_delete",
+] as const;
+
+/** Constraint indexes backing the v10 finalization lookups. */
+const SCHEMA_V10_INDEXES = [
+  "idx_evidence_audit_entries_audit",
+  "idx_final_plan_candidates_run",
+  "idx_proposal_final_plan_refs_candidate",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -769,6 +803,167 @@ function validateSchemaV9(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural + data checks for schema v10 (Phase 13 §91): finalization tables
+ * and immutability triggers exist; audit entries point to exact same-run
+ * Evidence revisions; candidate base HEAD/commit pairs are valid and the
+ * synthesis chain is exact; candidate refs belong to the frozen synthesis
+ * world; the proposal↔candidate binding carries the exact candidate hash; a
+ * FinalPlan references its exact candidate and its approval/proposal/commit
+ * all correspond, with the Final PlanCommit's resulting snapshot in the same
+ * run; FinalPlan stays unique per run. Store-open NEVER re-runs the
+ * FinalizationGate (§91) — only these identity facts.
+ */
+function validateSchemaV10(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V10_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 10`);
+    }
+  }
+  for (const trigger of SCHEMA_V10_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 10`);
+    }
+  }
+  for (const index of SCHEMA_V10_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 10`);
+    }
+  }
+  if (SCHEMA_V10_TABLES.some((table) => !objectNames.has(table))) {
+    return;
+  }
+  const baseWorldPresent =
+    objectNames.has("plan_commits") && objectNames.has("snapshot_members") && objectNames.has("proposals") && objectNames.has("synthesis_inputs");
+  if (!baseWorldPresent) {
+    return;
+  }
+  // Audit entries must point to exact same-run Evidence revisions (§91).
+  const auditEntryDrift = db
+    .prepare(
+      "SELECT e.run_id AS runId, e.audit_id AS auditId, e.evidence_id AS evidenceId FROM evidence_audit_entries e "
+      + "WHERE NOT EXISTS (SELECT 1 FROM evidence_revisions r WHERE r.run_id = e.run_id "
+      + "AND r.evidence_id = e.evidence_id AND r.revision = e.evidence_revision) LIMIT 1",
+    )
+    .get() as { runId?: string; auditId?: string; evidenceId?: string } | undefined;
+  if (auditEntryDrift !== undefined) {
+    problems.push(
+      `evidence audit '${auditEntryDrift.auditId}' in run '${auditEntryDrift.runId}' references missing evidence revision '${auditEntryDrift.evidenceId}'`,
+    );
+  }
+  // Candidate base HEAD/commit pair must be a real commit-chain pair (§91).
+  const candidateBaseDrift = db
+    .prepare(
+      "SELECT c.run_id AS runId, c.candidate_id AS candidateId FROM final_plan_candidates c "
+      + "JOIN plan_commits p ON p.run_id = c.run_id AND p.commit_id = c.base_head_commit_id "
+      + "WHERE p.resulting_snapshot_id != c.base_head_snapshot_id LIMIT 1",
+    )
+    .get() as { runId?: string; candidateId?: string } | undefined;
+  if (candidateBaseDrift !== undefined) {
+    problems.push(
+      `final plan candidate '${candidateBaseDrift.candidateId}' in run '${candidateBaseDrift.runId}' has a base commit whose resulting snapshot is not the base snapshot`,
+    );
+  }
+  // The candidate's synthesis chain must be exact (§17/§91).
+  const candidateChainDrift = db
+    .prepare(
+      "SELECT c.run_id AS runId, c.candidate_id AS candidateId FROM final_plan_candidates c "
+      + "JOIN synthesis_inputs i ON i.run_id = c.run_id AND i.input_id = c.input_id "
+      + "JOIN synthesis_manifests m ON m.run_id = c.run_id AND m.manifest_id = c.manifest_id "
+      + "JOIN semantic_validation_reports r ON r.run_id = c.run_id AND r.report_id = c.report_id "
+      + "WHERE c.input_hash != i.input_hash OR m.input_id != c.input_id OR m.input_hash != c.input_hash "
+      + "OR m.manifest_hash != c.manifest_hash OR r.manifest_id != c.manifest_id OR r.manifest_hash != c.manifest_hash "
+      + "OR r.input_id != c.input_id OR r.input_hash != c.input_hash OR r.is_clean != 1 LIMIT 1",
+    )
+    .get() as { runId?: string; candidateId?: string } | undefined;
+  if (candidateChainDrift !== undefined) {
+    problems.push(
+      `final plan candidate '${candidateChainDrift.candidateId}' in run '${candidateChainDrift.runId}' does not bind an exact clean synthesis chain`,
+    );
+  }
+  // Candidate refs must belong to the frozen synthesis world (§91).
+  const candidateRefOutsideInput = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.candidate_id AS candidateId, r.family AS family, r.artifact_id AS artifactId "
+      + "FROM final_plan_candidate_refs r JOIN final_plan_candidates c ON c.run_id = r.run_id AND c.candidate_id = r.candidate_id "
+      + "WHERE r.family != 'evidence' AND NOT EXISTS (SELECT 1 FROM synthesis_input_refs ir WHERE ir.run_id = r.run_id "
+      + "AND ir.input_id = c.input_id AND ir.kind = r.family AND ir.artifact_id = r.artifact_id AND ir.revision = r.revision) LIMIT 1",
+    )
+    .get() as { runId?: string; candidateId?: string; family?: string; artifactId?: string } | undefined;
+  if (candidateRefOutsideInput !== undefined) {
+    problems.push(
+      `final plan candidate '${candidateRefOutsideInput.candidateId}' in run '${candidateRefOutsideInput.runId}' references '${candidateRefOutsideInput.artifactId}' (${candidateRefOutsideInput.family}) outside its frozen input`,
+    );
+  }
+  const candidateEvidenceOutsideInput = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.candidate_id AS candidateId, r.artifact_id AS artifactId "
+      + "FROM final_plan_candidate_refs r JOIN final_plan_candidates c ON c.run_id = r.run_id AND c.candidate_id = r.candidate_id "
+      + "WHERE r.family = 'evidence' AND NOT EXISTS (SELECT 1 FROM synthesis_input_evidence ie WHERE ie.run_id = r.run_id "
+      + "AND ie.input_id = c.input_id AND ie.evidence_id = r.artifact_id AND ie.evidence_revision = r.revision) LIMIT 1",
+    )
+    .get() as { runId?: string; candidateId?: string; artifactId?: string } | undefined;
+  if (candidateEvidenceOutsideInput !== undefined) {
+    problems.push(
+      `final plan candidate '${candidateEvidenceOutsideInput.candidateId}' in run '${candidateEvidenceOutsideInput.runId}' references evidence '${candidateEvidenceOutsideInput.artifactId}' outside its frozen input`,
+    );
+  }
+  // The proposal↔candidate binding must carry the candidate's exact hash (§91).
+  const proposalRefHashDrift = db
+    .prepare(
+      "SELECT p.run_id AS runId, p.proposal_id AS proposalId FROM proposal_final_plan_refs p "
+      + "JOIN final_plan_candidates c ON c.run_id = p.run_id AND c.candidate_id = p.candidate_id "
+      + "WHERE p.candidate_hash != c.candidate_hash LIMIT 1",
+    )
+    .get() as { runId?: string; proposalId?: string } | undefined;
+  if (proposalRefHashDrift !== undefined) {
+    problems.push(
+      `final plan proposal '${proposalRefHashDrift.proposalId}' in run '${proposalRefHashDrift.runId}' binds a stale candidate hash`,
+    );
+  }
+  // A FinalPlan must reference its exact candidate and correspond to its
+  // approval/proposal/commit chain, with the commit's snapshot in-run (§91).
+  const finalPlanDrift = db
+    .prepare(
+      "SELECT f.run_id AS runId, f.final_plan_id AS finalPlanId FROM final_plans f "
+      + "LEFT JOIN final_plan_candidates c ON c.run_id = f.run_id AND c.candidate_id = f.candidate_id AND c.candidate_hash = f.candidate_hash "
+      + "LEFT JOIN proposals pr ON pr.run_id = f.run_id AND pr.proposal_id = f.proposal_id "
+      + "LEFT JOIN proposal_states ps ON ps.run_id = f.run_id AND ps.proposal_id = f.proposal_id AND ps.revision = f.proposal_revision AND ps.status = 'approved' "
+      + "LEFT JOIN approvals a ON a.approval_id = f.approval_id AND a.run_id = f.run_id AND a.proposal_id = f.proposal_id "
+      + "LEFT JOIN plan_commits pc ON pc.commit_id = f.commit_id AND pc.run_id = f.run_id AND pc.approval_id = f.approval_id "
+      + "LEFT JOIN plan_snapshots s ON s.run_id = f.run_id AND s.snapshot_id = f.snapshot_id "
+      + "WHERE c.candidate_id IS NULL OR pr.proposal_id IS NULL OR ps.proposal_id IS NULL "
+      + "OR a.approval_id IS NULL OR pc.commit_id IS NULL OR s.snapshot_id IS NULL "
+      + "OR pc.resulting_snapshot_id != f.snapshot_id LIMIT 1",
+    )
+    .get() as { runId?: string; finalPlanId?: string } | undefined;
+  if (finalPlanDrift !== undefined) {
+    problems.push(
+      `final plan '${finalPlanDrift.finalPlanId}' in run '${finalPlanDrift.runId}' has broken candidate/proposal/approval/commit/snapshot provenance`,
+    );
+  }
+  // Final PlanCommit must reference the final proposal revision exactly.
+  const finalCommitDrift = db
+    .prepare(
+      "SELECT f.run_id AS runId, f.final_plan_id AS finalPlanId FROM final_plans f "
+      + "JOIN plan_commits pc ON pc.run_id = f.run_id AND pc.commit_id = f.commit_id "
+      + "WHERE pc.proposal_id != f.proposal_id OR pc.proposal_revision != f.proposal_revision LIMIT 1",
+    )
+    .get() as { runId?: string; finalPlanId?: string } | undefined;
+  if (finalCommitDrift !== undefined) {
+    problems.push(
+      `final plan '${finalCommitDrift.finalPlanId}' in run '${finalCommitDrift.runId}' has a Final PlanCommit that does not reference its final proposal`,
+    );
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -825,6 +1020,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 9) {
     validateSchemaV9(db, problems);
+  }
+  if (version >= 10) {
+    validateSchemaV10(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

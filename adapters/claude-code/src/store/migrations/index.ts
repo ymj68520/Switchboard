@@ -14,6 +14,7 @@ import { createObservationEvidenceMigration } from "./006-observation-evidence-f
 import { createEvidenceFreshnessMigration } from "./007-evidence-freshness-foundation.js";
 import { createSectionWorkflowMigration } from "./008-section-workflow.js";
 import { createSynthesisValidationMigration } from "./009-synthesis-validation-foundation.js";
+import { createFinalizationFinalPlanMigration } from "./010-finalization-final-plan.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -72,7 +73,8 @@ export interface ProductionMigrationDeps {
  * `5→6 observation-evidence-foundation`,
  * `6→7 evidence-freshness-foundation`,
  * `7→8 section-workflow`,
- * `8→9 synthesis-validation-foundation`.
+ * `8→9 synthesis-validation-foundation`,
+ * `9→10 finalization-final-plan`.
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
   return [
@@ -85,5 +87,6 @@ export function createProductionMigrations(deps: ProductionMigrationDeps): Store
     createEvidenceFreshnessMigration(),
     createSectionWorkflowMigration(),
     createSynthesisValidationMigration(),
+    createFinalizationFinalPlanMigration(),
   ];
 }

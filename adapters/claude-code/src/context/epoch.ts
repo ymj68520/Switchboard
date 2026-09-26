@@ -44,6 +44,12 @@ export interface ContextEpochInputs {
   synthesis: { inputId: string; inputHash: string } | null;
   synthesisManifest: { manifestId: string; manifestHash: string } | null;
   semanticValidation: { reportId: string; reportHash: string } | null;
+  /** §63 — Phase 13: finalization identity joined the inputs (no raw event seq). */
+  finalization: {
+    candidate: { candidateId: string; candidateHash: string } | null;
+    finalProposal: { id: string; revision: number; hash: string } | null;
+    finalPlan: { finalPlanId: string; hash: string } | null;
+  };
 }
 
 /**
@@ -80,6 +86,10 @@ export function deriveContextEpoch(inputs: Omit<ContextEpochInputs, "epochVersio
     synthesis: inputs.synthesis,
     synthesisManifest: inputs.synthesisManifest,
     semanticValidation: inputs.semanticValidation,
+    // §63 — request_finalization / Final Approval are visible through the
+    // finalization identity pairs; raw Evidence validation event seqs never
+    // enter the epoch, and the Final PlanCommit itself moves HEAD.
+    finalization: inputs.finalization,
   };
   const hex = createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
   return `${CONTEXT_EPOCH_VERSION}:${hex}`;
@@ -107,6 +117,9 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
   const manifest =
     synthesis === null ? null : source.getSynthesisManifestForInput(runId, synthesis.inputId);
   const report = manifest === null ? null : source.getValidationReportForManifest(runId, manifest.manifestId);
+  // §63 — finalization identity, read only at stage final.
+  const finalizationWorld =
+    run.stage === "final" ? source.getFinalizationForRun(runId) : null;
   return deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -125,5 +138,19 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
     synthesis: synthesis === null ? null : { inputId: synthesis.inputId, inputHash: synthesis.inputHash },
     synthesisManifest: manifest,
     semanticValidation: report === null ? null : { reportId: report.reportId, reportHash: report.reportHash },
+    finalization: {
+      candidate:
+        finalizationWorld === null || finalizationWorld.candidate === null
+          ? null
+          : {
+              candidateId: finalizationWorld.candidate.candidateId,
+              candidateHash: finalizationWorld.candidate.candidateHash,
+            },
+      finalProposal:
+        awaiting === null
+          ? null
+          : { id: awaiting.proposalId, revision: awaiting.revision, hash: awaiting.hash },
+      finalPlan: finalizationWorld === null ? null : finalizationWorld.finalPlan,
+    },
   });
 }

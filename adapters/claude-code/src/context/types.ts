@@ -28,15 +28,15 @@ import type { SectionContract } from "../core/memory-artifacts.js";
 import type { SectionWorkflowState } from "../core/section-workflow.js";
 
 /**
- * Phase 12 (§28–§30): the v2 shape cannot express the frozen synthesis
- * identity or the semantic validation outcome — the context model formally
- * advances to version 3 and the epoch inputs gain the synthesis/validation
- * records (§30). Older shapes are never silently reinterpreted.
+ * Phase 13 (§62): the v3 shape cannot express the FinalPlanCandidate, the
+ * Evidence audit, or the approved FinalPlan — the context model formally
+ * advances to version 4 and the epoch inputs gain the finalization identity
+ * (§63). Older shapes are never silently reinterpreted.
  */
-export const CONTEXT_MODEL_VERSION = 3 as const;
+export const CONTEXT_MODEL_VERSION = 4 as const;
 
-/** The frozen epoch identity marker (§30): synthesis/validation facts joined the inputs. */
-export const CONTEXT_EPOCH_VERSION = "context-epoch:v3" as const;
+/** The frozen epoch identity marker (§63): finalization facts joined the inputs. */
+export const CONTEXT_EPOCH_VERSION = "context-epoch:v4" as const;
 
 /** L0 — static identity of the planning protocol layer. */
 export interface ContextProtocol {
@@ -172,11 +172,26 @@ export interface ContextSemanticValidation {
   findingCounts: Array<{ kind: string; count: number }>;
 }
 
+/**
+ * §62 — the finalization world at stage final: the newest frozen candidate,
+ * the newest Evidence audit, the exact final Proposal, the approved FinalPlan
+ * (once the user authorizes it), and the derived handoff-authorization
+ * projection. Phase 13 never performs the handoff itself (§56).
+ */
+export interface ContextFinalization {
+  candidate: { candidateId: string; candidateSeq: number; candidateHash: string } | null;
+  evidenceAudit: { auditId: string; auditHash: string; purpose: string; entryCount: number } | null;
+  finalProposal: { proposalId: string; revision: number; hash: string; status: "awaiting_approval" | "approved" } | null;
+  finalPlan: { finalPlanId: string; hash: string } | null;
+  /** Derived: an approved FinalPlan authorizes the future Phase 14 handoff. */
+  handoffAuthorized: boolean;
+}
+
 export interface ContextWorking {
   awaitingProposal: ContextAwaitingProposal | null;
 }
 
-/** L5 — operations logically available under the current state (§27/§73/§74). */
+/** L5 — operations logically available under the current state (§27/§73/§74/§88). */
 export type ContextOperation =
   | "get_state"
   | "get_context"
@@ -187,7 +202,8 @@ export type ContextOperation =
   | "approve_proposal"
   | "submit_synthesis"
   | "submit_validation"
-  | "request_reopen";
+  | "request_reopen"
+  | "request_finalization";
 
 /** Internal provenance of one assembly (directive §44) — tests/debug aid. */
 export interface ContextSourceTrace {
@@ -219,6 +235,8 @@ export interface PhasePlanContext {
   synthesisManifest: ContextSynthesisManifest | null;
   /** §29/§71 — the validation outcome once a report exists. */
   semanticValidation: ContextSemanticValidation | null;
+  /** §62 — the finalization world (final stage only). */
+  finalization: ContextFinalization | null;
   working: ContextWorking;
   operations: ContextOperation[];
   sourceTrace: ContextSourceTrace;
@@ -267,4 +285,14 @@ export interface ContextSource {
     runId: string,
     manifestId: string,
   ): { reportId: string; reportHash: string; isClean: boolean; findingCounts: Array<{ kind: string; count: number }> } | null;
+  /** §62 — the run's finalization world (candidate/audit/finalPlan), or null. */
+  getFinalizationForRun(
+    runId: string,
+  ): {
+    candidate: { candidateId: string; candidateSeq: number; candidateHash: string } | null;
+    evidenceAudit: { auditId: string; auditHash: string; purpose: string; entryCount: number } | null;
+    /** The exact final Proposal (awaiting or approved), or null. */
+    finalProposal: { proposalId: string; revision: number; hash: string; status: "awaiting_approval" | "approved" } | null;
+    finalPlan: { finalPlanId: string; hash: string } | null;
+  } | null;
 }

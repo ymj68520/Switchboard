@@ -48,8 +48,14 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
   `request_reopen` instead.
 - When stage=validation: invoke the Phase Plan `validator` subagent, then
   inspect its immutable report. If the report is not clean, `request_reopen`
-  (optionally scoped to the findings' `finding_ids`). A clean report does
-  NOT finalize the plan.
+  (optionally scoped to the findings' `finding_ids`).
+- When validation is clean: `request_finalization`. If finalization passes,
+  present the deterministic Final Plan Candidate
+  (`get_context(detail=final)`) and the exact final Proposal
+  id/revision/hash to the user. Only call `approve_proposal` after the user
+  chooses to authorize that exact final Proposal. After Final Approval: do
+  not exit Plan Mode yourself — execution handoff is a separate workflow
+  step that has not been delivered yet.
 - After a resume or compaction, rely on the injected Phase Plan Recovery
   Capsule for authoritative state. If exact artifact detail is needed, call
   `get_context` (structured projection + context epoch) or `read_memory`

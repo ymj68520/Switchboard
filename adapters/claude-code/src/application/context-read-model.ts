@@ -16,7 +16,17 @@
 import { getPlanningRunRecord } from "../store/planning-runs.js";
 import { getHeadCommitRecord } from "../store/plan-commits.js";
 import { getHeadSnapshotRecord, readMemoryRevisionRecord } from "../store/plan-memory.js";
-import { getAwaitingProposalRecord } from "../store/proposals.js";
+import {
+  findAwaitingProposalStateInTx,
+  getAwaitingProposalRecord,
+  getProposalRevisionInTx,
+} from "../store/proposals.js";
+import {
+  getFinalPlanInTx,
+  getLatestEvidenceAuditInTx,
+  getLatestFinalPlanCandidateInTx,
+  listEvidenceAuditEntriesInTx,
+} from "../store/finalization.js";
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import {
   getLatestValidationReportInTx,
@@ -139,6 +149,63 @@ export function createStoreContextSource(store: PlanStore): ContextSource {
           findingCounts: [...counts.entries()]
             .map(([kind, count]) => ({ kind, count }))
             .sort((a, b) => (a.kind < b.kind ? -1 : 1)),
+        };
+      });
+    },
+
+    // §62 — the finalization world: newest candidate, newest audit, the exact
+    // final Proposal (awaiting, or approved via the FinalPlan row), and the
+    // approved FinalPlan. All values are plain read projections.
+    getFinalizationForRun(runId) {
+      return store.withRead((tx) => {
+        const candidateRow = getLatestFinalPlanCandidateInTx(tx, runId);
+        const latestAudit = getLatestEvidenceAuditInTx(tx, runId);
+        const planRow = getFinalPlanInTx(tx, runId);
+        const awaitingFinal = findAwaitingProposalStateInTx(tx, runId);
+        let finalProposal: {
+          proposalId: string;
+          revision: number;
+          hash: string;
+          status: "awaiting_approval" | "approved";
+        } | null = null;
+        if (awaitingFinal !== null) {
+          const revision = getProposalRevisionInTx(tx, { runId, proposalId: awaitingFinal.proposalId, revision: awaitingFinal.revision });
+          if (revision !== null && revision.type === "final_plan") {
+            finalProposal = {
+              proposalId: revision.proposalId,
+              revision: revision.revision,
+              hash: revision.proposalHash,
+              status: "awaiting_approval",
+            };
+          }
+        } else if (planRow !== null) {
+          finalProposal = {
+            proposalId: planRow.proposalId,
+            revision: planRow.proposalRevision,
+            hash: planRow.proposalHash,
+            status: "approved",
+          };
+        }
+        return {
+          candidate:
+            candidateRow === null
+              ? null
+              : {
+                  candidateId: candidateRow.candidateId,
+                  candidateSeq: candidateRow.candidateSeq,
+                  candidateHash: candidateRow.candidateHash,
+                },
+          evidenceAudit:
+            latestAudit === null
+              ? null
+              : {
+                  auditId: latestAudit.auditId,
+                  auditHash: latestAudit.auditHash,
+                  purpose: latestAudit.purpose,
+                  entryCount: listEvidenceAuditEntriesInTx(tx, runId, latestAudit.auditId).length,
+                },
+          finalProposal,
+          finalPlan: planRow === null ? null : { finalPlanId: planRow.finalPlanId, hash: planRow.finalPlanHash },
         };
       });
     },

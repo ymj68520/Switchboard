@@ -31,6 +31,7 @@
 
 import { createHash } from "node:crypto";
 
+import { canonicalJson as planCanonicalJson } from "../core/canonical-json.js";
 import {
   nextStage,
   type PlanningRunEvent,
@@ -71,6 +72,15 @@ import {
   evaluateDetailCompletionInTx,
 } from "./section-workflow-service.js";
 import { createSynthesisInputAtDetailCompletionInTx } from "./synthesis-service.js";
+import {
+  finalPlanHash,
+  type FinalPlanV1,
+} from "../core/finalization.js";
+import {
+  runCommitTimeFinalizationInTx,
+  createFinalizationService,
+} from "./finalization-service.js";
+import { getFinalPlanInTx, insertFinalPlanInTx } from "../store/finalization.js";
 import {
   getProposalRevisionInTx,
   getProposalStateInTx,
@@ -381,16 +391,21 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
         // provenance closure (§40). Precedence is preserved: ownership/
         // hash/HEAD failures above already threw, so stale bindings still
         // answer STALE_SESSION_BINDING, never an Evidence error.
-        const evidenceGate = runProposalEvidenceGateInTx(tx, {
-          runId: input.runId,
-          workspaceId: run.workspaceId,
-          proposalId: proposal.proposalId,
-          proposalRevision: proposal.revision,
-          recheck: true,
-          clock,
-        });
-        if (!evidenceGate.ok) {
-          throw evidenceNeedsValidationError(evidenceGate.failures);
+        // final_plan proposals skip this gate — their authorization runs the
+        // FULL Phase 13 FinalizationGate rerun below (§47), which subsumes it.
+        const isFinalPlanAuthorization = proposal.type === "final_plan";
+        if (!isFinalPlanAuthorization) {
+          const evidenceGate = runProposalEvidenceGateInTx(tx, {
+            runId: input.runId,
+            workspaceId: run.workspaceId,
+            proposalId: proposal.proposalId,
+            proposalRevision: proposal.revision,
+            recheck: true,
+            clock,
+          });
+          if (!evidenceGate.ok) {
+            throw evidenceNeedsValidationError(evidenceGate.failures);
+          }
         }
 
         // 13/14. Re-simulate + revalidate the candidate snapshot.
@@ -405,6 +420,25 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
         gateProposalType(input.runId, proposal.type, proposal.changes, simulation.candidateRefs, (ref) =>
           requireMemoryRevisionContentInTx(tx, ref),
         );
+
+        // 15.F Phase 13 §47/§48 — the commit-time FinalizationGate rerun for a
+        // final_plan authorization. Phase 6 ordering above already held
+        // (idempotency → run → workspace → binding → lifecycle → run revision
+        // → proposal identity/state/hash → HEAD/base); now the ENTIRE world is
+        // reloaded and the gate re-evaluated — the second run never trusts the
+        // first (§3). The commit-time EvidenceAuditSnapshot (§34) is frozen
+        // here, BEFORE any Approval/PlanCommit/FinalPlan row is written; any
+        // deny rolls the whole authorization back (§68/§100).
+        const finalization =
+          proposal.type === "final_plan"
+            ? runCommitTimeFinalizationInTx(tx, {
+                runId: input.runId,
+                workspaceId: input.workspaceId,
+                proposalId: proposal.proposalId,
+                proposalRevision: proposal.revision,
+                clock,
+              })
+            : null;
 
         // 15.5 Phase 11 — collect the frozen Section workflow facts (§31).
         // The completion prerequisite gate itself runs after the candidate
@@ -511,12 +545,75 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           });
         }
 
+        // 21.F Phase 13 §50–§56 — the immutable FinalPlan, created in the SAME
+        // authorization transaction as the Approval/PlanCommit (§81/§82: there
+        // is never a FinalPlan without its commit, nor a Final PlanCommit
+        // without its FinalPlan). The FinalPlan references the COMMIT-TIME
+        // EvidenceAuditSnapshot (§34), not the pre-approval one, and carries
+        // the full Candidate→Proposal→Approval→Commit→Snapshot provenance
+        // (§56). One approved FinalPlan per run in v0.1 (§52).
+        let finalPlan: { finalPlanId: string; finalPlanHash: string; candidateId: string } | null = null;
+        if (finalization !== null) {
+          if (getFinalPlanInTx(tx, input.runId) !== null) {
+            throw new RuntimeError("FINAL_PLAN_ALREADY_APPROVED", "this run already has an approved FinalPlan", {
+              detail: { runId: input.runId },
+            });
+          }
+          if (headSnapshotId !== finalization.candidate.baseHeadSnapshot || headCommitId !== finalization.candidate.baseHeadCommit) {
+            throw new RuntimeError("FINAL_PLAN_CANDIDATE_STALE", "the candidate base no longer matches the committing HEAD", {
+              detail: { runId: input.runId },
+            });
+          }
+          const plan: FinalPlanV1 = {
+            version: 1,
+            candidateHash: finalization.candidateHash,
+            architecture: finalization.candidate.architecture,
+            sections: finalization.candidate.sections,
+            decisions: finalization.candidate.decisions,
+            constraints: finalization.candidate.constraints,
+            synthesisManifest: finalization.candidate.synthesisManifest,
+            implementationOrder: finalization.candidate.implementationOrder,
+            limitations: finalization.candidate.limitations,
+            validation: {
+              blockingQuestions: 0,
+              blockingConflicts: 0,
+              invalidSections: 0,
+              semanticValidation: "clean",
+            },
+            evidenceAudit: { auditId: finalization.auditId, auditHash: finalization.auditHash },
+          };
+          const finalPlanId = `fplan_${clock.newId()}`;
+          const planHash = finalPlanHash(plan);
+          insertFinalPlanInTx(tx, {
+            runId: input.runId,
+            finalPlanId,
+            revision: 1,
+            candidateId: finalization.candidateId,
+            candidateHash: finalization.candidateHash,
+            proposalId: proposal.proposalId,
+            proposalRevision: proposal.revision,
+            proposalHash: proposal.proposalHash,
+            approvalId,
+            commitId,
+            snapshotId: snapshot.snapshotId,
+            auditId: finalization.auditId,
+            auditHash: finalization.auditHash,
+            canonicalJson: planCanonicalJson(plan),
+            finalPlanHash: planHash,
+            createdAt: clock.nowIso(),
+          });
+          finalPlan = { finalPlanId, finalPlanHash: planHash, candidateId: finalization.candidateId };
+        }
+
         // 22. Workflow mutations — Phase 11, same transaction as everything
         // else. Order inside the block is the §40 canonical order: register →
         // reopen (§39) → downstream dependency review (§42) → complete
         // (§33) → active clear / Detail→Synthesis (§34/§35). Design
         // checkpoints and plain amendments leave the run revision untouched
         // (§29/§41); architecture completion keeps its Phase 6 semantics.
+        // final_plan authorization (Phase 13) performs NO workflow mutation
+        // and does NOT bump the run revision (§52/§84) — the stage already
+        // moved to final at request_finalization and stays there (§58).
         let finalRun = run;
         if (proposal.type === "architecture_completion") {
           const event: PlanningRunEvent = "ARCHITECTURE_APPROVED";
@@ -703,6 +800,15 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
               resultingSnapshotId: snapshot.snapshotId,
               runRevisionAfter: finalRun.revision,
               stageAfter: finalRun.stage,
+              // §79 — the Final PlanCommit audit extends the existing
+              // PLAN_COMMITTED payload; no second commit-event authority.
+              ...(finalPlan !== null
+                ? {
+                    finalPlanId: finalPlan.finalPlanId,
+                    finalPlanHash: finalPlan.finalPlanHash,
+                    candidateId: finalPlan.candidateId,
+                  }
+                : {}),
               ...(Object.keys(workflowAudit).length > 0 ? { sectionWorkflow: workflowAudit } : {}),
             },
           },
@@ -750,6 +856,20 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           } catch {
             // Concurrent drift re-failing the re-check is acceptable — the
             // blocking error below is the authoritative answer either way.
+          }
+        }
+        if (err instanceof RuntimeError && err.code === "FINALIZATION_DENIED") {
+          // Phase 13 §49 — a denied commit-time gate may have discovered real
+          // source changes before the rollback; re-run ONLY the Evidence audit
+          // in a fresh transaction so those system facts persist. No approval/
+          // commit/FinalPlan row is ever written on this path.
+          try {
+            createFinalizationService(store, clock).persistDiscoveredEvidenceFacts({
+              runId: input.runId,
+              workspaceId: input.workspaceId,
+            });
+          } catch {
+            // The denied authorization below stays authoritative either way.
           }
         }
         throw err;
@@ -815,8 +935,17 @@ function gateProposalType(
     }
     return;
   }
-  // final_plan never reaches the engine through prepare, and the engine
-  // refuses it outright rather than approximating (§56).
+  if (type === "final_plan") {
+    // Phase 13 §40 — FinalPlan approval is NOT a design mutation; the only
+    // legal final_plan Proposal is the server-frozen one with zero changes.
+    if (changes.length !== 0) {
+      throw new RuntimeError("FINAL_PLAN_PROPOSAL_INVALID", "a final_plan proposal carries no design changes", {
+        detail: { runId, type, changeCount: changes.length },
+      });
+    }
+    return;
+  }
+  // Unknown proposal types are refused outright rather than approximated.
   throw new RuntimeError("PROPOSAL_TYPE_UNAVAILABLE", `proposal type '${type}' is not available in this phase`, {
     detail: { runId, type },
   });

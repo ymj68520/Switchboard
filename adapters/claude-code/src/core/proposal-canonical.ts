@@ -33,6 +33,7 @@ import type { DerivedFromRef } from "../store/evidence.js";
 export const PROPOSAL_CANONICAL_SCHEMA = "phase-plan.proposal";
 export const PROPOSAL_CANONICAL_V1_VERSION = 1;
 export const PROPOSAL_CANONICAL_VERSION = 2;
+export const PROPOSAL_CANONICAL_V3_VERSION = 3;
 
 /** Exact upstream Evidence reference ({evidenceId, revision}). */
 export type ProposalEvidenceRef = DerivedFromRef;
@@ -59,6 +60,26 @@ export interface ProposalCanonicalV2 extends Omit<ProposalCanonicalV1, "version"
   version: typeof PROPOSAL_CANONICAL_VERSION;
   /** Exact Evidence revisions this proposal depends on (§31); [] when none. */
   requiredEvidence: ProposalEvidenceRef[];
+}
+
+/**
+ * The exact FinalPlanCandidate binding inside a final_plan Proposal (Phase 13
+ * §37): the proposal hash therefore binds both the candidate identity and its
+ * content hash.
+ */
+export interface FinalPlanCandidateBinding {
+  candidateId: string;
+  candidateHash: string;
+}
+
+/**
+ * ProposalCanonicalV3 (Phase 13 §37) — exclusively for server-generated
+ * `final_plan` proposals. Ordinary design proposals remain V1/V2 forever
+ * (§78): no historical proposal is ever upgraded to V3.
+ */
+export interface ProposalCanonicalV3 extends Omit<ProposalCanonicalV2, "version"> {
+  version: typeof PROPOSAL_CANONICAL_V3_VERSION;
+  finalPlanCandidate: FinalPlanCandidateBinding;
 }
 
 /** The shared non-version fields of a proposal canonical. */
@@ -126,8 +147,26 @@ export function buildProposalCanonical(input: CanonicalBase & { requiredEvidence
   };
 }
 
+/**
+ * The Phase-13 builder — the ONLY legal construction path of a final_plan
+ * proposal canonical. Server-generated inside request_finalization; the model
+ * can never prepare one (§38).
+ */
+export function buildFinalPlanProposalCanonical(
+  input: CanonicalBase & {
+    requiredEvidence?: ProposalEvidenceRef[];
+    finalPlanCandidate: FinalPlanCandidateBinding;
+  },
+): ProposalCanonicalV3 {
+  return {
+    ...buildProposalCanonical(input),
+    version: PROPOSAL_CANONICAL_V3_VERSION,
+    finalPlanCandidate: { ...input.finalPlanCandidate },
+  };
+}
+
 /** `sha256:<lowercase hex>` over the canonical serialization (§23). */
-export function canonicalProposalHash(canonical: ProposalCanonicalV1 | ProposalCanonicalV2): string {
+export function canonicalProposalHash(canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3): string {
   const digest = createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex");
   return `sha256:${digest}`;
 }
@@ -138,7 +177,7 @@ export function canonicalProposalHash(canonical: ProposalCanonicalV1 | ProposalC
  * V1 parses with requiredEvidence = [] — historical proposals NEVER gain
  * inferred evidence refs (§32); the refs table is the only V2 index.
  */
-export function parseProposalCanonical(value: unknown): ProposalCanonicalV1 | ProposalCanonicalV2 {
+export function parseProposalCanonical(value: unknown): ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3 {
   if (typeof value !== "object" || value === null) {
     throw new TypeError("proposal canonical must be a JSON object");
   }
@@ -155,10 +194,29 @@ export function parseProposalCanonical(value: unknown): ProposalCanonicalV1 | Pr
     }
     return raw as unknown as ProposalCanonicalV2;
   }
+  if (raw.version === PROPOSAL_CANONICAL_V3_VERSION) {
+    if (!Array.isArray(raw.requiredEvidence)) {
+      throw new TypeError("proposal canonical V3 requires a requiredEvidence array");
+    }
+    const binding = raw.finalPlanCandidate as Record<string, unknown> | undefined;
+    if (
+      typeof binding !== "object" ||
+      binding === null ||
+      typeof binding.candidateId !== "string" ||
+      binding.candidateId === "" ||
+      typeof binding.candidateHash !== "string" ||
+      !binding.candidateHash.startsWith("sha256:")
+    ) {
+      throw new TypeError("proposal canonical V3 requires a finalPlanCandidate {candidateId, candidateHash} binding");
+    }
+    return raw as unknown as ProposalCanonicalV3;
+  }
   throw new TypeError("proposal canonical version marker mismatch");
 }
 
 /** The exact requiredEvidence set of a parsed canonical (V1 → [], §32). */
-export function requiredEvidenceOf(canonical: ProposalCanonicalV1 | ProposalCanonicalV2): ProposalEvidenceRef[] {
-  return canonical.version === PROPOSAL_CANONICAL_VERSION ? canonical.requiredEvidence : [];
+export function requiredEvidenceOf(
+  canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3,
+): ProposalEvidenceRef[] {
+  return canonical.version === PROPOSAL_CANONICAL_V1_VERSION ? [] : canonical.requiredEvidence;
 }

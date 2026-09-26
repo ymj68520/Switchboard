@@ -7,13 +7,14 @@
  * frozen bundle (input + manifest + report) available at stage
  * synthesis/validation to the main agent AND the validator subagent alike
  * (the authority difference lives in submit_validation's caller attestation,
- * never in read permissions).
+ * never in read permissions); Phase 13 §43 adds "final" — the FinalPlanCandidate
+ * world (candidate + audit + exact final Proposal) at stage final.
  *
  * read_memory: fixed finite detail levels over EXACT MemoryRefs (§24) — no
  * latest/current/fuzzy shortcut exists.
  */
 
-export const CONTEXT_DETAILS = ["recovery", "current", "validation"] as const;
+export const CONTEXT_DETAILS = ["recovery", "current", "validation", "final"] as const;
 export type ContextDetail = (typeof CONTEXT_DETAILS)[number];
 
 export const MEMORY_DETAIL_LEVELS = ["identity", "summary", "full", "contract"] as const;

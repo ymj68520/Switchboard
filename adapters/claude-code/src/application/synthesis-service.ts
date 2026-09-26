@@ -44,7 +44,12 @@ import { runStateError } from "../store/planning-runs.js";
 import { getHeadPairInTx } from "../store/plan-commits.js";
 import { getSnapshotRefsInTx } from "../store/plan-memory.js";
 import { assertWritableBindingInTx } from "../store/session-bindings.js";
-import { getProposalRevisionInTx } from "../store/proposals.js";
+import {
+  getProposalRevisionInTx,
+  findAwaitingProposalStateInTx,
+  transitionProposalStateInTx,
+} from "../store/proposals.js";
+import { getFinalPlanInTx } from "../store/finalization.js";
 import {
   getLatestSynthesisInputInTx,
   getSynthesisManifestByInputInTx,
@@ -86,7 +91,8 @@ type SynthesisErrorCode =
   | "VALIDATION_REPORT_INVALID"
   | "VALIDATION_STALE"
   | "VALIDATION_ALREADY_SUBMITTED"
-  | "REOPEN_REQUEST_INVALID";
+  | "REOPEN_REQUEST_INVALID"
+  | "FINAL_PLAN_ALREADY_APPROVED";
 
 function synthesisError(code: SynthesisErrorCode, message: string, detail?: Record<string, unknown>): RuntimeError {
   return new RuntimeError(code, message, { detail });
@@ -167,8 +173,11 @@ function bumpRunStageInTx(
  * completion Proposal requiredEvidence; plus the recursive exact upstream
  * closure of every collected Evidence revision. No claims are scanned and no
  * run-wide "latest evidence" inference is allowed (§22).
+ *
+ * Exported for the Phase 13 finalization audit, which must re-verify that
+ * this deterministic reachability still equals the frozen input scope (§7).
  */
-function listRelevantEvidenceInTx(
+export function listRelevantEvidenceInTx(
   tx: StoreTx,
   runId: string,
   baseRefs: MemoryRef[],
@@ -919,11 +928,13 @@ export function createSynthesisService(store: PlanStore, clock: StoreClock) {
     },
 
     /**
-     * §59–§67 — reopen the run from synthesis/validation back into the
+     * §59–§67 — reopen the run from synthesis/validation/final back into the
      * normal design workflow. Main-agent-only, no formal approval, moves the
      * stage and run revision exactly once and derives the Section review
      * policy; never mutates Plan Memory and never touches the historical
-     * input/manifest/report records.
+     * input/manifest/report/candidate records. From final (Phase 13 §65) the
+     * reopen is legal ONLY before FinalPlan approval (§67) and atomically
+     * supersedes the awaiting final Proposal (§66).
      */
     requestReopen(input: RequestReopenInput): RequestReopenResult {
       return store.withWrite((tx) => {
@@ -953,11 +964,19 @@ export function createSynthesisService(store: PlanStore, clock: StoreClock) {
             { agentType: input.callerAgent.agentType },
           );
         }
-        // §60 — synthesis/validation are the only reopen origins.
-        if (run.stage !== "synthesis" && run.stage !== "validation") {
-          throw synthesisError("REOPEN_REQUEST_INVALID", `request_reopen operates only from synthesis/validation (run is at '${run.stage}')`, {
+        // §60/§65 — synthesis/validation/final are the reopen origins.
+        if (run.stage !== "synthesis" && run.stage !== "validation" && run.stage !== "final") {
+          throw synthesisError("REOPEN_REQUEST_INVALID", `request_reopen operates only from synthesis/validation/final (run is at '${run.stage}')`, {
             stage: run.stage,
           });
+        }
+        // §67 — once the FinalPlan is approved, Phase 14 owns the boundary.
+        if (run.stage === "final" && getFinalPlanInTx(tx, input.runId) !== null) {
+          throw synthesisError(
+            "FINAL_PLAN_ALREADY_APPROVED",
+            "the FinalPlan is approved; the run can no longer be reopened",
+            { runId: input.runId },
+          );
         }
         if (input.target !== "detail" && input.target !== "architecture") {
           throw synthesisError("REOPEN_REQUEST_INVALID", `reopen target must be detail or architecture (got '${String(input.target)}')`, {
@@ -1028,6 +1047,26 @@ export function createSynthesisService(store: PlanStore, clock: StoreClock) {
             affected = [...completed];
           }
         }
+        // §66 — reopening final while the Final Proposal is still awaiting
+        // atomically supersedes it; the Candidate/Audit history is preserved
+        // (immutable records, never deleted). A later cycle freezes a NEW
+        // candidate (§68).
+        if (run.stage === "final") {
+          const awaiting = findAwaitingProposalStateInTx(tx, input.runId);
+          if (awaiting !== null) {
+            const superseded = transitionProposalStateInTx(
+              tx,
+              { runId: input.runId, proposalId: awaiting.proposalId, revision: awaiting.revision, to: "superseded" },
+              clock.nowIso(),
+            );
+            if (!superseded) {
+              throw synthesisError("REOPEN_REQUEST_INVALID", "the awaiting final proposal could not be superseded", {
+                proposalId: awaiting.proposalId,
+              });
+            }
+          }
+        }
+
         for (const sectionId of affected) {
           transitionSectionWorkflowInTx(
             tx,

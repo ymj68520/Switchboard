@@ -109,15 +109,23 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "approve_proposal" ||
     logical === "submit_synthesis" ||
     logical === "submit_validation" ||
-    logical === "request_reopen"
+    logical === "request_reopen" ||
+    logical === "request_finalization"
   );
 }
 
 /**
- * Phase 12 §6–§7 — the capability family signed with V2 envelopes (optional
- * agent attestation). Everything else keeps byte-identical V1 contexts.
+ * Phase 12 §6–§7 / Phase 13 — the capability family signed with V2 envelopes
+ * (optional agent attestation). request_finalization joins so the validator
+ * can be denied by attestation (§26/E4); everything else keeps byte-identical
+ * V1 contexts.
  */
-const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>(["submit_synthesis", "submit_validation", "request_reopen"]);
+const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>([
+  "submit_synthesis",
+  "submit_validation",
+  "request_reopen",
+  "request_finalization",
+]);
 
 // ---------------------------------------------------------------------------
 // SessionStart (directive §36/§37)
@@ -431,12 +439,12 @@ async function handlePhasePlanPreToolUse(
   }
 
   // approve_proposal, promote_evidence, revalidate_evidence, select_section,
-  // prepare_proposal, submit_synthesis, submit_validation, and request_reopen
-  // require an owned active run for their write contexts; reads
-  // (get_state/get_context/read_memory/list_observations) degrade to a
-  // run-less outcome: nothing is signed, so the MCP layer fails closed and
-  // never reaches a workspace-wide run selection (Phase 8 §40/§41 — no
-  // auto-takeover).
+  // prepare_proposal, submit_synthesis, submit_validation, request_reopen,
+  // and request_finalization require an owned active run for their write
+  // contexts; reads (get_state/get_context/read_memory/list_observations)
+  // degrade to a run-less outcome: nothing is signed, so the MCP layer fails
+  // closed and never reaches a workspace-wide run selection (Phase 8 §40/§41 —
+  // no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
     if (
@@ -447,7 +455,8 @@ async function handlePhasePlanPreToolUse(
       logical === "prepare_proposal" ||
       logical === "submit_synthesis" ||
       logical === "submit_validation" ||
-      logical === "request_reopen"
+      logical === "request_reopen" ||
+      logical === "request_finalization"
     ) {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
@@ -473,7 +482,8 @@ async function handlePhasePlanPreToolUse(
     logical === "prepare_proposal" ||
     logical === "submit_synthesis" ||
     logical === "submit_validation" ||
-    logical === "request_reopen";
+    logical === "request_reopen" ||
+    logical === "request_finalization";
   if (isMutationTool && !cwdInsideWorkspace(input.cwd, workspace)) {
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }

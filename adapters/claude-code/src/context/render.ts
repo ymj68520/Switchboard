@@ -11,7 +11,7 @@
 
 import type { PhasePlanContext } from "./types.js";
 
-export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v3]";
+export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v4]";
 
 /** One named capsule section with its budget priority. */
 export interface CapsuleSegment {
@@ -200,6 +200,46 @@ export function semanticValidationSegment(context: PhasePlanContext): CapsuleSeg
       indent([`report=${validation.reportId}`, "clean=false", "findings:", indent(counts)]),
     ].join("\n"),
   };
+}
+
+/**
+ * §64 — the final-stage recovery lines. Awaiting approval: finalization
+ * passed + candidate identity + awaiting final Proposal. Approved: Final Plan
+ * approved + handoff authorized + handoff NOT yet delivered. Never tells the
+ * model "planning completed" or "build started" (§64) — the run stays active
+ * at stage final and Plan Mode remains on.
+ */
+export function finalizationSegment(context: PhasePlanContext): CapsuleSegment {
+  const finalization = context.finalization;
+  if (finalization === null) {
+    return { name: "finalization", required: false, text: "Finalization: (not at final stage)" };
+  }
+  if (finalization.finalPlan !== null) {
+    return {
+      name: "finalization",
+      required: true,
+      text: [
+        "Finalization:",
+        indent([
+          `Final Plan approved: ${finalization.finalPlan.finalPlanId} (${finalization.finalPlan.hash})`,
+          "Handoff authorized.",
+          "Execution handoff has not yet been delivered.",
+        ]),
+      ].join("\n"),
+    };
+  }
+  const lines = ["Finalization:", indent(["Finalization passed."])];
+  if (finalization.candidate !== null) {
+    lines.push(indent([`Final Plan Candidate: ${finalization.candidate.candidateId} (${finalization.candidate.candidateHash})`]));
+  }
+  if (finalization.finalProposal !== null) {
+    lines.push(
+      indent([
+        `Final Proposal: awaiting approval — ${finalization.finalProposal.proposalId}@${finalization.finalProposal.revision} (${finalization.finalProposal.hash})`,
+      ]),
+    );
+  }
+  return { name: "finalization", required: true, text: lines.join("\n") };
 }
 
 export function blockingSegment(context: PhasePlanContext): CapsuleSegment {

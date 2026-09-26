@@ -56,7 +56,7 @@ export function availableOperations(
     operations.push("submit_synthesis", "request_reopen");
   }
   if (run.stage === "validation") {
-    operations.push("request_reopen");
+    operations.push("request_reopen", "request_finalization");
   }
   if (awaitingProposal !== null) {
     operations.push("approve_proposal");
@@ -168,6 +168,20 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
     }
   }
 
+  // §62 — the finalization world (final stage only): candidate + audit +
+  // final Proposal + approved FinalPlan + the derived handoff authorization.
+  let finalization: import("./types.js").ContextFinalization | null = null;
+  if (run.stage === "final") {
+    const world = source.getFinalizationForRun(runId);
+    finalization = {
+      candidate: world?.candidate ?? null,
+      evidenceAudit: world?.evidenceAudit ?? null,
+      finalProposal: world?.finalProposal ?? null,
+      finalPlan: world?.finalPlan ?? null,
+      handoffAuthorized: world?.finalPlan != null,
+    };
+  }
+
   const epoch = deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -190,11 +204,27 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
       synthesisManifest === null ? null : { manifestId: synthesisManifest.manifestId, manifestHash: synthesisManifest.manifestHash },
     semanticValidation:
       semanticValidation === null ? null : { reportId: semanticValidation.reportId, reportHash: semanticValidation.reportHash },
+    // §63 — finalization identity joined the epoch inputs.
+    finalization: {
+      candidate:
+        finalization === null || finalization.candidate === null
+          ? null
+          : { candidateId: finalization.candidate.candidateId, candidateHash: finalization.candidate.candidateHash },
+      finalProposal:
+        finalization === null || finalization.finalProposal === null
+          ? null
+          : {
+              id: finalization.finalProposal.proposalId,
+              revision: finalization.finalProposal.revision,
+              hash: finalization.finalProposal.hash,
+            },
+      finalPlan: finalization === null ? null : finalization.finalPlan,
+    },
   });
   return {
-    version: 3,
+    version: 4,
     epoch,
-    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 3 },
+    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 4 },
     run,
     head,
     globalMemory,
@@ -204,6 +234,7 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
     synthesis,
     synthesisManifest,
     semanticValidation,
+    finalization,
     working: { awaitingProposal },
     operations: availableOperations(run, awaitingProposal),
     // §44 — internal provenance (all planning-domain facts, no secrets).
