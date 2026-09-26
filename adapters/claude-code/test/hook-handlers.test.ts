@@ -88,7 +88,7 @@ describe("SessionStart (§36/§37; Phase 8 §29)", () => {
       const payload = (output as { kind: "json"; payload: Record<string, unknown> }).payload;
       const context = (payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
       expect(context).toContain("Phase Plan active:");
-      expect(context).toContain("[Phase Plan Recovery v2]");
+      expect(context).toContain("[Phase Plan Recovery v3]");
       expect(context).toContain(`id=${h.fixture.runId}`);
       expect(context).toContain("stage=architecture");
       expect(context).toContain("commit=none");

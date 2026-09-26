@@ -1,6 +1,6 @@
 /**
  * Phase 11 §83 — Context v2 projection: active Section, workflow statuses,
- * direct dependency contracts only, the context-epoch:v2 evolution (§19/§20),
+ * direct dependency contracts only, the context-epoch:v3 evolution (§19/§20),
  * and deterministic Recovery Capsule restoration after resume/compact (§52).
  */
 
@@ -74,7 +74,7 @@ describe("context v2 (§83)", () => {
       const [, , c] = sectionIds as [string, string, string];
       selectOnFixture(f, c);
       const context = assembleContext(createStoreContextSource(f.store), f.runId);
-      expect(context.version).toBe(2);
+      expect(context.version).toBe(3);
       // Active scope resolved against current HEAD (§11).
       expect(context.activeScope).toMatchObject({
         kind: "section",
@@ -106,7 +106,7 @@ describe("context v2 (§83)", () => {
     try {
       const source = createStoreContextSource(f.store);
       const epoch0 = assembleContext(source, f.runId).epoch;
-      expect(epoch0).toMatch(/^context-epoch:v2:[0-9a-f]{64}$/);
+      expect(epoch0).toMatch(/^context-epoch:v3:[0-9a-f]{64}$/);
       const { sectionIds } = commitSectionDag(f, [{ title: "A" }, { title: "B" }]);
       const [a, b] = sectionIds as [string, string];
       const epochAfterDag = assembleContext(source, f.runId).epoch;
@@ -195,7 +195,7 @@ describe("context v2 (§83)", () => {
       const capsuleB = buildRecoveryCapsule(assembleContext(createStoreContextSource(f.store), f.runId));
       // Byte-identical re-render after a simulated compact/resume cycle.
       expect(capsuleB.text).toBe(capsuleA.text);
-      expect(capsuleA.text).toContain("[Phase Plan Recovery v2]");
+      expect(capsuleA.text).toContain("[Phase Plan Recovery v3]");
       expect(capsuleA.text).toContain(`Active scope: section ${c}@1 (open)`);
       expect(capsuleA.text).toContain("Section workflow:");
       expect(capsuleA.text).toContain("needs_review");

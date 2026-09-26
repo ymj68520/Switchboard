@@ -35,6 +35,7 @@ import { makeTestUserAuthorization } from "./proposal-helpers.js";
 const liveRoot = process.env.PHASE_PLAN_LIVE_STORE;
 const tag = process.env.PHASE_PLAN_LIVE_FIXTURE_TAG ?? "1";
 const phase8 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase8";
+const phase12 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase12";
 const phase10 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10";
 const phase10Revise = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10-revise";
 const d = liveRoot === undefined ? describe.skip : describe;
@@ -167,6 +168,154 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
           })}`,
         );
         expect(prepared.proposal.proposalId).toBeTruthy();
+        return;
+      }
+
+      if (phase12) {
+        // Phase 12 §100 fixture: drive the live run through the REAL domain
+        // path (Discovery bridge → architecture → detail → section
+        // completions) until the LAST completion freezes the SynthesisInput
+        // and advances the run to stage synthesis. Test authorization only.
+        const engine = createPlanCommitEngine(store, clock);
+        const sectionWorkflow = await import("../src/application/section-workflow-service.js");
+        const commit = (proposal: { proposalId: string; proposalId2?: never; revision: number; proposalHash: string }) => {
+          const result = engine.commitAuthorizedProposal({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            authorization: {
+              authorizationRequestId: `live-phase12-${proposal.proposalId}-${proposal.revision}`,
+              proposalId: proposal.proposalId,
+              proposalRevision: proposal.revision,
+              proposalHash: proposal.proposalHash,
+            },
+          });
+          revision = result.runRevision ?? revision;
+          return result;
+        };
+        const prepare = (input: Parameters<typeof proposals.prepareProposal>[0]) => proposals.prepareProposal(input);
+
+        // Discovery → Architecture: the Phase 11 §24 atomic prepare bridge.
+        const archContent = {
+          summary: "Phase 12 live architecture",
+          components: ["PlanningHarness"],
+          boundaries: ["plugin data dir"],
+          dataFlows: [],
+          principles: [],
+          unresolvedQuestionRefs: [],
+          decisionRefs: [],
+        };
+        const archCheckpoint = prepare({
+          runId: current!.runId,
+          workspaceId: current!.workspaceId,
+          sessionId: current!.sessionId,
+          bindingGeneration: current!.generation,
+          expectedRunRevision: revision,
+          type: "design_checkpoint",
+          scope: { kind: "architecture" },
+          title: "Phase 12 live architecture checkpoint",
+          summary: "live fixture architecture",
+          changes: [{ op: "SET_ARCHITECTURE_REVISION" as const, target: null, content: archContent, compactProjection: "ARCH-live@1" }],
+        });
+        commit(archCheckpoint.proposal);
+        const archCompletion = prepare({
+          runId: current!.runId,
+          workspaceId: current!.workspaceId,
+          sessionId: current!.sessionId,
+          bindingGeneration: current!.generation,
+          expectedRunRevision: revision,
+          type: "architecture_completion",
+          scope: { kind: "architecture" },
+          title: "Phase 12 live architecture completion",
+          summary: "architecture is stable",
+          changes: [],
+        });
+        commit(archCompletion.proposal);
+
+        // Detail: one two-section DAG (independent sections).
+        const sectionContent = (title: string) => ({
+          title,
+          objective: `${title} objective`,
+          design: `${title} design`,
+          interfaces: [],
+          invariants: [],
+          failureModes: [],
+          dependencies: [],
+          decisionRefs: [],
+          openQuestionRefs: [],
+          impactRefs: [],
+          contract: { provides: [], requires: [], invariants: [], interfaces: [], decisions: [] },
+        });
+        const dag = prepare({
+          runId: current!.runId,
+          workspaceId: current!.workspaceId,
+          sessionId: current!.sessionId,
+          bindingGeneration: current!.generation,
+          expectedRunRevision: revision,
+          type: "design_checkpoint",
+          scope: { kind: "detail" },
+          title: "Phase 12 live section DAG",
+          summary: "two sections",
+          changes: (["Alpha", "Beta"] as const).map((title) => ({
+            op: "SET_SECTION_REVISION" as const,
+            target: null,
+            content: sectionContent(`Live ${title}`),
+            compactProjection: `section:${title}`,
+          })),
+        });
+        commit(dag.proposal);
+        const sectionIds = [...new Set(dag.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
+
+        // Select + complete each section; the LAST completion reaches
+        // DETAIL_COMPLETE and freezes the SynthesisInput (§18).
+        for (const sectionId of sectionIds) {
+          sectionWorkflow.createSectionWorkflowService(store, clock).selectSection({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            expectedRunRevision: revision,
+            sectionId,
+          });
+          const afterSelect = store.withRead((tx) => tx.prepare("SELECT revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { r: number });
+          revision = afterSelect.r;
+          const completion = prepare({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            expectedRunRevision: revision,
+            type: "section_completion",
+            scope: { kind: "section", sectionId },
+            title: `Complete ${sectionId}`,
+            summary: "live phase 12 completion",
+            changes: [{ op: "COMPLETE_SECTION" as const, sectionId, compactProjection: `complete:${sectionId}@1` }],
+          });
+          commit(completion.proposal);
+        }
+
+        const finalRun = store.withRead((tx) => tx.prepare("SELECT stage AS s, revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { s: string; r: number });
+        const input = store.withRead((tx) =>
+          tx.prepare("SELECT input_id AS inputId, input_hash AS inputHash, input_seq AS seq FROM synthesis_inputs WHERE run_id = ? ORDER BY input_seq DESC LIMIT 1").get(current!.runId),
+        ) as { inputId: string; inputHash: string; seq: number } | undefined;
+        expect(finalRun.s).toBe("synthesis");
+        expect(input).toBeDefined();
+        const context = assembleContext(createStoreContextSource(store), current!.runId);
+        console.log(
+          `LIVE_FIXTURE ${JSON.stringify({
+            mode: "phase12",
+            runId: current!.runId,
+            stage: finalRun.s,
+            runRevision: finalRun.r,
+            inputId: input!.inputId,
+            inputHash: input!.inputHash,
+            inputSeq: input!.seq,
+            sectionIds,
+            epoch: context.epoch,
+            capsule: buildRecoveryCapsule(context).text,
+          })}`,
+        );
         return;
       }
 

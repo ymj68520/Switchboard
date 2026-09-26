@@ -104,6 +104,9 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
       "select_section",
       "prepare_proposal",
       "approve_proposal",
+      "submit_synthesis",
+      "submit_validation",
+      "request_reopen",
     ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
     expect(approve._meta).toBe(REQUIRES_USER_INTERACTION_META);
@@ -116,7 +119,7 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
     );
     // no Phase-12+ surfaces and no raw state setters (Phase 11 §74)
     const joinedTools = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
-    for (const banned of ["submit_synthesis", "submit_validation", "request_finalization", "handoff", "takeover_run", "abort_run", "set_section_status", "set_active_work"]) {
+    for (const banned of ["request_finalization", "handoff", "takeover_run", "abort_run", "set_section_status", "set_active_work"]) {
       expect(joinedTools).not.toContain(banned);
     }
   });
@@ -536,7 +539,7 @@ describe("approve_proposal → Phase 6 engine (E28–E35, E55–E59)", () => {
 });
 
 describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61: v6; Phase 10 §4: v7)", () => {
-  it("entry + approve leave PRAGMA user_version == 5", async () => {
+  it("entry + approve leave PRAGMA user_version at the supported schema version", async () => {
     const h = await makeToolHarness();
     try {
       executePhasePlanTool(h.ctx, "start_or_resume", {
@@ -556,7 +559,7 @@ describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61:
       const raw = rawConnection(storePathsFor(h.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(8);
+        expect(Object.values(row)[0]).toBe(9);
       } finally {
         raw.close();
       }

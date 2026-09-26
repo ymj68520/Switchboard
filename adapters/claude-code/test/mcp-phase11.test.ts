@@ -119,6 +119,9 @@ describe("Phase 11 MCP surface (§74)", () => {
       "select_section",
       "prepare_proposal",
       "approve_proposal",
+      "submit_synthesis",
+      "submit_validation",
+      "request_reopen",
     ]);
     const select = PHASE_PLAN_TOOLS.find((tool) => tool.name === "select_section")!;
     expect(Object.keys(select.inputSchema.properties as Record<string, unknown>).sort()).toEqual(["_hostContext", "section_id"]);

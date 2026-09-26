@@ -69,6 +69,15 @@ async function makeSchema7World(): Promise<ContextFixture> {
 function rewindToSchema7(root: string): void {
   const db = rawConnection(storePathsFor(root).databasePath, 5000);
   try {
+    // Phase 12: rewind must also remove the v9 synthesis/validation objects
+    // (children first; each table owns its no_update/no_delete triggers).
+    for (const table of ["synthesis_manifest_refs", "synthesis_manifests", "semantic_validation_findings", "semantic_validation_reports", "synthesis_input_refs", "synthesis_input_evidence", "synthesis_inputs"]) {
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    db.exec("DROP INDEX IF EXISTS idx_synthesis_inputs_run");
+    db.exec("DROP INDEX IF EXISTS idx_synthesis_manifests_input");
+    db.exec("DROP INDEX IF EXISTS idx_validation_reports_manifest");
+
     db.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_update");
     db.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_delete");
     db.exec("DROP TRIGGER IF EXISTS section_workflow_states_no_delete");
@@ -93,7 +102,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(8);
+        expect(store.getSchemaVersion()).toBe(9);
         const read = (sql: string, ...params: unknown[]): unknown =>
           store.withRead((tx) => tx.prepare(sql).get(...params)) as Record<string, unknown>;
         // Old rows survive EXACTLY.
@@ -116,9 +125,9 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
         const history = store
           .withRead((tx) => tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
           .map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
         expect(publishedBackups(backupsDir)).toHaveLength(1);
-        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-8-/);
+        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-9-/);
       } finally {
         store.close();
       }
@@ -138,7 +147,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       (failing as unknown as { apply: () => never }).apply = (() => {
         throw new Error("injected 008 failure");
       }) as never;
-      const registry = [...production.filter((m) => m.to < 8), failing];
+      const registry = [...production.filter((m) => m.to < 8), failing, ...production.filter((m) => m.to > 8)];
       await expect(initializePlanStore({ pluginDataRoot: root, migrations: registry })).rejects.toMatchObject({
         code: "STORE_MIGRATION_FAILED",
         causeText: expect.stringContaining("injected 008 failure"),
@@ -162,7 +171,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       rewindToSchema7(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(8);
+        expect(store.getSchemaVersion()).toBe(9);
         const { assertWriteCompat } = await import("../src/store/transaction.js");
         let writeRan = false;
         expect(() =>
