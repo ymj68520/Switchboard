@@ -35,6 +35,8 @@ import { makeTestUserAuthorization } from "./proposal-helpers.js";
 const liveRoot = process.env.PHASE_PLAN_LIVE_STORE;
 const tag = process.env.PHASE_PLAN_LIVE_FIXTURE_TAG ?? "1";
 const phase8 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase8";
+const phase10 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10";
+const phase10Revise = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10-revise";
 const d = liveRoot === undefined ? describe.skip : describe;
 
 d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
@@ -88,6 +90,85 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
           summary: "Prepared by the live-host validation fixture.",
           changes,
         });
+
+      if (phase10 || phase10Revise) {
+        // Phase 10 §68/§69 fixture: prepare (or revise) a ProposalCanonicalV2
+        // whose exact requiredEvidence is the live-promoted critical Evidence
+        // revision — the gate then runs inside the REAL approve_proposal.
+        const evidenceRef = JSON.parse(process.env.PHASE_PLAN_LIVE_EVIDENCE_REF!) as {
+          evidenceId: string;
+          revision: number;
+        };
+        expect(evidenceRef.evidenceId).toMatch(/^ev_/);
+        const changes = [
+          {
+            op: "ADD_DECISION",
+            content: {
+              title: `Live Phase 10 gate decision ${phase10Revise ? "r2" : "r1"} ${tag}`,
+              statement: "Decision frozen against the exact evidence revision named in requiredEvidence.",
+              rationale: "phase 10 live gate validation",
+              alternatives: ["none"],
+              consequences: ["commit blocked unless critical evidence is fresh"],
+              scope: "validation",
+              supportingRefs: [],
+            },
+            compactProjection: `live-gate-${phase10Revise ? "r2" : "r1"}-${tag}`,
+          },
+        ];
+        const proposalService = createProposalService(store, clock);
+        let prepared;
+        if (phase10Revise) {
+          const awaiting = store.withRead(
+            (tx) =>
+              tx
+                .prepare(
+                  "SELECT proposal_id AS proposalId, revision AS revision FROM proposal_states WHERE run_id = ? AND status = 'awaiting_approval' LIMIT 1",
+                )
+                .get(current!.runId),
+          ) as { proposalId: string; revision: number } | undefined;
+          expect(awaiting).toBeDefined();
+          prepared = proposalService.reviseProposal({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            expectedRunRevision: revision,
+            proposalId: awaiting!.proposalId,
+            type: "design_checkpoint",
+            scope: { kind: "architecture" },
+            title: `Live Phase 10 gate proposal (revised) ${tag}`,
+            summary: "Revised by the live fixture to reference the fresh replacement evidence revision.",
+            changes,
+            requiredEvidence: [evidenceRef],
+          });
+        } else {
+          prepared = proposalService.prepareProposal({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            expectedRunRevision: revision,
+            type: "design_checkpoint",
+            scope: { kind: "architecture" },
+            title: `Live Phase 10 gate proposal ${tag}`,
+            summary: "Prepared by the live fixture against the exact promoted evidence revision.",
+            changes,
+            requiredEvidence: [evidenceRef],
+          });
+        }
+        console.log(
+          `LIVE_FIXTURE ${JSON.stringify({
+            mode: phase10 ? "phase10" : "phase10-revise",
+            runId: current!.runId,
+            proposalId: prepared.proposal.proposalId,
+            proposalRevision: prepared.proposal.revision,
+            proposalHash: prepared.proposal.proposalHash,
+            requiredEvidence: [evidenceRef],
+          })}`,
+        );
+        expect(prepared.proposal.proposalId).toBeTruthy();
+        return;
+      }
 
       if (phase8) {
         // Phase 8 §58 fixture: one COMMITTED hard constraint (engine commit
