@@ -33,6 +33,9 @@ import {
   runSegment,
   sectionsSegment,
   sectionWorkflowSegment,
+  semanticValidationSegment,
+  synthesisManifestSegment,
+  synthesisSegment,
   type CapsuleSegment,
 } from "./render.js";
 
@@ -54,7 +57,7 @@ export interface RecoveryCapsule {
   epoch: string;
 }
 
-/** Segment display order (§17 sketch + Phase 11 §50); budget priority rides on `required`. */
+/** Segment display order (§17 sketch + Phase 11 §50 + Phase 12 §31); budget priority rides on `required`. */
 function capsuleSegments(context: PhasePlanContext): CapsuleSegment[] {
   return [
     runSegment(context),
@@ -64,6 +67,9 @@ function capsuleSegments(context: PhasePlanContext): CapsuleSegment[] {
     activeScopeSegment(context),
     sectionWorkflowSegment(context),
     dependencyContractsSegment(context),
+    synthesisSegment(context),
+    synthesisManifestSegment(context),
+    semanticValidationSegment(context),
     blockingSegment(context),
     awaitingProposalSegment(context),
     sectionsSegment(context),

@@ -35,7 +35,7 @@ import type {
 
 export type { ContextSource } from "./types.js";
 
-/** L5 — operations logically available under the current state (§27/§53). */
+/** L5 — operations logically available under the current state (§27/§73/§74). */
 export function availableOperations(
   run: ContextRunState,
   awaitingProposal: ContextAwaitingProposal | null,
@@ -43,13 +43,20 @@ export function availableOperations(
   // The tool surface is fixed per phase; approve_proposal joins only while a
   // proposal is actually awaiting approval, select_section only exists in the
   // Detail workflow, prepare_proposal only where preparation is a legal
-  // capability. Unimplemented future tools are never advertised (§27).
+  // capability, and the synthesis/validation capabilities exist only in their
+  // stages (§73/§74). Unimplemented future tools are never advertised (§27).
   const operations: ContextOperation[] = ["get_state", "get_context", "read_memory", "start_or_resume"];
   if (run.stage === "discovery" || run.stage === "architecture" || run.stage === "detail") {
     operations.push("prepare_proposal");
   }
   if (run.stage === "detail") {
     operations.push("select_section");
+  }
+  if (run.stage === "synthesis") {
+    operations.push("submit_synthesis", "request_reopen");
+  }
+  if (run.stage === "validation") {
+    operations.push("request_reopen");
   }
   if (awaitingProposal !== null) {
     operations.push("approve_proposal");
@@ -140,6 +147,27 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
     activeDependencyContracts.sort((a, b) => (a.ref.id < b.ref.id ? -1 : a.ref.id > b.ref.id ? 1 : 0));
   }
 
+  // §29 — the frozen synthesis identity (synthesis/validation stages only).
+  let synthesis: import("./types.js").ContextSynthesis | null = null;
+  let synthesisManifest: import("./types.js").ContextSynthesisManifest | null = null;
+  let semanticValidation: import("./types.js").ContextSemanticValidation | null = null;
+  if (run.stage === "synthesis" || run.stage === "validation" || run.stage === "final") {
+    const input = source.getLatestSynthesisInput(runId);
+    if (input !== null) {
+      synthesis = {
+        inputId: input.inputId,
+        inputHash: input.inputHash,
+        baseHead: { snapshotId: input.baseHeadSnapshotId, commitId: input.baseHeadCommitId },
+        refCounts: { design: input.designRefCount, evidence: input.evidenceCount },
+      };
+      const manifest = source.getSynthesisManifestForInput(runId, input.inputId);
+      if (manifest !== null) {
+        synthesisManifest = manifest;
+        semanticValidation = source.getValidationReportForManifest(runId, manifest.manifestId);
+      }
+    }
+  }
+
   const epoch = deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -155,17 +183,27 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
       status: section.status,
       completedRevision: section.completedRevision ?? null,
     })),
+    // §30 — synthesis/validation identity joined the epoch inputs; raw
+    // Evidence freshness state still never enters it (§20/§30).
+    synthesis: synthesis === null ? null : { inputId: synthesis.inputId, inputHash: synthesis.inputHash },
+    synthesisManifest:
+      synthesisManifest === null ? null : { manifestId: synthesisManifest.manifestId, manifestHash: synthesisManifest.manifestHash },
+    semanticValidation:
+      semanticValidation === null ? null : { reportId: semanticValidation.reportId, reportHash: semanticValidation.reportHash },
   });
   return {
-    version: 2,
+    version: 3,
     epoch,
-    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 2 },
+    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 3 },
     run,
     head,
     globalMemory,
     activeScope,
     sectionWorkflow: { sections },
     activeDependencyContracts,
+    synthesis,
+    synthesisManifest,
+    semanticValidation,
     working: { awaitingProposal },
     operations: availableOperations(run, awaitingProposal),
     // §44 — internal provenance (all planning-domain facts, no secrets).

@@ -56,7 +56,9 @@ import {
 import {
   businessInputHashOf,
   encodeHostContextToken,
+  encodeHostContextTokenV2,
   buildHostContextEnvelope,
+  buildHostContextEnvelopeV2,
   logicalToolName,
   assertHostContextForTool,
   type HostContextLogicalTool,
@@ -104,9 +106,18 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "revalidate_evidence" ||
     logical === "select_section" ||
     logical === "prepare_proposal" ||
-    logical === "approve_proposal"
+    logical === "approve_proposal" ||
+    logical === "submit_synthesis" ||
+    logical === "submit_validation" ||
+    logical === "request_reopen"
   );
 }
+
+/**
+ * Phase 12 §6–§7 — the capability family signed with V2 envelopes (optional
+ * agent attestation). Everything else keeps byte-identical V1 contexts.
+ */
+const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>(["submit_synthesis", "submit_validation", "request_reopen"]);
 
 // ---------------------------------------------------------------------------
 // SessionStart (directive §36/§37)
@@ -420,11 +431,12 @@ async function handlePhasePlanPreToolUse(
   }
 
   // approve_proposal, promote_evidence, revalidate_evidence, select_section,
-  // and prepare_proposal require an owned active run for their write
-  // contexts; reads (get_state/get_context/read_memory/list_observations)
-  // degrade to a run-less outcome: nothing is signed, so the MCP layer fails
-  // closed and never reaches a workspace-wide run selection (Phase 8 §40/§41
-  // — no auto-takeover).
+  // prepare_proposal, submit_synthesis, submit_validation, and request_reopen
+  // require an owned active run for their write contexts; reads
+  // (get_state/get_context/read_memory/list_observations) degrade to a
+  // run-less outcome: nothing is signed, so the MCP layer fails closed and
+  // never reaches a workspace-wide run selection (Phase 8 §40/§41 — no
+  // auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
     if (
@@ -432,7 +444,10 @@ async function handlePhasePlanPreToolUse(
       logical === "promote_evidence" ||
       logical === "revalidate_evidence" ||
       logical === "select_section" ||
-      logical === "prepare_proposal"
+      logical === "prepare_proposal" ||
+      logical === "submit_synthesis" ||
+      logical === "submit_validation" ||
+      logical === "request_reopen"
     ) {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
@@ -455,14 +470,18 @@ async function handlePhasePlanPreToolUse(
     logical === "promote_evidence" ||
     logical === "revalidate_evidence" ||
     logical === "select_section" ||
-    logical === "prepare_proposal";
+    logical === "prepare_proposal" ||
+    logical === "submit_synthesis" ||
+    logical === "submit_validation" ||
+    logical === "request_reopen";
   if (isMutationTool && !cwdInsideWorkspace(input.cwd, workspace)) {
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }
-  // §29 — approve_proposal and prepare_proposal require the session to BE in
-  // Plan Mode before a mutation context is signed at all (§59). Read tools
-  // (§39) and evidence writes (§45) deliberately do NOT require plan mode.
-  if ((logical === "approve_proposal" || logical === "prepare_proposal") && input.permissionMode !== "plan") {
+  // §29 — approve_proposal, prepare_proposal, and submit_synthesis require the
+  // session to BE in Plan Mode before a mutation context is signed at all
+  // (§59). Read tools (§39), evidence writes (§45), and validator submissions
+  // (§52 — no approval is involved) deliberately do NOT require plan mode.
+  if ((logical === "approve_proposal" || logical === "prepare_proposal" || logical === "submit_synthesis") && input.permissionMode !== "plan") {
     return deny(
       eventName,
       "PLAN_MODE_REQUIRED",
@@ -470,20 +489,48 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
-  const hostToken = encodeHostContextToken(
-    deps.secret,
-    buildHostContextEnvelope({
-      sessionId: input.sessionId,
-      ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
-      workspaceId: attached.binding.workspaceId,
-      runId: attached.binding.runId,
-      bindingGeneration: attached.binding.generation,
-      permissionMode: input.permissionMode ?? "unknown",
-      toolUseId: input.toolUseId,
-      toolName: input.toolName,
-      businessInputHash: businessInputHashOf(toolInput),
-    }),
-  );
+  // Phase 12 §6–§7 — V2 envelopes for the validator/synthesis/reopen family
+  // fold in the host's subagent identity fields when present (probe: they
+  // appear ONLY on subagent calls; a main-session call attests itself by
+  // their absence). Everything else keeps the byte-identical V1 envelope.
+  const agent =
+    input.agentId === undefined && input.agentType === undefined
+      ? undefined
+      : {
+          ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+          ...(input.agentType === undefined ? {} : { agentType: input.agentType }),
+        };
+  const hostToken =
+    V2_ATTESTED_TOOLS.has(logical)
+      ? encodeHostContextTokenV2(
+          deps.secret,
+          buildHostContextEnvelopeV2({
+            sessionId: input.sessionId,
+            ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+            workspaceId: attached.binding.workspaceId,
+            runId: attached.binding.runId,
+            bindingGeneration: attached.binding.generation,
+            permissionMode: input.permissionMode ?? "unknown",
+            toolUseId: input.toolUseId,
+            toolName: input.toolName,
+            businessInputHash: businessInputHashOf(toolInput),
+            ...(agent === undefined ? {} : { agent }),
+          }),
+        )
+      : encodeHostContextToken(
+          deps.secret,
+          buildHostContextEnvelope({
+            sessionId: input.sessionId,
+            ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+            workspaceId: attached.binding.workspaceId,
+            runId: attached.binding.runId,
+            bindingGeneration: attached.binding.generation,
+            permissionMode: input.permissionMode ?? "unknown",
+            toolUseId: input.toolUseId,
+            toolName: input.toolName,
+            businessInputHash: businessInputHashOf(toolInput),
+          }),
+        );
   const updatedInput = { ...toolInput, _hostContext: hostToken };
   if (logical === "approve_proposal") {
     // §29 — never "allow": the mandatory human prompt must still happen.

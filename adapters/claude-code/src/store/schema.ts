@@ -189,6 +189,43 @@ const SCHEMA_V8_INDEXES = [
   "idx_section_workflow_events_section",
 ] as const;
 
+/** Synthesis/validation tables required once the store has reached v9 (Phase 12 §11). */
+const SCHEMA_V9_TABLES = [
+  "synthesis_inputs",
+  "synthesis_input_refs",
+  "synthesis_input_evidence",
+  "synthesis_manifests",
+  "synthesis_manifest_refs",
+  "semantic_validation_reports",
+  "semantic_validation_findings",
+] as const;
+
+/** Immutability triggers required once the store has reached v9: every
+ * synthesis/validation record is append-only history (§14/§36/§46). */
+const SCHEMA_V9_TRIGGERS = [
+  "synthesis_inputs_no_update",
+  "synthesis_inputs_no_delete",
+  "synthesis_input_refs_no_update",
+  "synthesis_input_refs_no_delete",
+  "synthesis_input_evidence_no_update",
+  "synthesis_input_evidence_no_delete",
+  "synthesis_manifests_no_update",
+  "synthesis_manifests_no_delete",
+  "synthesis_manifest_refs_no_update",
+  "synthesis_manifest_refs_no_delete",
+  "semantic_validation_reports_no_update",
+  "semantic_validation_reports_no_delete",
+  "semantic_validation_findings_no_update",
+  "semantic_validation_findings_no_delete",
+] as const;
+
+/** Constraint indexes backing the v9 synthesis/validation lookups. */
+const SCHEMA_V9_INDEXES = [
+  "idx_synthesis_inputs_run",
+  "idx_synthesis_manifests_input",
+  "idx_validation_reports_manifest",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -566,6 +603,172 @@ function validateSchemaV8(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural + data checks for schema v9 (Phase 12 §90): table/trigger/index
+ * presence plus the synthesis-domain identity facts — an input's base
+ * snapshot belongs to its run and its base commit produced exactly that
+ * snapshot, input refs are exact members of the base snapshot, manifests bind
+ * the exact input (hash included) and only cite input refs, reports bind the
+ * exact manifest/input, finding refs stay inside the frozen bundle, clean is
+ * exclusive, and the immutability triggers exist. Targeted LIMIT-1 queries —
+ * never a full-history replay at store open.
+ */
+function validateSchemaV9(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V9_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 9`);
+    }
+  }
+  for (const trigger of SCHEMA_V9_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 9`);
+    }
+  }
+  for (const index of SCHEMA_V9_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 9`);
+    }
+  }
+  if (SCHEMA_V9_TABLES.some((table) => !objectNames.has(table))) {
+    return; // further queries would just cascade errors
+  }
+  // The data-level checks below also read earlier base tables; when an
+  // earlier-version validator has already flagged those as missing, skip
+  // instead of cascading SQL errors.
+  const baseWorldPresent =
+    objectNames.has("plan_commits") && objectNames.has("snapshot_members") && objectNames.has("memory_revisions") && objectNames.has("evidence_revisions");
+  if (!baseWorldPresent) {
+    return;
+  }
+  // Input base commit must produce the input's base snapshot (§90).
+  const basePairDrift = db
+    .prepare(
+      "SELECT i.run_id AS runId, i.input_id AS inputId FROM synthesis_inputs i "
+      + "JOIN plan_commits c ON c.run_id = i.run_id AND c.commit_id = i.base_head_commit_id "
+      + "WHERE c.resulting_snapshot_id != i.base_head_snapshot_id LIMIT 1",
+    )
+    .get() as { runId?: string; inputId?: string } | undefined;
+  if (basePairDrift !== undefined) {
+    problems.push(
+      `synthesis input '${basePairDrift.inputId}' in run '${basePairDrift.runId}' has a base commit whose resulting snapshot is not the base snapshot`,
+    );
+  }
+  // Input refs must be exact members of the base snapshot (§16/§90).
+  const refOutsideSnapshot = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.input_id AS inputId, r.artifact_id AS artifactId FROM synthesis_input_refs r "
+      + "JOIN synthesis_inputs i ON i.run_id = r.run_id AND i.input_id = r.input_id "
+      + "WHERE NOT EXISTS (SELECT 1 FROM snapshot_members sm WHERE sm.snapshot_id = i.base_head_snapshot_id "
+      + "AND sm.run_id = r.run_id AND sm.kind = r.kind AND sm.artifact_id = r.artifact_id AND sm.revision = r.revision) LIMIT 1",
+    )
+    .get() as { runId?: string; inputId?: string; artifactId?: string } | undefined;
+  if (refOutsideSnapshot !== undefined) {
+    problems.push(
+      `synthesis input '${refOutsideSnapshot.inputId}' in run '${refOutsideSnapshot.runId}' references '${refOutsideSnapshot.artifactId}' outside its base snapshot`,
+    );
+  }
+  // A manifest must carry the exact input hash of its input (§35/§90).
+  const manifestHashDrift = db
+    .prepare(
+      "SELECT m.run_id AS runId, m.manifest_id AS manifestId FROM synthesis_manifests m "
+      + "JOIN synthesis_inputs i ON i.run_id = m.run_id AND i.input_id = m.input_id "
+      + "WHERE m.input_hash != i.input_hash LIMIT 1",
+    )
+    .get() as { runId?: string; manifestId?: string } | undefined;
+  if (manifestHashDrift !== undefined) {
+    problems.push(
+      `synthesis manifest '${manifestHashDrift.manifestId}' in run '${manifestHashDrift.runId}' does not bind its input's exact hash`,
+    );
+  }
+  // Manifest supporting refs must be a subset of the input refs (§38/§90).
+  const manifestRefOutsideInput = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.manifest_id AS manifestId, r.kind AS kind, r.artifact_id AS artifactId "
+      + "FROM synthesis_manifest_refs r JOIN synthesis_manifests m ON m.run_id = r.run_id AND m.manifest_id = r.manifest_id "
+      + "WHERE NOT EXISTS (SELECT 1 FROM synthesis_input_refs ir WHERE ir.run_id = r.run_id AND ir.input_id = m.input_id "
+      + "AND ir.kind = (CASE r.kind WHEN 'section_contract' THEN 'section' ELSE r.kind END) "
+      + "AND ir.artifact_id = r.artifact_id AND ir.revision = r.revision) "
+      + "AND NOT EXISTS (SELECT 1 FROM synthesis_input_evidence ie WHERE ie.run_id = r.run_id AND ie.input_id = m.input_id "
+      + "AND r.kind = 'evidence' AND ie.evidence_id = r.artifact_id AND ie.evidence_revision = r.revision) LIMIT 1",
+    )
+    .get() as { runId?: string; manifestId?: string; kind?: string; artifactId?: string } | undefined;
+  if (manifestRefOutsideInput !== undefined) {
+    problems.push(
+      `synthesis manifest '${manifestRefOutsideInput.manifestId}' in run '${manifestRefOutsideInput.runId}' cites '${manifestRefOutsideInput.artifactId}' (${manifestRefOutsideInput.kind}) outside its frozen input`,
+    );
+  }
+  // A report must reference the exact manifest AND the manifest's exact input
+  // with matching hashes (§46/§90).
+  const reportBindingDrift = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.report_id AS reportId FROM semantic_validation_reports r "
+      + "JOIN synthesis_manifests m ON m.run_id = r.run_id AND m.manifest_id = r.manifest_id "
+      + "WHERE r.input_id != m.input_id OR r.manifest_hash != m.manifest_hash "
+      + "OR r.input_hash != (SELECT i.input_hash FROM synthesis_inputs i WHERE i.run_id = r.run_id AND i.input_id = m.input_id) LIMIT 1",
+    )
+    .get() as { runId?: string; reportId?: string } | undefined;
+  if (reportBindingDrift !== undefined) {
+    problems.push(
+      `validation report '${reportBindingDrift.reportId}' in run '${reportBindingDrift.runId}' does not bind its manifest/input exactly`,
+    );
+  }
+  // Finding refs must belong to the frozen validation bundle (§37/§90) —
+  // subject and supporting refs alike. Refs are JSON projections
+  // ({kind,id,revision}); json_extract keeps the check inside SQL.
+  const findingRefQueries = [
+    "f.subject_refs_json",
+    "f.supporting_refs_json",
+  ];
+  for (const column of findingRefQueries) {
+    const findingRefOutsideBundle = db
+      .prepare(
+        `SELECT f.run_id AS runId, f.finding_id AS findingId, je.value AS ref FROM semantic_validation_findings f `
+        + `JOIN json_each(${column}) je WHERE json_valid(je.value) AND NOT EXISTS (`
+        + "SELECT 1 FROM semantic_validation_reports r JOIN synthesis_input_refs ir ON ir.run_id = r.run_id AND ir.input_id = r.input_id "
+        + "WHERE r.run_id = f.run_id AND r.report_id = f.report_id "
+        + "AND ir.kind = (CASE json_extract(je.value,'$.kind') WHEN 'section_contract' THEN 'section' ELSE json_extract(je.value,'$.kind') END) "
+        + "AND ir.artifact_id = json_extract(je.value,'$.id') AND ir.revision = json_extract(je.value,'$.revision') "
+        + ") AND NOT EXISTS ("
+        + "SELECT 1 FROM semantic_validation_reports r2 JOIN synthesis_input_evidence ie ON ie.run_id = r2.run_id AND ie.input_id = r2.input_id "
+        + "WHERE r2.run_id = f.run_id AND r2.report_id = f.report_id AND json_extract(je.value,'$.kind') = 'evidence' "
+        + "AND ie.evidence_id = json_extract(je.value,'$.id') AND ie.evidence_revision = json_extract(je.value,'$.revision') "
+        + ") LIMIT 1",
+      )
+      .get() as { runId?: string; findingId?: string; ref?: string } | undefined;
+    if (findingRefOutsideBundle !== undefined) {
+      problems.push(
+        `validation finding '${findingRefOutsideBundle.findingId}' in run '${findingRefOutsideBundle.runId}' cites a ref outside the frozen bundle (${column})`,
+      );
+    }
+  }
+  // clean exclusivity (§48): is_clean=1 ⇔ findings are exactly [clean].
+  const badCleanReport = db
+    .prepare(
+      "SELECT r.run_id AS runId, r.report_id AS reportId FROM semantic_validation_reports r "
+      + "WHERE (r.is_clean = 1 AND ((SELECT COUNT(*) FROM semantic_validation_findings f "
+      + "WHERE f.run_id = r.run_id AND f.report_id = r.report_id AND f.kind = 'clean') != 1 "
+      + "OR (SELECT COUNT(*) FROM semantic_validation_findings f "
+      + "WHERE f.run_id = r.run_id AND f.report_id = r.report_id AND f.kind != 'clean') != 0)) "
+      + "OR (r.is_clean = 0 AND ((SELECT COUNT(*) FROM semantic_validation_findings f "
+      + "WHERE f.run_id = r.run_id AND f.report_id = r.report_id AND f.kind = 'clean') != 0 "
+      + "OR (SELECT COUNT(*) FROM semantic_validation_findings f "
+      + "WHERE f.run_id = r.run_id AND f.report_id = r.report_id) = 0)) LIMIT 1",
+    )
+    .get() as { runId?: string; reportId?: string } | undefined;
+  if (badCleanReport !== undefined) {
+    problems.push(
+      `validation report '${badCleanReport.reportId}' in run '${badCleanReport.runId}' violates clean exclusivity`,
+    );
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -619,6 +822,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 8) {
     validateSchemaV8(db, problems);
+  }
+  if (version >= 9) {
+    validateSchemaV9(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

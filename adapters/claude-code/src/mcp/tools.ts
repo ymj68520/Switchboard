@@ -1,10 +1,12 @@
 /**
- * Phase 11 MCP tool surface (Phase 11 directive §12/§21/§50/§74).
+ * Phase 12 MCP tool surface (Phase 12 directive §41/§52/§59/§95).
  *
- * Exactly ten tools — the Phase 10 set plus the two Phase 11 workflow tools:
+ * Exactly thirteen tools — the Phase 11 set plus the three synthesis/
+ * validation workflow tools:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
  *   get_state        (read-only, session-scoped)
- *   get_context      (read-only structured L0–L5 context projection + epoch)
+ *   get_context      (read-only structured context projection + epoch;
+ *                     detail=validation returns the frozen bundle, §32–§34)
  *   read_memory      (read-only exact MemoryRef retrieval)
  *   list_observations(read-only Observation ledger summaries, §21/§22)
  *   promote_evidence (explicit Observation→Evidence promotion, §28/§44/§45)
@@ -13,17 +15,23 @@
  *   prepare_proposal (the production model-facing prepare surface, §21)
  *   approve_proposal (the Formal Approval bridge into the Phase 6 engine,
  *                     marked anthropic/requiresUserInteraction=true)
+ *   submit_synthesis (main-agent manifest submission, §41–§45)
+ *   submit_validation(VALIDATOR-ONLY report submission, §52–§58 — the signed
+ *                     HostContext must attest agent_type=phase-plan:validator)
+ *   request_reopen   (main-agent reopen from synthesis/validation, §59–§67)
  *
  * Authority model: every handler verifies the hook-signed HostContext first
  * (signature → tool binding → business-input hash). The MCP process's own
  * environment — including CLAUDE_CODE_SESSION_ID — is NEVER authority
  * (directive §19/§26). Tool visibility is not authority: stage/lifecycle/
  * binding/HEAD/proposal state is revalidated by the application services and
- * the Phase 6 engine on every call. Read tools accept a read-only HostContext
- * without requiring permission_mode=plan (§39) but never widen scope: the run
- * is resolved from the signed session + workspace, never from model input.
- * prepare_proposal carries NO human approval (§21/§61): Formal Approval still
- * happens only through approve_proposal.
+ * the Phase 6 engine on every call, and submit_validation re-derives the
+ * validator attestation from the signed envelope, never from model input
+ * (§5/§53/§54). Read tools accept a read-only HostContext without requiring
+ * permission_mode=plan (§39) but never widen scope: the run is resolved from
+ * the signed session + workspace, never from model input. prepare_proposal
+ * carries NO human approval (§21/§61): Formal Approval still happens only
+ * through approve_proposal, and validator findings never need one (§52).
  */
 
 import { getWorkspaceById } from "../store/repositories.js";
@@ -32,6 +40,13 @@ import { getHeadCommitRecord } from "../store/plan-commits.js";
 import { getPlanningRunRecord, listPlanningRunsForWorkspaceRecord } from "../store/planning-runs.js";
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import { createSectionWorkflowService } from "../application/section-workflow-service.js";
+import { createSynthesisService } from "../application/synthesis-service.js";
+import {
+  getLatestSynthesisInputInTx,
+  getSynthesisManifestByInputInTx,
+  getValidationReportByManifestInTx,
+  listValidationFindingsInTx,
+} from "../store/synthesis.js";
 import { createProposalService } from "../application/proposal-service.js";
 import type { ProposalScope, ProposalType, RawProposalChange } from "../core/proposal.js";
 import type { ProposalEvidenceRef } from "../core/proposal-canonical.js";
@@ -343,6 +358,92 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
     },
     _meta: REQUIRES_USER_INTERACTION_META,
   },
+  {
+    name: "submit_synthesis",
+    description:
+      "Submit your derived SynthesisManifest for the run's frozen SynthesisInput (synthesis stage only, plan mode required). "
+      + "Every cross-section link, implementation step, and limitation must cite exact refs from the frozen input "
+      + "(get_context(detail=validation)). The manifest is immutable once accepted and the run advances to validation. "
+      + "This is NOT a design approval and moves no HEAD.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        input_id: { type: "string", description: "The frozen SynthesisInput id from get_context (synin_…)." },
+        input_hash: { type: "string", description: "The frozen input's hash (sha256:…)." },
+        cross_section_links: {
+          type: "array",
+          description: "Derived statements connecting approved design facts; each cites non-empty exact supportingRefs.",
+          items: { type: "object" },
+        },
+        implementation_order: {
+          type: "array",
+          description: "Implementation steps with manifest-local stepId, dependsOn (acyclic), and exact supportingRefs.",
+          items: { type: "object" },
+        },
+        limitations: {
+          type: "array",
+          description: "Derived limitation statements; each cites non-empty exact supportingRefs.",
+          items: { type: "object" },
+        },
+        unresolved_findings: {
+          type: "array",
+          description: "Findings you (the synthesizer) could not resolve: contradiction | missing_design | missing_dependency | coverage_gap | limitation.",
+          items: { type: "object" },
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["input_id", "input_hash", "cross_section_links", "implementation_order", "limitations", "unresolved_findings", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "submit_validation",
+    description:
+      "VALIDATOR-ONLY: persist the SemanticValidationReport for the run's current manifest (validation stage only). "
+      + "Findings vocabulary is frozen: unsupported_new_fact | contradiction | missing_design | missing_dependency | "
+      + "incorrect_derivation | coverage_gap | clean. clean must be the sole finding. Only the phase-plan validator "
+      + "subagent's signed context is accepted; the report never moves stage, run revision, or HEAD, and needs no approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        manifest_id: { type: "string", description: "The current SynthesisManifest id (synm_…)." },
+        manifest_hash: { type: "string", description: "The manifest's hash (sha256:…)." },
+        input_id: { type: "string", description: "The frozen SynthesisInput id the manifest was derived from." },
+        input_hash: { type: "string", description: "The frozen input's hash (sha256:…)." },
+        findings: {
+          type: "array",
+          description: "[clean] exactly, or one-or-more non-clean findings with summary, detail, and exact bundle refs.",
+          items: { type: "object" },
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["manifest_id", "manifest_hash", "input_id", "input_hash", "findings", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "request_reopen",
+    description:
+      "Reopen the planning run from synthesis/validation back into the normal design workflow (target: detail | architecture). " +
+      "Main-agent capability; needs no formal approval. Moves the stage and run revision exactly once and marks the affected " +
+      "completed Sections needs_review; committed Plan Memory and the historical synthesis records are never touched. At " +
+      "validation stage you may pass finding_ids to scope the review to the findings' Sections (omit for full review).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", enum: ["detail", "architecture"] },
+        reason: { type: "string", description: "Why the design workflow must re-run (recorded in the review events)." },
+        finding_ids: {
+          type: "array",
+          description: "Validation-stage only: scope the review to the Sections named by these findings (vf_…).",
+          items: { type: "string" },
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["target", "reason", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function inputInvalid(message: string, cause?: string): RuntimeError {
@@ -607,6 +708,69 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
 
   const source = createStoreContextSource(ctx.store);
   const context = assembleContext(source, preferred.run.runId);
+  if (detail === "validation") {
+    // §32–§34 — the authoritative frozen bundle, available at stage
+    // synthesis/validation to the main agent AND the validator alike (the
+    // authority difference lives in submit_validation's caller attestation,
+    // never in read permissions). Projections only: no conversation, no
+    // working drafts, no Observation payloads, no host tokens.
+    if (context.run.stage !== "synthesis" && context.run.stage !== "validation") {
+      throw domainError(
+        "CAPABILITY_NOT_AVAILABLE",
+        `detail="validation" is only available at stage synthesis or validation (run is at '${context.run.stage}')`,
+      );
+    }
+    const bundleRunId = preferred.run.runId;
+    const bundle = ctx.store.withRead((tx) => {
+      const input = getLatestSynthesisInputInTx(tx, bundleRunId);
+      if (input === null) {
+        return { synthesis_input: null, synthesis_manifest: null, semantic_validation: null };
+      }
+      const manifest = getSynthesisManifestByInputInTx(tx, bundleRunId, input.inputId);
+      const report = manifest === null ? null : getValidationReportByManifestInTx(tx, bundleRunId, manifest.manifestId);
+      const findings = report === null ? [] : listValidationFindingsInTx(tx, bundleRunId, report.reportId);
+      return {
+        synthesis_input: {
+          input_id: input.inputId,
+          input_seq: input.inputSeq,
+          input_hash: input.inputHash,
+          base_head: { snapshot_id: input.baseHeadSnapshotId, commit_id: input.baseHeadCommitId },
+          canonical: JSON.parse(input.canonicalJson) as unknown,
+        },
+        synthesis_manifest:
+          manifest === null
+            ? null
+            : {
+                manifest_id: manifest.manifestId,
+                manifest_hash: manifest.manifestHash,
+                input_hash: manifest.inputHash,
+                canonical: JSON.parse(manifest.canonicalJson) as unknown,
+              },
+        semantic_validation:
+          report === null
+            ? null
+            : {
+                report_id: report.reportId,
+                report_hash: report.reportHash,
+                is_clean: report.isClean,
+                canonical: JSON.parse(report.canonicalJson) as unknown,
+                findings: findings.map((finding) => ({
+                  finding_id: finding.findingId,
+                  kind: finding.kind,
+                  summary: finding.summary,
+                  detail: finding.detail,
+                  subject_refs: JSON.parse(finding.subjectRefsJson) as unknown,
+                  supporting_refs: JSON.parse(finding.supportingRefsJson) as unknown,
+                })),
+              },
+      };
+    });
+    return {
+      status: "ok",
+      context_epoch: context.epoch,
+      bundle,
+    };
+  }
   return {
     status: "ok",
     context_epoch: context.epoch,
@@ -785,6 +949,10 @@ export function handlePromoteEvidence(ctx: PhasePlanToolContext, rawArgs: Record
   if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
     throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
   }
+  {
+    const stageRun = getPlanningRunRecord(ctx.store, envelope.runId);
+    if (stageRun !== null) assertMainCapabilityForStage(stageRun.stage, "promote_evidence");
+  }
 
   const observationRefs =
     rawArgs.observation_refs === undefined
@@ -866,6 +1034,10 @@ export function handleRevalidateEvidence(ctx: PhasePlanToolContext, rawArgs: Rec
 
   if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
     throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  {
+    const stageRun = getPlanningRunRecord(ctx.store, envelope.runId);
+    if (stageRun !== null) assertMainCapabilityForStage(stageRun.stage, "revalidate_evidence");
   }
   if (typeof rawArgs.evidence_id !== "string" || rawArgs.evidence_id === "") {
     throw inputInvalid("evidence_id must be a non-empty string");
@@ -1111,6 +1283,11 @@ export function handleApproveProposal(ctx: PhasePlanToolContext, rawArgs: Record
   if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
     throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
   }
+  // §73 — approving ordinary design is shut off once the run leaves Detail.
+  {
+    const stageRun = getPlanningRunRecord(ctx.store, envelope.runId);
+    if (stageRun !== null) assertMainCapabilityForStage(stageRun.stage, "approve_proposal");
+  }
 
   // §31/§32 — the authorization request id derives from the SIGNED
   // HostContext.toolUseId, never from tool input.
@@ -1139,6 +1316,182 @@ export function handleApproveProposal(ctx: PhasePlanToolContext, rawArgs: Record
 }
 
 // ---------------------------------------------------------------------------
+// submit_synthesis / submit_validation / request_reopen (Phase 12 §41–§67)
+// ---------------------------------------------------------------------------
+
+/** §73/§74 — main-mutation capabilities the later stages shut off entirely. */
+const STAGE_BLOCKED_MAIN_TOOLS = ["promote_evidence", "revalidate_evidence", "approve_proposal"] as const;
+
+function assertMainCapabilityForStage(stage: string, tool: string): void {
+  if ((STAGE_BLOCKED_MAIN_TOOLS as readonly string[]).includes(tool) && (stage === "synthesis" || stage === "validation" || stage === "final")) {
+    throw domainError("CAPABILITY_NOT_AVAILABLE", `${tool} is not available at stage '${stage}'`);
+  }
+}
+
+function stringArgument(rawArgs: Record<string, unknown>, field: string): string {
+  const value = rawArgs[field];
+  if (typeof value !== "string" || value.trim() === "") {
+    throw inputInvalid(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+export function handleSubmitSynthesis(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, [
+    "input_id",
+    "input_hash",
+    "cross_section_links",
+    "implementation_order",
+    "limitations",
+    "unresolved_findings",
+  ]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "submit_synthesis", businessInput: rawArgs });
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  const inputId = stringArgument(rawArgs, "input_id");
+  const inputHash = stringArgument(rawArgs, "input_hash");
+  for (const field of ["cross_section_links", "implementation_order", "limitations", "unresolved_findings"] as const) {
+    if (!Array.isArray(rawArgs[field])) {
+      throw inputInvalid(`${field} must be an array`);
+    }
+  }
+  const current = getPlanningRunRecord(ctx.store, envelope.runId);
+  if (current === null) {
+    throw domainError("RUN_NOT_FOUND", `the attached run '${envelope.runId}' no longer exists`);
+  }
+  const service = createSynthesisService(ctx.store, ctx.clock);
+  const result = service.submitSynthesis({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    permissionMode: envelope.permissionMode,
+    inputId,
+    inputHash,
+    manifest: {
+      version: 1,
+      inputId,
+      inputHash,
+      crossSectionLinks: rawArgs.cross_section_links,
+      implementationOrder: rawArgs.implementation_order,
+      limitations: rawArgs.limitations,
+      unresolvedFindings: rawArgs.unresolved_findings,
+    },
+    // §44 — the operation identity derives from the SIGNED tool use.
+    requestId: `synthesis:${envelope.toolUseId}`,
+    // §42 — from the signed envelope only; absent agent ⇒ main-session call.
+    callerAgent: envelope.version === 2 ? (envelope.agent ?? null) : null,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    manifest_id: result.manifestId,
+    manifest_hash: result.manifestHash,
+    input_id: result.inputId,
+    stage: result.stage,
+    run_revision: result.runRevision,
+    next: result.stage === "validation" ? "invoke the phase-plan validator subagent (it calls submit_validation)" : undefined,
+  };
+}
+
+export function handleSubmitValidation(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["manifest_id", "manifest_hash", "input_id", "input_hash", "findings"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "submit_validation", businessInput: rawArgs });
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  const manifestId = stringArgument(rawArgs, "manifest_id");
+  const manifestHash = stringArgument(rawArgs, "manifest_hash");
+  const inputId = stringArgument(rawArgs, "input_id");
+  const inputHash = stringArgument(rawArgs, "input_hash");
+  if (!Array.isArray(rawArgs.findings)) {
+    throw inputInvalid("findings must be an array");
+  }
+  const current = getPlanningRunRecord(ctx.store, envelope.runId);
+  if (current === null) {
+    throw domainError("RUN_NOT_FOUND", `the attached run '${envelope.runId}' no longer exists`);
+  }
+  const service = createSynthesisService(ctx.store, ctx.clock);
+  const result = service.submitValidation({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    manifestId,
+    manifestHash,
+    inputId,
+    inputHash,
+    findings: rawArgs.findings,
+    // §57 — the operation identity derives from the SIGNED validator tool use.
+    requestId: `validation:${envelope.toolUseId}`,
+    callerAgent: envelope.version === 2 ? (envelope.agent ?? null) : null,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    report_id: result.reportId,
+    report_hash: result.reportHash,
+    manifest_id: result.manifestId,
+    is_clean: result.isClean,
+    finding_ids: result.findingIds,
+    stage: current.stage,
+    run_revision: current.revision,
+    next: result.isClean
+      ? "validation clean — finalization is NOT performed by this phase; await Phase 13 finalization authority"
+      : "call request_reopen to bring the affected sections back into review",
+  };
+}
+
+export function handleRequestReopen(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["target", "reason", "finding_ids"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "request_reopen", businessInput: rawArgs });
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  const target = rawArgs.target;
+  if (target !== "detail" && target !== "architecture") {
+    throw inputInvalid('target must be "detail" or "architecture"');
+  }
+  const reason = stringArgument(rawArgs, "reason");
+  const findingIds: string[] = [];
+  if (rawArgs.finding_ids !== undefined) {
+    if (!Array.isArray(rawArgs.finding_ids)) throw inputInvalid("finding_ids must be an array of finding ids");
+    for (const entry of rawArgs.finding_ids) {
+      if (typeof entry !== "string" || entry === "") throw inputInvalid("finding_ids entries must be non-empty strings");
+      findingIds.push(entry);
+    }
+  }
+  const current = getPlanningRunRecord(ctx.store, envelope.runId);
+  if (current === null) {
+    throw domainError("RUN_NOT_FOUND", `the attached run '${envelope.runId}' no longer exists`);
+  }
+  const service = createSynthesisService(ctx.store, ctx.clock);
+  const result = service.requestReopen({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    target,
+    reason,
+    findingIds,
+    requestId: `reopen:${envelope.toolUseId}`,
+    callerAgent: envelope.version === 2 ? (envelope.agent ?? null) : null,
+  });
+  return {
+    status: "ok",
+    target: result.stage,
+    stage: result.stage,
+    run_revision: result.runRevision,
+    review_event: result.reviewEvent,
+    sections_needing_review: result.reviewRequired,
+  };
+}
+
+// ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
   switch (name) {
@@ -1162,6 +1515,12 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handlePrepareProposal(ctx, rawArgs);
     case "approve_proposal":
       return handleApproveProposal(ctx, rawArgs);
+    case "submit_synthesis":
+      return handleSubmitSynthesis(ctx, rawArgs);
+    case "submit_validation":
+      return handleSubmitValidation(ctx, rawArgs);
+    case "request_reopen":
+      return handleRequestReopen(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

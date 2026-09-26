@@ -11,7 +11,7 @@
 
 import type { PhasePlanContext } from "./types.js";
 
-export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v2]";
+export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v3]";
 
 /** One named capsule section with its budget priority. */
 export interface CapsuleSegment {
@@ -136,6 +136,69 @@ export function dependencyContractsSegment(context: PhasePlanContext): CapsuleSe
     name: "dependency contracts",
     required: true,
     text: ["Dependency contracts (direct dependencies of the active section):", ...entries].join("\n"),
+  };
+}
+
+/** §31/§105 — the frozen synthesis identity; exact recovery facts, never prose. */
+export function synthesisSegment(context: PhasePlanContext): CapsuleSegment {
+  const synthesis = context.synthesis;
+  if (synthesis === null) {
+    return { name: "synthesis", required: false, text: "Synthesis: (no frozen input)" };
+  }
+  return {
+    name: "synthesis",
+    required: true,
+    text: [
+      "Synthesis:",
+      indent([
+        `input=${synthesis.inputId}`,
+        `input_hash=${synthesis.inputHash}`,
+        `base_head_snapshot=${synthesis.baseHead.snapshotId}`,
+        `base_head_commit=${synthesis.baseHead.commitId ?? "none"}`,
+        `refs=design:${synthesis.refCounts.design},evidence:${synthesis.refCounts.evidence}`,
+      ]),
+    ].join("\n"),
+  };
+}
+
+/** §31/§105 — the accepted manifest, present at stage validation. */
+export function synthesisManifestSegment(context: PhasePlanContext): CapsuleSegment {
+  const manifest = context.synthesisManifest;
+  if (manifest === null) {
+    return { name: "synthesis manifest", required: false, text: "Synthesis manifest: (none)" };
+  }
+  return {
+    name: "synthesis manifest",
+    required: true,
+    text: ["Synthesis manifest:", indent([`id=${manifest.manifestId}`, `hash=${manifest.manifestHash}`])].join("\n"),
+  };
+}
+
+/** §71/§72 — the validation outcome: counts only; full detail via get_context(detail=validation). */
+export function semanticValidationSegment(context: PhasePlanContext): CapsuleSegment {
+  const validation = context.semanticValidation;
+  if (validation === null) {
+    return {
+      name: "semantic validation",
+      required: false,
+      text: "Semantic validation: (no report yet)",
+    };
+  }
+  if (validation.isClean) {
+    return {
+      name: "semantic validation",
+      required: true,
+      text: ["Semantic validation:", indent([`report=${validation.reportId}`, "clean=true", "Finalization not yet performed."])].join("\n"),
+    };
+  }
+  const counts = validation.findingCounts.map((entry) => `${entry.kind}: ${entry.count}`);
+  return {
+    name: "semantic validation",
+    required: true,
+    text: [
+      "Semantic validation:",
+      indent([`report=${validation.reportId}`, "clean=false", "findings:", indent(counts)]),
+    ].join("\n"),
   };
 }
 

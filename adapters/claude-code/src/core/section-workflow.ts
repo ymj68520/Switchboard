@@ -24,9 +24,11 @@ export const SECTION_WORKFLOW_STATES = ["open", "completed", "needs_review"] as 
 export type SectionWorkflowState = (typeof SECTION_WORKFLOW_STATES)[number];
 
 /**
- * Append-only workflow event vocabulary (§7). Deliberately absent:
- * SET_STATUS / FORCE_COMPLETE / FORCE_VALID — states are only ever derived
- * from named workflow facts, never set directly.
+ * Append-only workflow event vocabulary (§7, extended by Phase 12 §65 with
+ * the three synthesis/reopen review events — workflow/system facts, never
+ * Plan Memory). Deliberately absent: SET_STATUS / FORCE_COMPLETE /
+ * FORCE_VALID — states are only ever derived from named workflow facts,
+ * never set directly.
  */
 export const SECTION_WORKFLOW_EVENT_TYPES = [
   "REGISTERED",
@@ -34,6 +36,9 @@ export const SECTION_WORKFLOW_EVENT_TYPES = [
   "REOPENED",
   "DEPENDENCY_REVIEW_REQUIRED",
   "EVIDENCE_REVIEW_REQUIRED",
+  "SYNTHESIS_REVIEW_REQUIRED",
+  "VALIDATION_REVIEW_REQUIRED",
+  "ARCHITECTURE_REVIEW_REQUIRED",
 ] as const;
 
 export type SectionWorkflowEventType = (typeof SECTION_WORKFLOW_EVENT_TYPES)[number];
@@ -60,6 +65,9 @@ const SECTION_WORKFLOW_TRANSITIONS: Readonly<
   REOPENED: ["completed", "needs_review"],
   DEPENDENCY_REVIEW_REQUIRED: ["completed"],
   EVIDENCE_REVIEW_REQUIRED: ["completed"],
+  SYNTHESIS_REVIEW_REQUIRED: ["completed"],
+  VALIDATION_REVIEW_REQUIRED: ["completed"],
+  ARCHITECTURE_REVIEW_REQUIRED: ["completed"],
 };
 
 /** Whether `event` may legally transition a Section currently in `from`. */
@@ -88,6 +96,9 @@ export function sectionWorkflowEventTarget(
       return "completed";
     case "DEPENDENCY_REVIEW_REQUIRED":
     case "EVIDENCE_REVIEW_REQUIRED":
+    case "SYNTHESIS_REVIEW_REQUIRED":
+    case "VALIDATION_REVIEW_REQUIRED":
+    case "ARCHITECTURE_REVIEW_REQUIRED":
       return "needs_review";
   }
 }

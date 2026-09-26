@@ -40,6 +40,10 @@ export interface ContextEpochInputs {
   activeSection: { sectionId: string } | null;
   /** Deterministic [{sectionId, status, completedRevision}] digest input (§19). */
   sectionWorkflow: Array<{ sectionId: string; status: string; completedRevision: number | null }>;
+  /** §30 — Phase 12: synthesis/validation identity joined the inputs. */
+  synthesis: { inputId: string; inputHash: string } | null;
+  synthesisManifest: { manifestId: string; manifestHash: string } | null;
+  semanticValidation: { reportId: string; reportHash: string } | null;
 }
 
 /**
@@ -53,7 +57,7 @@ export function sectionWorkflowDigest(
   return createHash("sha256").update(canonicalJson(sorted), "utf8").digest("hex");
 }
 
-/** `context-epoch:v2:<hex>` over the canonical form of the epoch inputs. */
+/** `context-epoch:v3:<hex>` over the canonical form of the epoch inputs. */
 export function deriveContextEpoch(inputs: Omit<ContextEpochInputs, "epochVersion">): string {
   const payload = {
     epochVersion: CONTEXT_EPOCH_VERSION,
@@ -71,6 +75,11 @@ export function deriveContextEpoch(inputs: Omit<ContextEpochInputs, "epochVersio
           },
     activeSection: inputs.activeSection,
     sectionWorkflowDigest: sectionWorkflowDigest(inputs.sectionWorkflow),
+    // §30 — submit_synthesis / submit_validation / request_reopen are all
+    // visible in the epoch through these identity pairs.
+    synthesis: inputs.synthesis,
+    synthesisManifest: inputs.synthesisManifest,
+    semanticValidation: inputs.semanticValidation,
   };
   const hex = createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
   return `${CONTEXT_EPOCH_VERSION}:${hex}`;
@@ -90,6 +99,14 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
   const awaiting = source.getAwaitingProposal(runId);
   const activeSectionId = source.getActiveSection(runId);
   const workflow = source.listSectionWorkflowStates(runId);
+  // §30 — cheap identity reads only; null outside synthesis/validation.
+  const synthesis =
+    run.stage === "synthesis" || run.stage === "validation" || run.stage === "final"
+      ? source.getLatestSynthesisInput(runId)
+      : null;
+  const manifest =
+    synthesis === null ? null : source.getSynthesisManifestForInput(runId, synthesis.inputId);
+  const report = manifest === null ? null : source.getValidationReportForManifest(runId, manifest.manifestId);
   return deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -105,5 +122,8 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
       status: state.status,
       completedRevision: state.completedRevision,
     })),
+    synthesis: synthesis === null ? null : { inputId: synthesis.inputId, inputHash: synthesis.inputHash },
+    synthesisManifest: manifest,
+    semanticValidation: report === null ? null : { reportId: report.reportId, reportHash: report.reportHash },
   });
 }

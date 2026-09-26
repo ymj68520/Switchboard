@@ -70,6 +70,7 @@ import {
   transitionSectionWorkflowInTx,
   evaluateDetailCompletionInTx,
 } from "./section-workflow-service.js";
+import { createSynthesisInputAtDetailCompletionInTx } from "./synthesis-service.js";
 import {
   getProposalRevisionInTx,
   getProposalStateInTx,
@@ -653,7 +654,30 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
             );
             finalRun = { ...finalRun, revision: bumped.revision, stage: bumped.stage, updatedAt: now };
             workflowAudit.activeCleared = true;
-            if (next !== undefined) workflowAudit.detailComplete = true;
+            if (next !== undefined) {
+              workflowAudit.detailComplete = true;
+              // Phase 12 §18 — the LAST legal Section completion that reaches
+              // DETAIL_COMPLETE freezes the SynthesisInput in the SAME
+              // transaction, anchored to the resulting HEAD. Any construction
+              // failure (including the §24 critical-Evidence gate) rolls the
+              // entire completion back: stage synthesis never lacks an input.
+              const synthesis = createSynthesisInputAtDetailCompletionInTx(
+                tx,
+                {
+                  runId: input.runId,
+                  workspaceId: input.workspaceId,
+                  snapshotId: snapshot.snapshotId,
+                  commitId,
+                  baseRunRevision: bumped.revision,
+                },
+                clock,
+              );
+              workflowAudit.synthesisInput = {
+                inputId: synthesis.inputId,
+                inputHash: synthesis.inputHash,
+                relevantEvidence: synthesis.relevantEvidence,
+              };
+            }
           }
         }
 

@@ -18,6 +18,14 @@ import { getHeadCommitRecord } from "../store/plan-commits.js";
 import { getHeadSnapshotRecord, readMemoryRevisionRecord } from "../store/plan-memory.js";
 import { getAwaitingProposalRecord } from "../store/proposals.js";
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
+import {
+  getLatestValidationReportInTx,
+  getLatestSynthesisInputInTx,
+  getSynthesisManifestByInputInTx,
+  listSynthesisInputEvidenceInTx,
+  listSynthesisInputRefsInTx,
+  listValidationFindingsInTx,
+} from "../store/synthesis.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type {
   CommittedRevisionView,
@@ -92,6 +100,47 @@ export function createStoreContextSource(store: PlanStore): ContextSource {
             title: awaiting.title,
             summary: awaiting.summary,
           };
+    },
+
+    getLatestSynthesisInput(runId) {
+      return store.withRead((tx) => {
+        const input = getLatestSynthesisInputInTx(tx, runId);
+        if (input === null) return null;
+        return {
+          inputId: input.inputId,
+          inputHash: input.inputHash,
+          baseHeadSnapshotId: input.baseHeadSnapshotId,
+          baseHeadCommitId: input.baseHeadCommitId,
+          designRefCount: listSynthesisInputRefsInTx(tx, runId, input.inputId).length,
+          evidenceCount: listSynthesisInputEvidenceInTx(tx, runId, input.inputId).length,
+        };
+      });
+    },
+
+    getSynthesisManifestForInput(runId, inputId) {
+      return store.withRead((tx) => {
+        const manifest = getSynthesisManifestByInputInTx(tx, runId, inputId);
+        return manifest === null ? null : { manifestId: manifest.manifestId, manifestHash: manifest.manifestHash };
+      });
+    },
+
+    getValidationReportForManifest(runId, manifestId) {
+      return store.withRead((tx) => {
+        const report = getLatestValidationReportInTx(tx, runId);
+        if (report === null || report.manifestId !== manifestId) return null;
+        const counts = new Map<string, number>();
+        for (const finding of listValidationFindingsInTx(tx, runId, report.reportId)) {
+          counts.set(finding.kind, (counts.get(finding.kind) ?? 0) + 1);
+        }
+        return {
+          reportId: report.reportId,
+          reportHash: report.reportHash,
+          isClean: report.isClean,
+          findingCounts: [...counts.entries()]
+            .map(([kind, count]) => ({ kind, count }))
+            .sort((a, b) => (a.kind < b.kind ? -1 : 1)),
+        };
+      });
     },
   };
 }

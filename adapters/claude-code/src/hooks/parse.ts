@@ -33,6 +33,14 @@ export interface HookCommonInput {
   transcriptPath?: string;
   cwd?: string;
   permissionMode?: string;
+  /**
+   * Phase 12 §4/§6 — host-provided subagent identity (Claude Code 2.1.283
+   * PreToolUse input). Present ONLY on subagent tool calls: `agent_id` is an
+   * opaque per-spawn id, `agent_type` is `<plugin>:<agent-name>`. Main-session
+   * calls carry neither; the absence is itself the main-agent attestation.
+   */
+  agentId?: string;
+  agentType?: string;
   hookEventName: string;
   /** Unknown future fields are tolerated, never stripped from authority decisions. */
   [key: string]: unknown;
@@ -151,6 +159,14 @@ function parseCommon(record: RawRecord, expectedEvent: string, issues: HookParse
     ...(() => {
       const permissionMode = optionalString(record, "permission_mode", issues);
       return permissionMode === undefined ? {} : { permissionMode };
+    })(),
+    ...(() => {
+      const agentId = optionalString(record, "agent_id", issues);
+      return agentId === undefined ? {} : { agentId };
+    })(),
+    ...(() => {
+      const agentType = optionalString(record, "agent_type", issues);
+      return agentType === undefined ? {} : { agentType };
     })(),
     hookEventName: eventName,
     ...record,

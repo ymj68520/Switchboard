@@ -13,6 +13,7 @@ import { createProposalApprovalCommitMigration } from "./005-proposal-approval-p
 import { createObservationEvidenceMigration } from "./006-observation-evidence-foundation.js";
 import { createEvidenceFreshnessMigration } from "./007-evidence-freshness-foundation.js";
 import { createSectionWorkflowMigration } from "./008-section-workflow.js";
+import { createSynthesisValidationMigration } from "./009-synthesis-validation-foundation.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -70,7 +71,8 @@ export interface ProductionMigrationDeps {
  * `3→4 plan-memory-foundation`, `4→5 proposal-approval-plan-commit`,
  * `5→6 observation-evidence-foundation`,
  * `6→7 evidence-freshness-foundation`,
- * `7→8 section-workflow`.
+ * `7→8 section-workflow`,
+ * `8→9 synthesis-validation-foundation`.
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
   return [
@@ -82,5 +84,6 @@ export function createProductionMigrations(deps: ProductionMigrationDeps): Store
     createObservationEvidenceMigration(),
     createEvidenceFreshnessMigration(),
     createSectionWorkflowMigration(),
+    createSynthesisValidationMigration(),
   ];
 }

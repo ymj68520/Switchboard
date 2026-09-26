@@ -28,16 +28,15 @@ import type { SectionContract } from "../core/memory-artifacts.js";
 import type { SectionWorkflowState } from "../core/section-workflow.js";
 
 /**
- * Phase 11 (§16): the v1 shape could not unambiguously express Section
- * workflow states, the active Section, or dependency contracts — the context
- * model formally advances to version 2. The version-1 structural contract is
- * never silently changed: v1 consumers see a new version marker, never
- * reinterpreted old fields.
+ * Phase 12 (§28–§30): the v2 shape cannot express the frozen synthesis
+ * identity or the semantic validation outcome — the context model formally
+ * advances to version 3 and the epoch inputs gain the synthesis/validation
+ * records (§30). Older shapes are never silently reinterpreted.
  */
-export const CONTEXT_MODEL_VERSION = 2 as const;
+export const CONTEXT_MODEL_VERSION = 3 as const;
 
-/** The frozen epoch identity marker (§19): workflow facts changed the inputs. */
-export const CONTEXT_EPOCH_VERSION = "context-epoch:v2" as const;
+/** The frozen epoch identity marker (§30): synthesis/validation facts joined the inputs. */
+export const CONTEXT_EPOCH_VERSION = "context-epoch:v3" as const;
 
 /** L0 — static identity of the planning protocol layer. */
 export interface ContextProtocol {
@@ -146,11 +145,38 @@ export interface ContextDependencyContract {
   contract: SectionContract;
 }
 
+/** §29 — the frozen synthesis identity visible at stage synthesis/validation. */
+export interface ContextSynthesis {
+  inputId: string;
+  inputHash: string;
+  baseHead: {
+    snapshotId: string;
+    commitId: string | null;
+  };
+  /** Exact ref counts of the frozen input (§29 "exact ref counts"). */
+  refCounts: { design: number; evidence: number };
+}
+
+/** §29 — the accepted manifest visible at stage validation. */
+export interface ContextSynthesisManifest {
+  manifestId: string;
+  manifestHash: string;
+}
+
+/** §29/§71/§72 — the semantic validation outcome (present once a report exists). */
+export interface ContextSemanticValidation {
+  reportId: string;
+  reportHash: string;
+  isClean: boolean;
+  /** Finding-kind counts for the recovery summary (§71) — empty when clean. */
+  findingCounts: Array<{ kind: string; count: number }>;
+}
+
 export interface ContextWorking {
   awaitingProposal: ContextAwaitingProposal | null;
 }
 
-/** L5 — operations logically available under the current state (§27). */
+/** L5 — operations logically available under the current state (§27/§73/§74). */
 export type ContextOperation =
   | "get_state"
   | "get_context"
@@ -158,7 +184,10 @@ export type ContextOperation =
   | "start_or_resume"
   | "select_section"
   | "prepare_proposal"
-  | "approve_proposal";
+  | "approve_proposal"
+  | "submit_synthesis"
+  | "submit_validation"
+  | "request_reopen";
 
 /** Internal provenance of one assembly (directive §44) — tests/debug aid. */
 export interface ContextSourceTrace {
@@ -184,6 +213,12 @@ export interface PhasePlanContext {
   };
   /** §51 — contracts of the active Section's DIRECT dependencies only. */
   activeDependencyContracts: ContextDependencyContract[];
+  /** §29 — the frozen synthesis identity (synthesis/validation stages only). */
+  synthesis: ContextSynthesis | null;
+  /** §29 — the accepted manifest (validation stage only). */
+  synthesisManifest: ContextSynthesisManifest | null;
+  /** §29/§71 — the validation outcome once a report exists. */
+  semanticValidation: ContextSemanticValidation | null;
   working: ContextWorking;
   operations: ContextOperation[];
   sourceTrace: ContextSourceTrace;
@@ -221,4 +256,15 @@ export interface ContextSource {
     status: SectionWorkflowState;
     completedRevision: number | null;
   }>;
+  /** §29 — the run's newest frozen synthesis input, or null (Phase 12). */
+  getLatestSynthesisInput(
+    runId: string,
+  ): { inputId: string; inputHash: string; baseHeadSnapshotId: string; baseHeadCommitId: string | null; designRefCount: number; evidenceCount: number } | null;
+  /** §29 — the manifest accepted for the given input, or null. */
+  getSynthesisManifestForInput(runId: string, inputId: string): { manifestId: string; manifestHash: string } | null;
+  /** §29/§71 — the accepted report for the given manifest, or null. */
+  getValidationReportForManifest(
+    runId: string,
+    manifestId: string,
+  ): { reportId: string; reportHash: string; isClean: boolean; findingCounts: Array<{ kind: string; count: number }> } | null;
 }

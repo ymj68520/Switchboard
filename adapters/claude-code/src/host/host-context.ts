@@ -24,6 +24,28 @@ import { HOST_CONTEXT_DOMAIN, signCanonical, verifyCanonical } from "./signing.j
 
 export const HOST_CONTEXT_VERSION = 1 as const;
 
+/**
+ * HostContextEnvelopeV2 (Phase 12 §6–§7) — V1 plus the OPTIONAL signed agent
+ * attestation. Field names come from the real host probe (Claude Code 2.1.283
+ * PreToolUse input): `agent_id` (opaque per-spawn id, == the background task
+ * id) and `agent_type` (`<plugin>:<agent-name>`). Main-session hook input
+ * carries neither, so a V2 envelope WITHOUT agent attests a main-agent call.
+ *
+ * V2 is signed ONLY for the validator/synthesis/reopen capability family;
+ * the ten Phase 7–11 tools keep byte-identical V1 envelopes (§7).
+ */
+export const HOST_CONTEXT_V2_VERSION = 2 as const;
+
+export interface HostContextAgent {
+  agentId?: string;
+  agentType?: string;
+}
+
+export interface HostContextEnvelopeV2 extends Omit<HostContextEnvelopeV1, "version"> {
+  version: typeof HOST_CONTEXT_V2_VERSION;
+  agent?: HostContextAgent;
+}
+
 export interface HostContextEnvelopeV1 {
   version: typeof HOST_CONTEXT_VERSION;
   sessionId: string;
@@ -51,7 +73,10 @@ export type HostContextLogicalTool =
   | "revalidate_evidence"
   | "select_section"
   | "prepare_proposal"
-  | "approve_proposal";
+  | "approve_proposal"
+  | "submit_synthesis"
+  | "submit_validation"
+  | "request_reopen";
 
 export interface BuildHostContextInput {
   sessionId: string;
@@ -86,6 +111,26 @@ export function encodeHostContextToken(secret: Buffer, envelope: HostContextEnve
   return Buffer.from(JSON.stringify({ ...envelope, signature }), "utf8").toString("base64url");
 }
 
+export interface BuildHostContextV2Input extends BuildHostContextInput {
+  /** Present only when the hook input carried the host's subagent fields. */
+  agent?: HostContextAgent;
+}
+
+/** Build a V2 envelope (§6) — identical rules to V1 plus the agent attestation. */
+export function buildHostContextEnvelopeV2(input: BuildHostContextV2Input): HostContextEnvelopeV2 {
+  return {
+    ...buildHostContextEnvelope(input),
+    version: HOST_CONTEXT_V2_VERSION,
+    ...(input.agent === undefined ? {} : { agent: input.agent }),
+  };
+}
+
+/** Serialize a V2 envelope to the opaque signed token injected as `_hostContext`. */
+export function encodeHostContextTokenV2(secret: Buffer, envelope: HostContextEnvelopeV2): string {
+  const signature = signCanonical(HOST_CONTEXT_DOMAIN, secret, { ...envelope });
+  return Buffer.from(JSON.stringify({ ...envelope, signature }), "utf8").toString("base64url");
+}
+
 /**
  * Hash of the business input a context authorizes: reserved host fields are
  * removed, the remainder is canonical-JSON'd and SHA-256'd (directive §20).
@@ -116,9 +161,10 @@ function hostContextError(code: RuntimeError["code"], message: string, cause?: s
 /**
  * Decode + signature-verify a token. Shape failures and HMAC failures both
  * fail closed as HOST_CONTEXT_INVALID — an HMAC failure is never remapped to
- * a session-binding error (directive §22).
+ * a session-binding error (directive §22). Accepts V1 and V2 envelopes; the
+ * version byte decides whether the optional agent attestation may appear.
  */
-export function verifyHostContext(secret: Buffer, token: unknown): HostContextEnvelopeV1 {
+export function verifyHostContext(secret: Buffer, token: unknown): HostContextEnvelopeV1 | HostContextEnvelopeV2 {
   if (typeof token !== "string" || token.trim() === "") {
     throw hostContextError("HOST_CONTEXT_REQUIRED", "no signed host context was provided");
   }
@@ -137,9 +183,10 @@ export function verifyHostContext(secret: Buffer, token: unknown): HostContextEn
   if (!verifyCanonical(HOST_CONTEXT_DOMAIN, secret, signedPayload, typeof signature === "string" ? signature : "")) {
     throw hostContextError("HOST_CONTEXT_INVALID", "host context signature verification failed");
   }
-  if (rest.version !== HOST_CONTEXT_VERSION) {
+  if (rest.version !== HOST_CONTEXT_VERSION && rest.version !== HOST_CONTEXT_V2_VERSION) {
     throw hostContextError("HOST_CONTEXT_INVALID", `unsupported host context version: ${String(rest.version)}`);
   }
+  const isV2 = rest.version === HOST_CONTEXT_V2_VERSION;
   for (const key of ["sessionId", "workspaceId", "permissionMode", "toolUseId", "toolName", "businessInputHash"] as const) {
     if (typeof rest[key] !== "string" || rest[key] === "") {
       throw hostContextError("HOST_CONTEXT_INVALID", `host context field '${key}' is missing or malformed`);
@@ -157,8 +204,24 @@ export function verifyHostContext(secret: Buffer, token: unknown): HostContextEn
   ) {
     throw hostContextError("HOST_CONTEXT_INVALID", "host context field 'bindingGeneration' is malformed");
   }
-  return {
-    version: HOST_CONTEXT_VERSION,
+  let agent: HostContextAgent | undefined;
+  if (isV2 && rest.agent !== undefined) {
+    if (typeof rest.agent !== "object" || rest.agent === null) {
+      throw hostContextError("HOST_CONTEXT_INVALID", "host context field 'agent' is malformed");
+    }
+    const rawAgent = rest.agent as Record<string, unknown>;
+    if (rawAgent.agentId !== undefined && (typeof rawAgent.agentId !== "string" || rawAgent.agentId === "")) {
+      throw hostContextError("HOST_CONTEXT_INVALID", "host context field 'agent.agentId' is malformed");
+    }
+    if (rawAgent.agentType !== undefined && (typeof rawAgent.agentType !== "string" || rawAgent.agentType === "")) {
+      throw hostContextError("HOST_CONTEXT_INVALID", "host context field 'agent.agentType' is malformed");
+    }
+    agent = {
+      ...(rawAgent.agentId === undefined ? {} : { agentId: rawAgent.agentId }),
+      ...(rawAgent.agentType === undefined ? {} : { agentType: rawAgent.agentType }),
+    };
+  }
+  const common = {
     sessionId: rest.sessionId as string,
     ...(rest.promptId === undefined ? {} : { promptId: rest.promptId as string }),
     workspaceId: rest.workspaceId as string,
@@ -169,6 +232,7 @@ export function verifyHostContext(secret: Buffer, token: unknown): HostContextEn
     toolName: rest.toolName as string,
     businessInputHash: rest.businessInputHash as string,
   };
+  return isV2 ? { ...common, version: HOST_CONTEXT_V2_VERSION, ...(agent === undefined ? {} : { agent }) } : { ...common, version: HOST_CONTEXT_VERSION };
 }
 
 export interface AssertHostContextInput {
@@ -182,7 +246,11 @@ export interface AssertHostContextInput {
  * Full verification chain for a mutation/read handler:
  * signature+shape → tool binding → business-input hash (directive §20–§22).
  */
-export function assertHostContextForTool(secret: Buffer, token: unknown, expected: AssertHostContextInput): HostContextEnvelopeV1 {
+export function assertHostContextForTool(
+  secret: Buffer,
+  token: unknown,
+  expected: AssertHostContextInput,
+): HostContextEnvelopeV1 | HostContextEnvelopeV2 {
   const envelope = verifyHostContext(secret, token);
   if (logicalToolName(envelope.toolName) !== expected.tool) {
     throw hostContextError(
