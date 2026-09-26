@@ -36,6 +36,8 @@ const liveRoot = process.env.PHASE_PLAN_LIVE_STORE;
 const tag = process.env.PHASE_PLAN_LIVE_FIXTURE_TAG ?? "1";
 const phase8 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase8";
 const phase12 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase12";
+const phase13 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase13";
+const phase13drift = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase13-drift";
 const phase10 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10";
 const phase10Revise = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10-revise";
 const d = liveRoot === undefined ? describe.skip : describe;
@@ -171,7 +173,7 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
         return;
       }
 
-      if (phase12) {
+      if (phase12 || phase13 || phase13drift) {
         // Phase 12 §100 fixture: drive the live run through the REAL domain
         // path (Discovery bridge → architecture → detail → section
         // completions) until the LAST completion freezes the SynthesisInput
@@ -196,6 +198,30 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
         };
         const prepare = (input: Parameters<typeof proposals.prepareProposal>[0]) => proposals.prepareProposal(input);
 
+        let evidenceRef: { evidenceId: string; revision: number } | null = null;
+        // Phase 13 drift RESUME: the run already sits at synthesis (an earlier
+        // drift attempt drove it there before the evidence existed). The design
+        // drive below is skipped; the reopen path rebuilds the world.
+        const resumeStageRow = store.withRead(
+          (tx) => tx.prepare("SELECT stage AS s FROM planning_runs WHERE run_id = ?").get(current!.runId) as { s: string },
+        );
+        const driftResume = phase13drift && resumeStageRow.s === "synthesis";
+        let sectionIds: string[] = [];
+        if (driftResume) {
+          const headRow = store.withRead(
+            (tx) =>
+              tx.prepare("SELECT head_snapshot_id AS s FROM plan_heads WHERE run_id = ?").get(current!.runId) as { s: string },
+          );
+          sectionIds = (
+            store.withRead(
+              (tx) =>
+                tx
+                  .prepare("SELECT artifact_id AS id FROM snapshot_members WHERE snapshot_id = ? AND kind = 'section' ORDER BY artifact_id")
+                  .all(headRow.s) as Array<{ id: string }>,
+            )
+          ).map((row) => row.id);
+        }
+        if (!driftResume) {
         // Discovery → Architecture: the Phase 11 §24 atomic prepare bridge.
         const archContent = {
           summary: "Phase 12 live architecture",
@@ -233,6 +259,55 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
         });
         commit(archCompletion.proposal);
 
+        // Phase 13 drift mode: a critical fingerprint Evidence revision over a
+        // dedicated workspace file, promoted BEFORE the design DAG and named in
+        // its requiredEvidence so it enters the frozen input's
+        // relevantEvidence (Phase 13 §21/§105).
+        let evidenceRef: { evidenceId: string; revision: number } | null = null;
+        if (phase13drift) {
+          const workspace = (await import("../src/store/repositories.js")).getWorkspaceById(store, current!.workspaceId)!;
+          const driftPath = path.join(workspace.canonicalRoot, "phase-plan-live-drift.txt");
+          fs.writeFileSync(driftPath, "LIVE DRIFT SOURCE v1\n", "utf8");
+          const { captureObservation } = await import("../src/observations/capture.js");
+          const { createBlobStore } = await import("../src/store/blob-store.js");
+          const blobs = createBlobStore(path.join(liveRoot!, "blobs"));
+          const captured = await captureObservation(
+            {
+              store,
+              clock,
+              runId: current!.runId,
+              workspace: workspace as never,
+              blobs,
+            },
+            {
+              sessionId: current!.sessionId,
+              toolName: "Read",
+              toolUseId: `live-drift-obs-${tag}`,
+              toolInput: { file_path: driftPath },
+              toolResponse: { type: "text", file: { filePath: "phase-plan-live-drift.txt", content: "LIVE DRIFT SOURCE v1\n" } },
+              cwd: workspace.canonicalRoot,
+            },
+          );
+          if (captured.status !== "captured") throw new Error(`drift observation failed: ${captured.status}`);
+          const observationId = (captured as { status: "captured"; observation: { observationId: string } }).observation.observationId;
+          const evidenceService = (await import("../src/application/evidence-service.js")).createEvidenceService(store, blobs, clock);
+          const promoted = evidenceService.promoteEvidence({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            request: {
+              claim: "the live drift source declares its frozen content",
+              kind: "source_fact",
+              scope: { type: "global" },
+              confidence: "direct",
+              criticality: "critical",
+              observationRefs: [observationId],
+              derivedFrom: [],
+            },
+            operationId: `live:promote-drift-${tag}`,
+          });
+          evidenceRef = { evidenceId: promoted.evidence.evidenceId, revision: promoted.evidence.revision };
+        }
+
         // Detail: one two-section DAG (independent sections).
         const sectionContent = (title: string) => ({
           title,
@@ -257,6 +332,7 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
           scope: { kind: "detail" },
           title: "Phase 12 live section DAG",
           summary: "two sections",
+          ...(evidenceRef !== null ? { requiredEvidence: [evidenceRef] } : {}),
           changes: (["Alpha", "Beta"] as const).map((title) => ({
             op: "SET_SECTION_REVISION" as const,
             target: null,
@@ -265,7 +341,7 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
           })),
         });
         commit(dag.proposal);
-        const sectionIds = [...new Set(dag.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
+        sectionIds = [...new Set(dag.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
 
         // Select + complete each section; the LAST completion reaches
         // DETAIL_COMPLETE and freezes the SynthesisInput (§18).
@@ -295,22 +371,264 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
           commit(completion.proposal);
         }
 
+        }
+        // Phase 13 drift RESUME: the run already sits at synthesis (an earlier
+        // drift attempt drove it there before promoting the evidence). Reopen
+        // to detail, promote the critical fingerprint evidence, contribute it
+        // through a real committed decision proposal, and re-complete both
+        // Sections — DETAIL_COMPLETE then freezes a NEW input whose scope
+        // contains the evidence (Phase 13 §21/§71 flow).
+        if (phase13drift) {
+          const stageRow = store.withRead((tx) => tx.prepare("SELECT stage AS s, revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { s: string; r: number });
+          if (stageRow.s === "synthesis") {
+            const synthesisService = (await import("../src/application/synthesis-service.js")).createSynthesisService(store, clock);
+            const reopened = synthesisService.requestReopen({
+              runId: current!.runId,
+              workspaceId: current!.workspaceId,
+              sessionId: current!.sessionId,
+              bindingGeneration: current!.generation,
+              target: "detail",
+              reason: "phase13 drift fixture: reopen to bring critical evidence into scope",
+              findingIds: [],
+              requestId: `fixture:reopen-${tag}`,
+              callerAgent: null,
+            });
+            revision = reopened.runRevision;
+
+            const workspace = (await import("../src/store/repositories.js")).getWorkspaceById(store, current!.workspaceId)!;
+            const driftPath = path.join(workspace.canonicalRoot, "phase-plan-live-drift.txt");
+            fs.writeFileSync(driftPath, "LIVE DRIFT SOURCE v1\n", "utf8");
+            const { captureObservation } = await import("../src/observations/capture.js");
+            const { createBlobStore } = await import("../src/store/blob-store.js");
+            const blobs = createBlobStore(path.join(liveRoot!, "blobs"));
+            const captured = await captureObservation(
+              { store, clock, runId: current!.runId, workspace: workspace as never, blobs },
+              {
+                sessionId: current!.sessionId,
+                toolName: "Read",
+                toolUseId: `live-drift-obs2-${tag}`,
+                toolInput: { file_path: driftPath },
+                toolResponse: { type: "text", file: { filePath: "phase-plan-live-drift.txt", content: "LIVE DRIFT SOURCE v1\n" } },
+                cwd: workspace.canonicalRoot,
+              },
+            );
+            if (captured.status !== "captured") throw new Error(`drift observation failed: ${captured.status}`);
+            const observationId = (captured as { status: "captured"; observation: { observationId: string } }).observation.observationId;
+            const evidenceService = (await import("../src/application/evidence-service.js")).createEvidenceService(store, blobs, clock);
+            const promoted = evidenceService.promoteEvidence({
+              runId: current!.runId,
+              workspaceId: current!.workspaceId,
+              request: {
+                claim: "the live drift source declares its frozen content",
+                kind: "source_fact",
+                scope: { type: "global" },
+                confidence: "direct",
+                criticality: "critical",
+                observationRefs: [observationId],
+                derivedFrom: [],
+              },
+              operationId: `live:promote-drift2-${tag}`,
+            });
+            evidenceRef = { evidenceId: promoted.evidence.evidenceId, revision: promoted.evidence.revision };
+
+            // A real committed decision whose requiredEvidence is the exact
+            // fresh evidence revision (§21 contributing proposal).
+            const decisionCheckpoint = prepare({
+              runId: current!.runId,
+              workspaceId: current!.workspaceId,
+              sessionId: current!.sessionId,
+              bindingGeneration: current!.generation,
+              expectedRunRevision: revision,
+              type: "design_checkpoint",
+              scope: { kind: "detail" },
+              title: `Live drift decision ${tag}`,
+              summary: "decision anchored to the fresh critical evidence",
+              changes: [
+                {
+                  op: "ADD_DECISION" as const,
+                  content: {
+                    title: "Live drift decision",
+                    statement: "The drift source content is authoritative for this plan.",
+                    rationale: "phase 13 live drift setup",
+                    alternatives: ["none"],
+                    consequences: ["finalization revalidates this evidence at commit time"],
+                    scope: "validation",
+                    supportingRefs: [],
+                  },
+                  compactProjection: `live-drift-decision-${tag}`,
+                },
+              ],
+              requiredEvidence: [evidenceRef],
+            });
+            commit(decisionCheckpoint.proposal);
+
+            // Re-complete both Sections (they are needs_review after reopen).
+            for (const sectionId of sectionIds) {
+              sectionWorkflow.createSectionWorkflowService(store, clock).selectSection({
+                runId: current!.runId,
+                workspaceId: current!.workspaceId,
+                sessionId: current!.sessionId,
+                bindingGeneration: current!.generation,
+                expectedRunRevision: revision,
+                sectionId,
+              });
+              const afterSelect2 = store.withRead((tx) => tx.prepare("SELECT revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { r: number });
+              revision = afterSelect2.r;
+              const recompletion = prepare({
+                runId: current!.runId,
+                workspaceId: current!.workspaceId,
+                sessionId: current!.sessionId,
+                bindingGeneration: current!.generation,
+                expectedRunRevision: revision,
+                type: "section_completion",
+                scope: { kind: "section", sectionId },
+                title: `Re-complete ${sectionId}`,
+                summary: "live phase 13 drift re-completion",
+                changes: [{ op: "COMPLETE_SECTION" as const, sectionId, compactProjection: `recomplete:${sectionId}@1` }],
+              });
+              commit(recompletion.proposal);
+            }
+          } else {
+            throw new Error(`phase13-drift expects the run at synthesis for the resume path (run is at '${stageRow.s}')`);
+          }
+        }
+
         const finalRun = store.withRead((tx) => tx.prepare("SELECT stage AS s, revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { s: string; r: number });
         const input = store.withRead((tx) =>
           tx.prepare("SELECT input_id AS inputId, input_hash AS inputHash, input_seq AS seq FROM synthesis_inputs WHERE run_id = ? ORDER BY input_seq DESC LIMIT 1").get(current!.runId),
         ) as { inputId: string; inputHash: string; seq: number } | undefined;
         expect(finalRun.s).toBe("synthesis");
         expect(input).toBeDefined();
+
+        // Phase 13 modes: submit the manifest + the [clean] validation report
+        // through the REAL services (the validator attestation is a sanctioned
+        // fixture fact), leaving the run at stage validation with a clean
+        // report — the exact Phase 13 §103 preparation state.
+        let manifestId: string | undefined;
+        let manifestHash: string | undefined;
+        let reportId: string | undefined;
+        if (phase13 || phase13drift) {
+          const sectionRefs = sectionIds.map((id) => {
+            const rev = store.withRead((tx) =>
+              tx.prepare("SELECT revision AS r FROM snapshot_members WHERE snapshot_id = (SELECT head_snapshot_id FROM plan_heads WHERE run_id = ?) AND kind = 'section' AND artifact_id = ?").get(current!.runId, id),
+            ) as { r: number };
+            return { kind: "section" as const, id, revision: rev.r };
+          });
+          const synthesis = (await import("../src/application/synthesis-service.js")).createSynthesisService(store, clock);
+          const manifestPayload = {
+            version: 1 as const,
+            inputId: input!.inputId,
+            inputHash: input!.inputHash,
+            crossSectionLinks: [
+              { statement: "Live Alpha and Beta share the approved boundary", supportingRefs: sectionRefs },
+            ],
+            implementationOrder: [
+              { stepId: "step-1", title: "Implement Alpha", description: "build alpha", dependsOn: [], supportingRefs: [sectionRefs[0]!] },
+              { stepId: "step-2", title: "Implement Beta", description: "build beta after alpha", dependsOn: ["step-1"], supportingRefs: [sectionRefs[1]!] },
+            ],
+            limitations: [
+              { statement: "Runtime behavior is bounded by the committed constraints", supportingRefs: sectionRefs },
+            ],
+            unresolvedFindings: [],
+          };
+          const synthesisService = synthesis;
+          const accepted = synthesisService.submitSynthesis({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            permissionMode: "plan",
+            inputId: input!.inputId,
+            inputHash: input!.inputHash,
+            manifest: manifestPayload,
+            requestId: `fixture:synthesis-${tag}`,
+            callerAgent: null,
+          });
+          manifestId = accepted.manifestId;
+          manifestHash = accepted.manifestHash;
+          const report = synthesisService.submitValidation({
+            runId: current!.runId,
+            workspaceId: current!.workspaceId,
+            sessionId: current!.sessionId,
+            bindingGeneration: current!.generation,
+            manifestId: accepted.manifestId,
+            manifestHash: accepted.manifestHash,
+            inputId: input!.inputId,
+            inputHash: input!.inputHash,
+            findings: [
+              { kind: "clean" as const, summary: "The manifest is a faithful derivation.", detail: "Live fixture clean report.", subjectRefs: [], supportingRefs: [] },
+            ],
+            requestId: `fixture:validation-${tag}`,
+            callerAgent: { agentId: `live-validator-${tag}`, agentType: "phase-plan:validator" },
+          });
+          expect(report.isClean).toBe(true);
+          reportId = report.reportId;
+          if (phase13drift) {
+            // The SERVICE-level request_finalization freezes the candidate
+            // while the evidence is fresh; the real host later Allows the
+            // approval over drifted source and the commit-time gate denies
+            // (Phase 13 §105, real host, service-frozen candidate).
+            const finalization = (await import("../src/application/finalization-service.js")).createFinalizationService(store, clock);
+            const frozen = finalization.requestFinalization({
+              runId: current!.runId,
+              workspaceId: current!.workspaceId,
+              sessionId: current!.sessionId,
+              bindingGeneration: current!.generation,
+              requestId: `fixture:finalize-${tag}`,
+              callerAgent: null,
+            });
+            const workspace2 = (await import("../src/store/repositories.js")).getWorkspaceById(store, current!.workspaceId)!;
+            fs.writeFileSync(path.join(workspace2.canonicalRoot, "phase-plan-live-drift.txt"), "LIVE DRIFT SOURCE v2 — drifted\\n", "utf8");
+            const finalRun2 = store.withRead((tx) => tx.prepare("SELECT stage AS s, revision AS r FROM planning_runs WHERE run_id = ?").get(current!.runId) as { s: string; r: number });
+            console.log(
+              `LIVE_FIXTURE ${JSON.stringify({
+                mode: "phase13-drift",
+                runId: current!.runId,
+                stage: finalRun2.s,
+                runRevision: finalRun2.r,
+                candidateId: frozen.candidateId,
+                candidateHash: frozen.candidateHash,
+                proposalId: frozen.proposalId,
+                proposalRevision: frozen.proposalRevision,
+                proposalHash: frozen.proposalHash,
+                evidence: evidenceRef,
+                driftFile: "phase-plan-live-drift.txt",
+              })}`,
+            );
+            return;
+          }
+        }
+
         const context = assembleContext(createStoreContextSource(store), current!.runId);
+        if (phase12) {
+          console.log(
+            `LIVE_FIXTURE ${JSON.stringify({
+              mode: "phase12",
+              runId: current!.runId,
+              stage: finalRun.s,
+              runRevision: finalRun.r,
+              inputId: input!.inputId,
+              inputHash: input!.inputHash,
+              inputSeq: input!.seq,
+              sectionIds,
+              epoch: context.epoch,
+              capsule: buildRecoveryCapsule(context).text,
+            })}`,
+          );
+          return;
+        }
         console.log(
           `LIVE_FIXTURE ${JSON.stringify({
-            mode: "phase12",
+            mode: "phase13",
             runId: current!.runId,
             stage: finalRun.s,
             runRevision: finalRun.r,
             inputId: input!.inputId,
             inputHash: input!.inputHash,
             inputSeq: input!.seq,
+            manifestId,
+            manifestHash,
+            reportId,
             sectionIds,
             epoch: context.epoch,
             capsule: buildRecoveryCapsule(context).text,

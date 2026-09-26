@@ -6,6 +6,7 @@ import { createObservationEvidenceMigration } from "../src/store/migrations/006-
 import { createEvidenceFreshnessMigration } from "../src/store/migrations/007-evidence-freshness-foundation.js";
 import { createSectionWorkflowMigration } from "../src/store/migrations/008-section-workflow.js";
 import { createSynthesisValidationMigration } from "../src/store/migrations/009-synthesis-validation-foundation.js";
+import { createFinalizationFinalPlanMigration } from "../src/store/migrations/010-finalization-final-plan.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
@@ -95,6 +96,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createEvidenceFreshnessMigration(),
             createSectionWorkflowMigration(),
             createSynthesisValidationMigration(),
+            createFinalizationFinalPlanMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -143,6 +145,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createEvidenceFreshnessMigration(),
             createSectionWorkflowMigration(),
             createSynthesisValidationMigration(),
+            createFinalizationFinalPlanMigration(),
           ],
           clock,
         }),

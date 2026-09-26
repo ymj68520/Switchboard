@@ -50,7 +50,7 @@ describe("SessionStart Recovery Capsule (§29, E17/E18)", () => {
       commitCheckpoint(fixture, [{ op: "ADD_CONSTRAINT", content: CONSTRAINT_1, compactProjection: "CONST-1@1 committed" }]);
       const context = additionalContext(await handleSessionStart(deps, sessionStartInput(fixture, "startup", "plan")));
       expect(context).toContain("Phase Plan active:");
-      expect(context).toContain("[Phase Plan Recovery v3]");
+      expect(context).toContain("[Phase Plan Recovery v4]");
       expect(context).toContain(`id=${fixture.runId}`);
       expect(context).toContain("stage=architecture");
       expect(context).toContain("goal=proposal fixture");
@@ -76,7 +76,7 @@ describe("SessionStart Recovery Capsule (§29, E17/E18)", () => {
   it("resume in non-plan mode keeps the exact A1 wording appended to the capsule (E19)", async () => {
     await withFixture(async (fixture, deps) => {
       const context = additionalContext(await handleSessionStart(deps, sessionStartInput(fixture, "resume", "default")));
-      expect(context).toContain("[Phase Plan Recovery v3]");
+      expect(context).toContain("[Phase Plan Recovery v4]");
       expect(context).toContain("Phase Plan run recovered.");
       expect(context).toContain("Claude Plan Mode must be restored by invoking /phase-plan.");
     });
@@ -96,7 +96,7 @@ describe("SessionStart Recovery Capsule (§29, E17/E18)", () => {
       expect(context).toContain("CONTEXT_RECOVERY_FAILED");
       expect(context).toContain("error=CONTEXT_BUDGET_EXCEEDED");
       expect(context).toContain("Do not continue planning on stale context; invoke /phase-plan.");
-      expect(context).not.toContain("[Phase Plan Recovery v3]");
+      expect(context).not.toContain("[Phase Plan Recovery v4]");
     });
   });
 
@@ -119,7 +119,7 @@ describe("UserPromptSubmit delta context (§34, E5)", () => {
       });
       expect(before.kind).toBe("json");
       const marker = ((before as { kind: "json"; payload: Record<string, unknown> }).payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
-      expect(marker).toMatch(/^Phase Plan context epoch: context-epoch:v3:[0-9a-f]{64}\nUse phase_plan\.get_context if context appears stale\.$/);
+      expect(marker).toMatch(/^Phase Plan context epoch: context-epoch:v4:[0-9a-f]{64}\nUse phase_plan\.get_context if context appears stale\.$/);
 
       // After a commit the epoch marker changes (E5).
       commitCheckpoint(fixture, [{ op: "ADD_CONSTRAINT", content: CONSTRAINT_1, compactProjection: "CONST-1@1 committed" }]);
@@ -132,7 +132,7 @@ describe("UserPromptSubmit delta context (§34, E5)", () => {
       const marker2 = ((after as { kind: "json"; payload: Record<string, unknown> }).payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
       expect(marker2).not.toBe(marker);
       // The marker never carries the full capsule.
-      expect(marker2).not.toContain("[Phase Plan Recovery v3]");
+      expect(marker2).not.toContain("[Phase Plan Recovery v4]");
     });
   });
 

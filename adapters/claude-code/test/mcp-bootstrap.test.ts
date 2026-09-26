@@ -46,8 +46,8 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
           serverInfo: { name: "phase-plan", version: "0.1.0" },
         });
-        // Phase 12 (§95): thirteen tools — the Phase 11 set plus submit_
-        // synthesis, submit_validation, request_reopen; approve_proposal keeps the flag.
+        // Phase 13 (§87): fourteen tools — the Phase 12 set plus
+        // request_finalization; approve_proposal keeps the flag.
         const tools = (
           parsed.find((m) => m.id === 2)?.result as {
             tools: Array<{ name: string; _meta?: Record<string, unknown> }>;
@@ -67,6 +67,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
           "submit_synthesis",
           "submit_validation",
           "request_reopen",
+          "request_finalization",
         ]);
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
           "anthropic/requiresUserInteraction": true,
@@ -105,7 +106,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       await fs.writeFile(databasePath, "");
       // Leave a schema-2 marker via raw connection (test-only manipulation).
       const raw = rawConnection(databasePath, 500);
-      raw.exec("PRAGMA user_version = 10");
+      raw.exec("PRAGMA user_version = 11");
       raw.close();
 
       const result = await runMcpSmoke(process.execPath, BUNDLE, {
@@ -119,7 +120,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       expect(result.stderr).toContain("STORE_SCHEMA_TOO_NEW");
       expect(result.stdoutLines).toEqual([]);
       // Untouched: still the too-new marker, never downgraded.
-      expect(rawConnectionQueried(databasePath)).toBe(10);
+      expect(rawConnectionQueried(databasePath)).toBe(11);
     } finally {
       removeTempPluginDataRoot(pluginDataRoot);
     }

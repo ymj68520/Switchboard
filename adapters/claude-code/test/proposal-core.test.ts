@@ -281,7 +281,16 @@ describe("proposal canonical representation and hash (§22/§23/§24)", () => {
     delete v1.requiredEvidence;
     expect(() => parseProposalCanonical(v1)).not.toThrow();
     expect(parseProposalCanonical(v1).version).toBe(1);
-    expect(() => parseProposalCanonical({ ...v1Parsed, version: 3 })).toThrowError(/marker/);
+    expect(() => parseProposalCanonical({ ...v1Parsed, version: 4 })).toThrowError(/marker/);
+    // Phase 13 §37/§97 — V3 parses ONLY with a well-formed finalPlanCandidate
+    // binding; a malformed one is a typed structure error, not a marker miss.
+    expect(() => parseProposalCanonical({ ...v1Parsed, version: 3 })).toThrowError(/finalPlanCandidate/);
+    const v3 = {
+      ...v1Parsed,
+      version: 3,
+      finalPlanCandidate: { candidateId: "fpc_x", candidateHash: "sha256:" + "0".repeat(64) },
+    };
+    expect(parseProposalCanonical(v3).version).toBe(3);
     expect(() =>
       parseProposalCanonical({ ...v1Parsed, version: 2, requiredEvidence: "not-an-array" }),
     ).toThrowError(/requiredEvidence/);

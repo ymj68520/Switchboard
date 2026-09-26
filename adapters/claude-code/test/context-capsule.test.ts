@@ -34,7 +34,7 @@ async function capsuleFor(fn: (fixture: ContextFixture) => void, options?: { max
 describe("Recovery Capsule rendering (§17, E7/E14)", () => {
   it("renders a stable segmented shape for a fresh run", async () => {
     const capsule = await capsuleFor(() => {});
-    expect(capsule.text.split("\n")[0]).toBe("[Phase Plan Recovery v3]");
+    expect(capsule.text.split("\n")[0]).toBe("[Phase Plan Recovery v4]");
     for (const marker of [
       "Run:",
       "HEAD:",
@@ -111,7 +111,7 @@ describe("Recovery Capsule budget (§18/§19, E15/E16)", () => {
         compactProjection: "ARCH-1@1 | long projection | ".padEnd(400, "x"),
       });
       publishHead(fixture, [c, arch]);
-    }, { maxChars: 900 });
+    }, { maxChars: 950 });
     expect(capsule.truncated).toBe(true);
     // P0 facts survive (E16 — never silently removed):
     expect(capsule.text).toContain("- C-1@1 (user): No network access at runtime");

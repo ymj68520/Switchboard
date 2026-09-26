@@ -233,6 +233,15 @@ describe("§19/§70/§110 — legacy schema-8 synthesis runs", () => {
       // touching the run row: stage synthesis, no input possible.
       const db = rawConnection(storePathsFor(f.root).databasePath, 5000);
       try {
+        for (const table of ["final_plans", "proposal_final_plan_refs", "final_plan_candidate_refs", "final_plan_candidates", "evidence_audit_entries", "evidence_audit_snapshots"]) {
+          db.exec(`DROP TABLE IF EXISTS ${table}`);
+        }
+        for (const kind of ["update", "delete"]) {
+          for (const table of ["evidence_audit_snapshots", "evidence_audit_entries", "final_plan_candidates", "final_plan_candidate_refs", "proposal_final_plan_refs", "final_plans"]) {
+            db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+          }
+        }
+        db.exec("DELETE FROM schema_migrations WHERE version = 10");
         for (const table of ["synthesis_manifest_refs", "synthesis_manifests", "semantic_validation_findings", "semantic_validation_reports", "synthesis_input_refs", "synthesis_input_evidence", "synthesis_inputs"]) {
           db.exec(`DROP TABLE IF EXISTS ${table}`);
         }
