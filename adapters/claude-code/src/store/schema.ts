@@ -167,6 +167,28 @@ const SCHEMA_V7_INDEXES = [
   "idx_evidence_derived_refs_upstream",
 ] as const;
 
+/** Section workflow tables required once the store has reached v8 (Phase 11 §3). */
+const SCHEMA_V8_TABLES = [
+  "section_workflow_events",
+  "section_workflow_states",
+  "planning_active_work",
+] as const;
+
+/** Immutability triggers required once the store has reached v8. The
+ * materialized state is a projection (UPDATE is its normal operation), so
+ * only its deletion is fenced. planning_active_work is ordinary mutable
+ * workflow state and carries no immutability triggers. */
+const SCHEMA_V8_TRIGGERS = [
+  "section_workflow_events_no_update",
+  "section_workflow_events_no_delete",
+  "section_workflow_states_no_delete",
+] as const;
+
+/** Constraint index backing the deterministic per-Section workflow history. */
+const SCHEMA_V8_INDEXES = [
+  "idx_section_workflow_events_section",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -435,6 +457,115 @@ function validateSchemaV7(db: StoreConnection | StoreTx, problems: string[]): vo
 }
 
 /**
+ * Structural + data checks for schema v8 (Phase 11 §69): table/trigger/index
+ * presence plus the workflow-invariant facts — materialized state matches its
+ * last event, every Section identity has a workflow state, completion
+ * provenance references real Section revisions, and active work points at a
+ * Section in the run's current HEAD snapshot. Targeted LIMIT-1 queries only —
+ * never a full-history replay at store open.
+ */
+function validateSchemaV8(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V8_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 8`);
+    }
+  }
+  for (const trigger of SCHEMA_V8_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 8`);
+    }
+  }
+  for (const index of SCHEMA_V8_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 8`);
+    }
+  }
+  if (SCHEMA_V8_TABLES.some((table) => !objectNames.has(table))) {
+    return; // further queries would just cascade errors
+  }
+  // The data-level checks below also read Plan Memory base tables; when an
+  // earlier-version validator has already flagged those as missing, skip
+  // instead of cascading SQL errors.
+  const baseWorldPresent =
+    objectNames.has("memory_artifacts") && objectNames.has("memory_revisions") && objectNames.has("plan_heads") && objectNames.has("snapshot_members");
+  if (!baseWorldPresent) {
+    return;
+  }
+  // Materialized state must equal its last workflow event's target state (§7/§69).
+  const stateEventDrift = db
+    .prepare(
+      "SELECT s.run_id AS runId, s.section_id AS sectionId FROM section_workflow_states s "
+      + "JOIN section_workflow_events e ON e.run_id = s.run_id AND e.event_seq = s.last_event_seq "
+      + "WHERE e.to_state != s.status LIMIT 1",
+    )
+    .get() as { runId?: string; sectionId?: string } | undefined;
+  if (stateEventDrift !== undefined) {
+    problems.push(
+      `section workflow state '${stateEventDrift.sectionId}' in run '${stateEventDrift.runId}' does not match its last workflow event`,
+    );
+  }
+  // Every Section identity has a workflow state row (backfill completeness).
+  const missingState = db
+    .prepare(
+      "SELECT a.run_id AS runId, a.artifact_id AS sectionId FROM memory_artifacts a "
+      + "WHERE a.kind = 'section' AND NOT EXISTS ("
+      + "SELECT 1 FROM section_workflow_states s WHERE s.run_id = a.run_id AND s.section_id = a.artifact_id) LIMIT 1",
+    )
+    .get() as { runId?: string; sectionId?: string } | undefined;
+  if (missingState !== undefined) {
+    problems.push(`section '${missingState.sectionId}' in run '${missingState.runId}' has no workflow state`);
+  }
+  // A workflow state without a real Section identity is corruption.
+  const orphanState = db
+    .prepare(
+      "SELECT s.run_id AS runId, s.section_id AS sectionId FROM section_workflow_states s "
+      + "WHERE NOT EXISTS ("
+      + "SELECT 1 FROM memory_artifacts a WHERE a.run_id = s.run_id AND a.kind = 'section' AND a.artifact_id = s.section_id) LIMIT 1",
+    )
+    .get() as { runId?: string; sectionId?: string } | undefined;
+  if (orphanState !== undefined) {
+    problems.push(
+      `section workflow state '${orphanState.sectionId}' in run '${orphanState.runId}' references a missing section identity`,
+    );
+  }
+  // completed_revision must reference a real Section revision (§69).
+  const badCompletedRevision = db
+    .prepare(
+      "SELECT s.run_id AS runId, s.section_id AS sectionId, s.completed_revision AS revision FROM section_workflow_states s "
+      + "WHERE s.completed_revision IS NOT NULL AND NOT EXISTS ("
+      + "SELECT 1 FROM memory_revisions m WHERE m.run_id = s.run_id AND m.kind = 'section' "
+      + "AND m.artifact_id = s.section_id AND m.revision = s.completed_revision) LIMIT 1",
+    )
+    .get() as { runId?: string; sectionId?: string; revision?: number } | undefined;
+  if (badCompletedRevision !== undefined) {
+    problems.push(
+      `completed revision ${badCompletedRevision.revision} for section '${badCompletedRevision.sectionId}' in run '${badCompletedRevision.runId}' references a missing section revision`,
+    );
+  }
+  // Active work must point at a Section in the run's current HEAD snapshot (§69).
+  const badActiveWork = db
+    .prepare(
+      "SELECT w.run_id AS runId, w.section_id AS sectionId FROM planning_active_work w "
+      + "WHERE NOT EXISTS ("
+      + "SELECT 1 FROM plan_heads h JOIN snapshot_members sm ON sm.snapshot_id = h.head_snapshot_id "
+      + "WHERE h.run_id = w.run_id AND sm.run_id = w.run_id AND sm.kind = 'section' AND sm.artifact_id = w.section_id) LIMIT 1",
+    )
+    .get() as { runId?: string; sectionId?: string } | undefined;
+  if (badActiveWork !== undefined) {
+    problems.push(
+      `active section '${badActiveWork.sectionId}' in run '${badActiveWork.runId}' is not present in the current HEAD snapshot`,
+    );
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -442,7 +573,8 @@ function validateSchemaV7(db: StoreConnection | StoreTx, problems: string[]): vo
  * integrity checks apply as well; from version 4 the structural Plan Memory
  * checks apply; from version 5 the Proposal/Approval/PlanCommit structural
  * checks apply; from version 6 the Observation/Evidence structural checks
- * apply; from version 7 the Evidence freshness structural checks apply.
+ * apply; from version 7 the Evidence freshness structural checks apply;
+ * from version 8 the Section workflow structural checks apply.
  */
 export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   const version = readSchemaVersion(db);
@@ -484,6 +616,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 7) {
     validateSchemaV7(db, problems);
+  }
+  if (version >= 8) {
+    validateSchemaV8(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

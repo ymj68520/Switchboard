@@ -70,8 +70,44 @@ import {
   type EvidenceValidationStrategy,
 } from "../store/evidence.js";
 import { assertWritableBindingInTx } from "../store/session-bindings.js";
+import { getHeadPairInTx } from "../store/plan-commits.js";
+import { getSnapshotRefsInTx } from "../store/plan-memory.js";
+import { propagateEvidenceSectionReviewInTx } from "./section-workflow-service.js";
+import type { MemoryRef } from "../core/memory-refs.js";
 import type { CapturedObservation, SourceFingerprint } from "../observations/types.js";
 import { getObservationRecord } from "../store/observations.js";
+
+/**
+ * Phase 11 §45–§48 — after REAL evidence-basis events (SOURCE_CHANGED,
+ * REPLACED, INVALIDATED, or a propagated real UPSTREAM_CHANGED — never a
+ * FILE_CHANGED_HINT, §46) have been appended, completed Sections whose
+ * completion Proposal required exactly those Evidence revisions transition to
+ * needs_review, then completed downstream Sections follow recursively. Runs
+ * in the SAME transaction as the evidence events.
+ */
+function propagateSectionReviewInTx(
+  tx: StoreTx,
+  input: {
+    runId: string;
+    affected: EvidenceRef[];
+    requestId?: string | null;
+    clock: StoreClock;
+  },
+): void {
+  if (input.affected.length === 0) return;
+  const head = getHeadPairInTx(tx, input.runId);
+  const headSectionRefs: MemoryRef[] = head === null ? [] : (getSnapshotRefsInTx(tx, head.headSnapshotId) ?? []);
+  propagateEvidenceSectionReviewInTx(
+    tx,
+    {
+      runId: input.runId,
+      headSectionRefs,
+      affectedEvidence: input.affected.map((ref) => ({ evidenceId: ref.evidenceId, revision: ref.revision })),
+      ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    },
+    input.clock,
+  );
+}
 
 export { FRESHNESS_STATES };
 
@@ -394,6 +430,7 @@ export function evaluateCriticalEvidenceGateInTx(
 ): EvidenceGateOutcome {
   const failures: EvidenceGateFailure[] = [];
   const visited = new Set<string>();
+  const sectionReviewAffected: EvidenceRef[] = [];
 
   const check = (ref: EvidenceRef): void => {
     const key = keyOf(ref);
@@ -450,6 +487,7 @@ export function evaluateCriticalEvidenceGateInTx(
         eventId: `FRE-${input.clock.newId()}`,
         createdAt: input.clock.nowIso(),
       });
+      sectionReviewAffected.push({ evidenceId: ref.evidenceId, revision: ref.revision });
       failures.push({
         evidence_id: ref.evidenceId,
         revision: ref.revision,
@@ -481,6 +519,14 @@ export function evaluateCriticalEvidenceGateInTx(
     }
     check(ref);
   }
+  // Phase 11 §48 — real basis changes discovered by the gate also trigger the
+  // Section review bridge in this same transaction (on the §37 persist path
+  // the re-run repeats the discovery and re-fires the bridge durably).
+  propagateSectionReviewInTx(tx, {
+    runId: input.runId,
+    affected: sectionReviewAffected,
+    clock: input.clock,
+  });
   return { ok: failures.length === 0, failures };
 }
 
@@ -819,6 +865,13 @@ export function createEvidenceFreshnessService(store: PlanStore, blobs: BlobStor
           requestId: input.operationId,
           clock,
         });
+        // Phase 11 §48 — real basis change → Section review bridge.
+        propagateSectionReviewInTx(tx, {
+          runId: input.runId,
+          affected: [{ evidenceId: request.evidenceId, revision: request.revision }, ...affected],
+          requestId: input.operationId,
+          clock,
+        });
         return {
           status: "source_changed" as const,
           idempotent: false,
@@ -901,6 +954,13 @@ export function createEvidenceFreshnessService(store: PlanStore, blobs: BlobStor
           runId: input.runId,
           changedRef: targetRef,
           cause: "INVALIDATED",
+          requestId: input.operationId,
+          clock,
+        });
+        // Phase 11 §48 — invalidation → Section review bridge.
+        propagateSectionReviewInTx(tx, {
+          runId: input.runId,
+          affected: [targetRef, ...affected],
           requestId: input.operationId,
           clock,
         });
@@ -1033,6 +1093,14 @@ export function createEvidenceFreshnessService(store: PlanStore, blobs: BlobStor
         runId: input.runId,
         changedRef: targetRef,
         cause: "REPLACED",
+        requestId: input.operationId,
+        clock,
+      });
+      // Phase 11 §48/§49 — the REPLACED old revision triggers the Section
+      // review bridge; the fresh EV@N+1 NEVER auto re-completes anything.
+      propagateSectionReviewInTx(tx, {
+        runId: input.runId,
+        affected: [targetRef, ...affected],
         requestId: input.operationId,
         clock,
       });

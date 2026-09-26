@@ -1,20 +1,28 @@
 /**
- * Proposal domain vocabulary and parsers (frozen plan Phase 6 §6–§15/§84).
+ * Proposal domain vocabulary and parsers (frozen plan Phase 6 §6–§15/§84;
+ * Phase 11 §23/§26–§31/§39–§40).
  *
  * A Proposal is the frozen, hashable boundary between working discussion and
  * committed design. Identity (run + opaque server-generated proposal id) is
  * separate from revisions (immutable frozen content, strict max+1) and from
  * state (awaiting_approval → approved/rejected/superseded, terminal).
  *
- * The schema recognizes the full frozen proposal-type vocabulary, but the
- * Phase 6 production Transaction Engine only opens design_checkpoint,
- * architecture_completion, and amendment — section_completion and final_plan
- * fail closed with PROPOSAL_TYPE_UNAVAILABLE rather than faking Section
- * lifecycle or Finalization semantics that do not exist yet.
+ * The schema recognizes the full frozen proposal-type vocabulary. The
+ * production Transaction Engine opens design_checkpoint,
+ * architecture_completion, amendment, and (since Phase 11) section_completion
+ * — final_plan still fails closed with PROPOSAL_TYPE_UNAVAILABLE rather than
+ * faking Finalization semantics that do not exist yet.
  *
  * Normalized changes carry refs WITHOUT the owning runId (the canonical
  * representation pins runId once at the root); every parser rebinds them to
  * the owning run so cross-run contamination is invalid by construction.
+ *
+ * Phase 11 workflow ops (§31/§39): COMPLETE_SECTION and REOPEN_SECTION create
+ * NO artifact revision — they are exact-revision-bound workflow facts that
+ * enter the canonical hash. Normalization resolves them to the candidate
+ * revision the proposal itself produces (COMPLETE) or pins the base revision
+ * being reopened (REOPEN), and fixes the per-Section application order to
+ * REOPEN → design mutation → COMPLETE regardless of model array order (§40).
  */
 
 import {
@@ -48,10 +56,11 @@ export const PROPOSAL_TYPES = [
 
 export type ProposalType = (typeof PROPOSAL_TYPES)[number];
 
-/** Types the Phase 6 Transaction Engine actually implements. */
+/** Types the production Transaction Engine actually implements. */
 export const PRODUCTION_PROPOSAL_TYPES = [
   "design_checkpoint",
   "architecture_completion",
+  "section_completion",
   "amendment",
 ] as const satisfies readonly ProposalType[];
 
@@ -63,7 +72,16 @@ export function isProductionProposalType(value: string): value is (typeof PRODUC
   return (PRODUCTION_PROPOSAL_TYPES as readonly string[]).includes(value);
 }
 
-export type ProposalScope = { kind: "architecture" } | { kind: "section"; sectionId: string };
+/**
+ * Proposal scope vocabulary (Phase 11 §23):
+ *   architecture — architecture checkpoint / completion / amendment
+ *   detail       — dynamic Section DAG decomposition / cross-section checkpoint
+ *   section      — one Section design / checkpoint / completion / amendment
+ */
+export type ProposalScope =
+  | { kind: "architecture" }
+  | { kind: "detail" }
+  | { kind: "section"; sectionId: string };
 
 export const PROPOSAL_STATUSES = [
   "awaiting_approval",
@@ -124,6 +142,13 @@ export interface RawChangeTarget {
  * ops get server-generated ids, mutation ops pin an exact base target, and
  * the server derives every result revision (frozen plan §14). Content is
  * typed per op and validated by the same parsers as committed memory.
+ *
+ * Phase 11 additions: a section CREATE may carry a request-local `localRef`
+ * alias so other changes in the SAME request can depend on it before any
+ * server id exists (§27) — the alias never persists. COMPLETE_SECTION /
+ * REOPEN_SECTION name a Section by id or alias and are resolved by the
+ * normalizer to exact candidate revisions (§31/§40); they never carry
+ * revisions themselves.
  */
 export type RawProposalChange =
   | { op: "ADD_CONSTRAINT"; content: ConstraintContent; compactProjection: string; fullProjection?: string }
@@ -131,7 +156,9 @@ export type RawProposalChange =
   | { op: "ADD_DECISION"; content: DecisionContent; compactProjection: string; fullProjection?: string }
   | { op: "SUPERSEDE_DECISION"; target: RawChangeTarget; content: DecisionContent; compactProjection: string; fullProjection?: string }
   | { op: "SET_ARCHITECTURE_REVISION"; target: RawChangeTarget | null; content: Omit<ArchitectureContent, never>; compactProjection: string; fullProjection?: string }
-  | { op: "SET_SECTION_REVISION"; target: RawChangeTarget | null; content: RawSectionContent; compactProjection: string; fullProjection?: string }
+  | { op: "SET_SECTION_REVISION"; target: RawChangeTarget | null; content: RawSectionContent; compactProjection: string; fullProjection?: string; localRef?: string }
+  | { op: "COMPLETE_SECTION"; sectionId: string; compactProjection: string }
+  | { op: "REOPEN_SECTION"; sectionId: string; compactProjection: string }
   | { op: "ADD_OPEN_QUESTION"; content: OpenQuestionContent; compactProjection: string; fullProjection?: string }
   | { op: "RESOLVE_OPEN_QUESTION"; target: RawChangeTarget; content: RawResolvedQuestionContent; compactProjection: string; fullProjection?: string }
   | { op: "ADD_CONFLICT"; content: ConflictContent; compactProjection: string; fullProjection?: string }
@@ -180,6 +207,8 @@ export type NormalizedProposalChange =
   | { op: "SUPERSEDE_DECISION"; target: ArtifactRef; artifactId: string; content: DecisionContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
   | { op: "SET_ARCHITECTURE_REVISION"; target: ArtifactRef | null; artifactId: string; content: ArchitectureContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
   | { op: "SET_SECTION_REVISION"; target: ArtifactRef | null; artifactId: string; content: SectionContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
+  | { op: "COMPLETE_SECTION"; artifactId: string; target: ArtifactRef; result: ArtifactRef; compactProjection: string }
+  | { op: "REOPEN_SECTION"; artifactId: string; target: ArtifactRef; result: ArtifactRef; compactProjection: string }
   | { op: "ADD_OPEN_QUESTION"; artifactId: string; content: OpenQuestionContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
   | { op: "RESOLVE_OPEN_QUESTION"; target: ArtifactRef; artifactId: string; content: OpenQuestionContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
   | { op: "ADD_CONFLICT"; artifactId: string; content: ConflictContent; result: ArtifactRef; compactProjection: string; fullProjection?: string }
@@ -192,11 +221,20 @@ export const PROPOSAL_CHANGE_OPS = [
   "SUPERSEDE_DECISION",
   "SET_ARCHITECTURE_REVISION",
   "SET_SECTION_REVISION",
+  "COMPLETE_SECTION",
+  "REOPEN_SECTION",
   "ADD_OPEN_QUESTION",
   "RESOLVE_OPEN_QUESTION",
   "ADD_CONFLICT",
   "RESOLVE_CONFLICT",
 ] as const;
+
+/** Workflow ops create no artifact revision — they bind exact-revision facts. */
+export const SECTION_WORKFLOW_CHANGE_OPS = ["COMPLETE_SECTION", "REOPEN_SECTION"] as const;
+
+export function isSectionWorkflowChangeOp(op: ProposalChangeOp): boolean {
+  return op === "COMPLETE_SECTION" || op === "REOPEN_SECTION";
+}
 
 export type ProposalChangeOp = (typeof PROPOSAL_CHANGE_OPS)[number];
 
@@ -216,6 +254,8 @@ export function changeOpKind(op: ProposalChangeOp): MemoryArtifactKind {
     case "SET_ARCHITECTURE_REVISION":
       return "architecture";
     case "SET_SECTION_REVISION":
+    case "COMPLETE_SECTION":
+    case "REOPEN_SECTION":
       return "section";
     case "ADD_OPEN_QUESTION":
     case "RESOLVE_OPEN_QUESTION":
@@ -226,7 +266,12 @@ export function changeOpKind(op: ProposalChangeOp): MemoryArtifactKind {
   }
 }
 
-/** Mutation target of a change, or null for creates (ADD ops and null-target SETs). */
+/**
+ * Mutation target of a change, or null for creates (ADD ops and null-target
+ * SETs). Workflow ops are never creates: they bind exact Section revisions,
+ * but the commit engine must still treat them separately (they write no
+ * memory revision).
+ */
 export function changeTarget(change: NormalizedProposalChange): ArtifactRef | null {
   if (
     change.op === "ADD_CONSTRAINT" ||
@@ -323,6 +368,34 @@ export function parseNormalizedProposalChange(value: unknown, runId: string): No
     } as NormalizedProposalChange;
   }
 
+  // Phase 11 §31/§39: persisted workflow facts. No content; the projection
+  // field is still required (uniform change shape). COMPLETE binds one exact
+  // candidate revision (target == result); REOPEN pins the base revision it
+  // reopens (target) and the candidate revision it lands on (result).
+  if (op === "COMPLETE_SECTION" || op === "REOPEN_SECTION") {
+    if (typeof raw.artifactId !== "string" || raw.artifactId === "") {
+      throw proposalInvalid(`${op} requires a server-assigned artifactId`);
+    }
+    if (raw.content !== undefined) throw proposalInvalid(`${op} must not carry content`);
+    if (raw.fullProjection !== undefined) throw proposalInvalid(`${op} must not carry fullProjection`);
+    const target = requireTargetRef(raw.target, "section");
+    const result = requireArtifactRef(raw.result, "section", raw.artifactId);
+    if (target.id !== raw.artifactId) throw proposalInvalid(`${op} target.id must match the artifactId`);
+    if (op === "COMPLETE_SECTION" && (target.revision !== result.revision)) {
+      throw proposalInvalid("COMPLETE_SECTION must bind exactly one candidate revision (target == result)");
+    }
+    if (op === "REOPEN_SECTION" && result.revision < target.revision) {
+      throw proposalInvalid("REOPEN_SECTION result revision cannot precede the reopened base revision");
+    }
+    return {
+      op,
+      artifactId: raw.artifactId,
+      target,
+      result,
+      compactProjection,
+    } as NormalizedProposalChange;
+  }
+
   // SUPERSEDE_*/RESOLVE_*: target is required and pins the base revision.
   if (!isRawChangeTarget(raw.target)) {
     throw proposalInvalid(`${op} requires an exact target ref`);
@@ -390,13 +463,17 @@ export function parseProposalScope(value: unknown): ProposalScope {
     if (Object.keys(raw).length !== 1) throw proposalInvalid("architecture scope carries no extra fields");
     return { kind: "architecture" };
   }
+  if (raw.kind === "detail") {
+    if (Object.keys(raw).length !== 1) throw proposalInvalid("detail scope carries no extra fields");
+    return { kind: "detail" };
+  }
   if (raw.kind === "section") {
     if (typeof raw.sectionId !== "string" || raw.sectionId === "" || Object.keys(raw).length !== 2) {
       throw proposalInvalid("section scope requires exactly a sectionId");
     }
     return { kind: "section", sectionId: raw.sectionId };
   }
-  throw proposalInvalid("scope.kind must be 'architecture' or 'section'");
+  throw proposalInvalid("scope.kind must be 'architecture', 'detail', or 'section'");
 }
 
 /** Parse persisted impact JSON; impact never carries authority (§21). */

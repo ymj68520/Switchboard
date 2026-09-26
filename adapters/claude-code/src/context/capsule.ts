@@ -25,12 +25,14 @@ import {
   architectureSegment,
   awaitingProposalSegment,
   blockingSegment,
+  dependencyContractsSegment,
   hardConstraintsSegment,
   headSegment,
   operationsSegment,
   renderRecoveryCapsule,
   runSegment,
   sectionsSegment,
+  sectionWorkflowSegment,
   type CapsuleSegment,
 } from "./render.js";
 
@@ -52,14 +54,16 @@ export interface RecoveryCapsule {
   epoch: string;
 }
 
-/** Segment display order (§17 sketch); budget priority rides on `required`. */
+/** Segment display order (§17 sketch + Phase 11 §50); budget priority rides on `required`. */
 function capsuleSegments(context: PhasePlanContext): CapsuleSegment[] {
   return [
     runSegment(context),
     headSegment(context),
     hardConstraintsSegment(context),
     architectureSegment(context),
-    activeScopeSegment(),
+    activeScopeSegment(context),
+    sectionWorkflowSegment(context),
+    dependencyContractsSegment(context),
     blockingSegment(context),
     awaitingProposalSegment(context),
     sectionsSegment(context),

@@ -17,6 +17,7 @@ import { getPlanningRunRecord } from "../store/planning-runs.js";
 import { getHeadCommitRecord } from "../store/plan-commits.js";
 import { getHeadSnapshotRecord, readMemoryRevisionRecord } from "../store/plan-memory.js";
 import { getAwaitingProposalRecord } from "../store/proposals.js";
+import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type {
   CommittedRevisionView,
@@ -33,6 +34,18 @@ export function createStoreContextSource(store: PlanStore): ContextSource {
       return run === null
         ? null
         : { runId: run.runId, lifecycle: run.lifecycle, stage: run.stage, revision: run.revision, goal: run.goal };
+    },
+
+    getActiveSection(runId: string): string | null {
+      return getActiveSection(store, runId);
+    },
+
+    listSectionWorkflowStates(runId) {
+      return listSectionWorkflowStates(store, runId).map((state) => ({
+        sectionId: state.sectionId,
+        status: state.status,
+        completedRevision: state.completedRevision ?? null,
+      }));
     },
 
     getHeadPair(runId: string): ContextHead {

@@ -9,6 +9,8 @@ import { createPlanningRunMigration } from "../src/store/migrations/003-planning
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
 import { createProposalApprovalCommitMigration } from "../src/store/migrations/005-proposal-approval-plan-commit.js";
 import { createObservationEvidenceMigration } from "../src/store/migrations/006-observation-evidence-foundation.js";
+import { createEvidenceFreshnessMigration } from "../src/store/migrations/007-evidence-freshness-foundation.js";
+import { createSectionWorkflowMigration } from "../src/store/migrations/008-section-workflow.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore, openPlanStore } from "../src/store/sqlite-store.js";
@@ -34,11 +36,11 @@ function makeSchema1Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
+    for (const table of ["section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts", "planning_runs"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     for (const kind of ["update", "delete"]) {
-      for (const table of ["observations", "evidence_artifacts", "evidence_revisions", "evidence_observation_refs", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "audit_events"]) {
+      for (const table of ["observations", "evidence_artifacts", "evidence_revisions", "evidence_observation_refs", "section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "audit_events"]) {
         raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
     }
@@ -54,10 +56,14 @@ for (const kind of ["update", "delete"]) {
     raw.exec("DROP TRIGGER IF EXISTS evidence_validation_events_no_delete");
     raw.exec("DROP TRIGGER IF EXISTS evidence_validation_events_no_revival");
     raw.exec("DROP TRIGGER IF EXISTS evidence_current_states_no_delete");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_update");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_delete");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_states_no_delete");
     raw.exec("DROP TRIGGER IF EXISTS proposal_evidence_refs_no_update");
     raw.exec("DROP TRIGGER IF EXISTS proposal_evidence_refs_no_delete");
     raw.exec("DROP INDEX IF EXISTS idx_evidence_validation_events_revision");
     raw.exec("DROP INDEX IF EXISTS idx_evidence_derived_refs_upstream");
+    raw.exec("DROP INDEX IF EXISTS idx_section_workflow_events_section");
     raw.exec("DELETE FROM schema_migrations WHERE version >= 2");
     raw.exec("DROP INDEX IF EXISTS idx_session_bindings_active_session");
     raw.exec("PRAGMA user_version = 1");
@@ -96,6 +102,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
           { version: 5, name: "proposal-approval-plan-commit" },
           { version: 6, name: "observation-evidence-foundation" },
           { version: 7, name: "evidence-freshness-foundation" },
+          { version: 8, name: "section-workflow" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM phase2_sentinel").all(),
@@ -107,7 +114,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-7-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-8-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       // The backup captures the SOURCE state (schema 1 + sentinel).
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
@@ -151,6 +158,8 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
             createPlanMemoryMigration(),
             createProposalApprovalCommitMigration(),
             createObservationEvidenceMigration(),
+            createEvidenceFreshnessMigration(),
+            createSectionWorkflowMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -171,7 +180,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(7);
+      expect(retry.getSchemaVersion()).toBe(8);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -187,7 +196,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       makeSchema1Store(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(7);
+        expect(store.getSchemaVersion()).toBe(8);
       } finally {
         store.close();
       }
@@ -231,11 +240,11 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       createSchema0Database(databasePath, "chain-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(7);
+        expect(store.getSchemaVersion()).toBe(8);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
         ) as { version: number }[];
-        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -244,7 +253,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
         store.close();
       }
       expect(publishedBackups(backupsDir)).toHaveLength(1);
-      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-7-/);
+      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-8-/);
     } finally {
       removeTempPluginDataRoot(root);
     }

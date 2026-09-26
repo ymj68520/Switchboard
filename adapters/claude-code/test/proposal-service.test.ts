@@ -81,9 +81,11 @@ describe("prepareProposal (§8/§16/§17/§80–§83)", () => {
     try {
       const fixture = await makeProposalFixture(root);
       try {
+        // Phase 11: section_completion is a production TYPE now, but the
+        // architecture stage still rejects its section scope (§53).
         expect(() =>
-          prepareCheckpoint(fixture, [], { type: "section_completion" }),
-        ).toThrowError(expect.objectContaining({ code: "PROPOSAL_TYPE_UNAVAILABLE" }));
+          prepareCheckpoint(fixture, [], { type: "section_completion", scope: { kind: "section", sectionId: "SEC-1" } }),
+        ).toThrowError(expect.objectContaining({ code: "PROPOSAL_INVALID" }));
         expect(() =>
           prepareCheckpoint(fixture, [], { type: "final_plan" }),
         ).toThrowError(expect.objectContaining({ code: "PROPOSAL_TYPE_UNAVAILABLE" }));

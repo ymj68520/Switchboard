@@ -15,13 +15,18 @@
  *   binding generation → lifecycle active → run revision vs base →
  *   proposal identity/state → proposal hash → HEAD/base (incl. legacy
  *   uncommitted HEAD) → dependencies → re-simulation → proposal-type gates →
- *   apply revisions → snapshot → approval → commit → HEAD → proposal state →
- *   state-machine side effect → audit.
+ *   Section completion prerequisites (§32) → apply revisions → snapshot →
+ *   approval → commit → HEAD → proposal state → Section workflow mutations
+ *   (registration §28, reopen §39, dependency review §42, completion §33,
+ *   active clear + Detail→Synthesis §34/§35) → state-machine side effect →
+ *   audit.
  *
  * Two concurrency domains stay separate: design_checkpoint/amendment NEVER
  * touch PlanningRun.revision/stage (§50/§51/§77); architecture_completion
- * advances stage architecture→detail via ARCHITECTURE_APPROVED and bumps the
- * run revision exactly once, in the same transaction (§54/§78).
+ * advances stage architecture→detail via ARCHITECTURE_APPROVED, and a Section
+ * completion clears the active Section (and may advance detail→synthesis) —
+ * each bumps the run revision exactly once, in the same transaction
+ * (§54/§78/§34/§35).
  */
 
 import { createHash } from "node:crypto";
@@ -56,6 +61,15 @@ import {
   setHeadPairInTx,
 } from "../store/plan-commits.js";
 import { runStateError } from "../store/planning-runs.js";
+import { getActiveSectionInTx, getSectionWorkflowStateInTx } from "../store/section-workflow.js";
+import {
+  clearActiveSectionAfterCompletionInTx,
+  propagateDependencyReviewInTx,
+  registerSectionWorkflowInTx,
+  sectionWorkflowError,
+  transitionSectionWorkflowInTx,
+  evaluateDetailCompletionInTx,
+} from "./section-workflow-service.js";
 import {
   getProposalRevisionInTx,
   getProposalStateInTx,
@@ -391,13 +405,30 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           requireMemoryRevisionContentInTx(tx, ref),
         );
 
+        // 15.5 Phase 11 — collect the frozen Section workflow facts (§31).
+        // The completion prerequisite gate itself runs after the candidate
+        // revisions are applied (single transaction — order only affects
+        // where the content reads come from, never atomicity).
+        const reopenOps = proposal.changes.filter(
+          (change): change is Extract<NormalizedProposalChange, { op: "REOPEN_SECTION" }> => change.op === "REOPEN_SECTION",
+        );
+        const completeOps = proposal.changes.filter(
+          (change): change is Extract<NormalizedProposalChange, { op: "COMPLETE_SECTION" }> => change.op === "COMPLETE_SECTION",
+        );
+
         // 16. Apply the exact frozen changes through the Phase 5 internal
         // writer (§45) — the engine is its only production caller (§75).
+        // Workflow facts (§31) write no memory revision; brand-new Section
+        // identities are registered into the workflow layer in this same
+        // transaction after the commit lands (§28).
         const createdRefs: MemoryRef[] = [];
+        const createdSectionIds: string[] = [];
         for (const change of proposal.changes) {
+          if (change.op === "COMPLETE_SECTION" || change.op === "REOPEN_SECTION") continue;
           const kind = change.result.kind as MemoryArtifactKind;
           if (changeTarget(change) === null) {
             insertArtifactIdentityInTx(tx, { runId: input.runId, kind, artifactId: change.artifactId }, clock.nowIso());
+            if (kind === "section") createdSectionIds.push(change.artifactId);
           }
           const ref = insertMemoryRevisionInTx(tx, {
             runId: input.runId,
@@ -413,6 +444,21 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
 
         // 17. The new immutable Snapshot (exactly one per commit, §48).
         const snapshot: MemorySnapshot = insertSnapshotInTx(tx, { runId: input.runId, refs: simulation.candidateRefs }, clock);
+
+        // 17.5 Phase 11 §32 — Section completion prerequisites, evaluated
+        // against the candidate snapshot now materialized in this transaction
+        // (the whole commit still rolls back on any violation). Critical
+        // required Evidence freshness was already gated at step 12.5.
+        if (completeOps.length > 0) {
+          gateSectionCompletionInTx(tx, {
+            runId: input.runId,
+            stage: run.stage,
+            reopenIds: new Set(reopenOps.map((op) => op.artifactId)),
+            completeOps: completeOps.map((op) => ({ artifactId: op.artifactId, revision: op.result.revision })),
+            candidateRefs: simulation.candidateRefs,
+            readContent: (ref) => requireMemoryRevisionContentInTx(tx, ref),
+          });
+        }
 
         // 18. Approval — same transaction as everything else (§34).
         const approvalId = `APPR-${clock.newId()}`;
@@ -464,7 +510,12 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           });
         }
 
-        // 22. Allowed State Machine side effect — architecture completion only.
+        // 22. Workflow mutations — Phase 11, same transaction as everything
+        // else. Order inside the block is the §40 canonical order: register →
+        // reopen (§39) → downstream dependency review (§42) → complete
+        // (§33) → active clear / Detail→Synthesis (§34/§35). Design
+        // checkpoints and plain amendments leave the run revision untouched
+        // (§29/§41); architecture completion keeps its Phase 6 semantics.
         let finalRun = run;
         if (proposal.type === "architecture_completion") {
           const event: PlanningRunEvent = "ARCHITECTURE_APPROVED";
@@ -493,6 +544,119 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           finalRun = { ...run, stage: targetStage, revision: run.revision + 1, updatedAt: now };
         }
 
+        const workflowAudit: Record<string, unknown> = {};
+        if (createdSectionIds.length > 0 || reopenOps.length > 0 || completeOps.length > 0) {
+          const now = clock.nowIso();
+          const requestRef = input.authorization.authorizationRequestId;
+          // (a) §28 — first commit of a Section identity registers it open
+          // atomically; Plan Memory and workflow state are never split.
+          for (const sectionId of createdSectionIds) {
+            registerSectionWorkflowInTx(
+              tx,
+              {
+                runId: input.runId,
+                sectionId,
+                reasonCode: "section_created_by_commit",
+                detail: { proposalId: proposal.proposalId, proposalRevision: proposal.revision, commitId },
+                ...(requestRef !== undefined ? { requestId: requestRef } : {}),
+              },
+              clock,
+            );
+          }
+          workflowAudit.registered = [...createdSectionIds].sort();
+          // (b) §39/§41 — explicit reopens first; a completed or needs_review
+          // Section goes open with its completion provenance cleared.
+          const reopenedIds: string[] = [];
+          for (const op of reopenOps) {
+            transitionSectionWorkflowInTx(
+              tx,
+              {
+                runId: input.runId,
+                sectionId: op.artifactId,
+                eventType: "REOPENED",
+                reasonCode: "explicit_reopen_proposal",
+                detail: { proposalId: proposal.proposalId, proposalRevision: proposal.revision, commitId },
+                ...(requestRef !== undefined ? { requestId: requestRef } : {}),
+              },
+              clock,
+            );
+            reopenedIds.push(op.artifactId);
+          }
+          workflowAudit.reopened = [...reopenedIds].sort();
+          // (c) §42 — completed downstream Sections become needs_review,
+          // recursively over the NEW HEAD's Section DAG; their immutable
+          // revisions are untouched. Sections this same commit completes are
+          // excluded — their fate is decided after the reopens.
+          if (reopenedIds.length > 0) {
+            const reviewAffected = propagateDependencyReviewInTx(
+              tx,
+              {
+                runId: input.runId,
+                headSectionRefs: simulation.candidateRefs,
+                reopenedIds,
+                exclude: completeOps.map((op) => op.artifactId),
+                ...(requestRef !== undefined ? { requestId: requestRef } : {}),
+              },
+              clock,
+            );
+            if (reviewAffected.length > 0) workflowAudit.reviewRequired = reviewAffected;
+          }
+          // (d) §30/§33 — completions bind the exact candidate revision and
+          // this proposal/commit as provenance, in the same transaction.
+          const completedIds: string[] = [];
+          for (const op of completeOps) {
+            transitionSectionWorkflowInTx(
+              tx,
+              {
+                runId: input.runId,
+                sectionId: op.artifactId,
+                eventType: "COMPLETED",
+                reasonCode: "section_completion_committed",
+                detail: { proposalId: proposal.proposalId, proposalRevision: proposal.revision, commitId },
+                completion: {
+                  completedRevision: op.result.revision,
+                  completedProposalId: proposal.proposalId,
+                  completedProposalRevision: proposal.revision,
+                  completionCommitId: commitId,
+                },
+                ...(requestRef !== undefined ? { requestId: requestRef } : {}),
+              },
+              clock,
+            );
+            completedIds.push(op.artifactId);
+          }
+          workflowAudit.completed = [...completedIds].sort();
+          // (e) §34/§35 — completing the active Section clears the active
+          // work and bumps the run revision exactly once; if this was the
+          // last Section at its exact HEAD revision with nothing in
+          // needs_review, the SAME bump advances Detail → Synthesis via
+          // DETAIL_COMPLETE. An empty Section set never passes the gate (§36).
+          if (completedIds.length > 0) {
+            const evaluation = evaluateDetailCompletionInTx(tx, input.runId, simulation.candidateRefs);
+            let next: PlanningStage | undefined;
+            if (evaluation.ready) {
+              const event: PlanningRunEvent = "DETAIL_COMPLETE";
+              try {
+                next = nextStage(run.stage, event);
+              } catch (err) {
+                throw runStateError(
+                  "INVALID_RUN_TRANSITION",
+                  err instanceof Error ? err.message.replace("INVALID_RUN_TRANSITION:", "") : "invalid run transition",
+                  { runId: input.runId, stage: run.stage, event },
+                );
+              }
+            }
+            const bumped = clearActiveSectionAfterCompletionInTx(
+              tx,
+              { runId: input.runId, expectedRevision: run.revision, ...(next !== undefined ? { nextStage: next } : {}) },
+              clock,
+            );
+            finalRun = { ...finalRun, revision: bumped.revision, stage: bumped.stage, updatedAt: now };
+            workflowAudit.activeCleared = true;
+            if (next !== undefined) workflowAudit.detailComplete = true;
+          }
+        }
+
         // 23. Audit — provenance, never authority (§70).
         appendAuditEventInTx(
           tx,
@@ -515,6 +679,7 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
               resultingSnapshotId: snapshot.snapshotId,
               runRevisionAfter: finalRun.revision,
               stageAfter: finalRun.stage,
+              ...(Object.keys(workflowAudit).length > 0 ? { sectionWorkflow: workflowAudit } : {}),
             },
           },
           clock.nowIso(),
@@ -615,11 +780,161 @@ function gateProposalType(
     }
     return;
   }
-  // section_completion / final_plan never reach the engine through prepare,
-  // and the engine refuses them outright rather than approximating (§56).
+  if (type === "section_completion") {
+    // §30/§44 — a section_completion asserts completion; the design changes
+    // themselves are optional (a needs_review re-completion may carry only
+    // COMPLETE_SECTION at the unchanged exact revision).
+    if (!changes.some((change) => change.op === "COMPLETE_SECTION")) {
+      throw new RuntimeError("PROPOSAL_INVALID", "section_completion proposals require at least one COMPLETE_SECTION change", {
+        detail: { runId, type },
+      });
+    }
+    return;
+  }
+  // final_plan never reaches the engine through prepare, and the engine
+  // refuses it outright rather than approximating (§56).
   throw new RuntimeError("PROPOSAL_TYPE_UNAVAILABLE", `proposal type '${type}' is not available in this phase`, {
     detail: { runId, type },
   });
+}
+
+/**
+ * Phase 11 §32 — Section completion prerequisites, all evaluated inside the
+ * commit transaction against the CANDIDATE snapshot:
+ * run at detail → target is the ACTIVE section → candidate contains the
+ * target at the bound exact revision → frozen SectionContract present → all
+ * direct dependencies exist AND are completed at exactly their candidate
+ * revisions → no target-scoped blocking Question / target-relevant blocking
+ * Conflict (typed scope fields, never substring heuristics). DAG validity and
+ * critical required Evidence freshness are enforced by the re-simulation and
+ * the step-12.5 gate respectively. Re-completion of a needs_review Section is
+ * legal (§44); completing an already-completed exact revision is not — unless
+ * the same proposal explicitly reopens it first (§40).
+ */
+function gateSectionCompletionInTx(
+  tx: StoreTx,
+  input: {
+    runId: string;
+    stage: PlanningStage;
+    reopenIds: Set<string>;
+    completeOps: Array<{ artifactId: string; revision: number }>;
+    candidateRefs: MemoryRef[];
+    readContent: (ref: MemoryRef) => Record<string, unknown>;
+  },
+): void {
+  if (input.stage !== "detail") {
+    throw sectionWorkflowError("SECTION_WORKFLOW_INVALID", "section completion requires the detail stage", {
+      runId: input.runId,
+      stage: input.stage,
+    });
+  }
+  const candidateSections = new Map<string, number>();
+  for (const ref of input.candidateRefs) {
+    if (ref.kind === "section") candidateSections.set(ref.id, ref.revision);
+  }
+  for (const op of input.completeOps) {
+    const candidateRevision = candidateSections.get(op.artifactId);
+    if (candidateRevision !== op.revision) {
+      throw sectionWorkflowError(
+        "SECTION_WORKFLOW_INVALID",
+        `COMPLETE_SECTION binds section '${op.artifactId}'@${op.revision} but the candidate snapshot contains @${String(candidateRevision)}`,
+        { runId: input.runId, sectionId: op.artifactId },
+      );
+    }
+    // target == active Section (§32).
+    const active = getActiveSectionInTx(tx, input.runId);
+    if (active !== op.artifactId) {
+      throw sectionWorkflowError(
+        "SECTION_NOT_ACTIVE",
+        `section '${op.artifactId}' is not the active section${active === null ? " (no active section)" : ` ('${active}' is)`}; select it before completion`,
+        { runId: input.runId, sectionId: op.artifactId, active },
+      );
+    }
+    const state = getSectionWorkflowStateInTx(tx, input.runId, op.artifactId);
+    if (state === null) {
+      throw sectionWorkflowError("SECTION_NOT_FOUND", `section '${op.artifactId}' has no workflow state`, {
+        runId: input.runId,
+        sectionId: op.artifactId,
+      });
+    }
+    if (state.status === "completed" && !input.reopenIds.has(op.artifactId)) {
+      throw sectionWorkflowError(
+        "SECTION_ALREADY_COMPLETED",
+        `section '${op.artifactId}' is already completed at revision ${String(state.completedRevision)}`,
+        { runId: input.runId, sectionId: op.artifactId, completedRevision: state.completedRevision },
+      );
+    }
+    // Frozen SectionContract present for the candidate revision (§32).
+    const candidateRef: MemoryRef = { runId: input.runId, kind: "section", id: op.artifactId, revision: op.revision };
+    const content = input.readContent(candidateRef) as unknown as {
+      contract?: unknown;
+      dependencies?: unknown;
+    };
+    if (content.contract === undefined || content.contract === null || typeof content.contract !== "object") {
+      throw sectionWorkflowError(
+        "SECTION_WORKFLOW_INVALID",
+        `section '${op.artifactId}'@${op.revision} has no frozen SectionContract`,
+        { runId: input.runId, sectionId: op.artifactId, revision: op.revision },
+      );
+    }
+    // Direct dependencies: exist and completed at exactly their candidate
+    // revisions (§32 — DAG legality itself was re-validated by simulation).
+    const dependencies = Array.isArray(content.dependencies) ? (content.dependencies as string[]) : [];
+    for (const dependencyId of dependencies) {
+      const dependencyRevision = candidateSections.get(dependencyId);
+      if (dependencyRevision === undefined) {
+        throw sectionWorkflowError(
+          "SECTION_DEPENDENCY_INCOMPLETE",
+          `dependency '${dependencyId}' of section '${op.artifactId}' does not exist in the candidate snapshot`,
+          { runId: input.runId, sectionId: op.artifactId, dependencyId },
+        );
+      }
+      const dependencyState = getSectionWorkflowStateInTx(tx, input.runId, dependencyId);
+      if (
+        dependencyState === null ||
+        dependencyState.status !== "completed" ||
+        dependencyState.completedRevision !== dependencyRevision
+      ) {
+        throw sectionWorkflowError(
+          "SECTION_DEPENDENCY_INCOMPLETE",
+          `dependency '${dependencyId}' of section '${op.artifactId}' is ${dependencyState?.status ?? "unregistered"} at ${String(dependencyState?.completedRevision)}, but the candidate snapshot contains @${dependencyRevision}`,
+          {
+            runId: input.runId,
+            sectionId: op.artifactId,
+            dependencyId,
+            dependencyRevision,
+            dependencyStatus: dependencyState?.status ?? null,
+          },
+        );
+      }
+    }
+    // Target-scoped blocking conditions (§32) — typed scope fields only.
+    for (const ref of input.candidateRefs) {
+      if (ref.kind === "open_question") {
+        const question = input.readContent(ref) as unknown as { status: string; blocking: boolean; scope: string };
+        if (question.status === "open" && question.blocking === true && question.scope === op.artifactId) {
+          throw new RuntimeError(
+            "BLOCKING_QUESTION",
+            `open blocking question '${ref.id}@${ref.revision}' scoped to section '${op.artifactId}' prevents completion`,
+            { detail: { runId: input.runId, sectionId: op.artifactId, questionRef: { id: ref.id, revision: ref.revision } } },
+          );
+        }
+      }
+      if (ref.kind === "conflict") {
+        const conflict = input.readContent(ref) as unknown as { status: string; severity: string; refs?: unknown };
+        const refsSection =
+          Array.isArray(conflict.refs) &&
+          (conflict.refs as Array<{ kind?: string; id?: string }>).some((entry) => entry.kind === "section" && entry.id === op.artifactId);
+        if (conflict.status === "open" && conflict.severity === "hard" && refsSection) {
+          throw new RuntimeError(
+            "BLOCKING_CONFLICT",
+            `open hard conflict '${ref.id}@${ref.revision}' referencing section '${op.artifactId}' prevents completion`,
+            { detail: { runId: input.runId, sectionId: op.artifactId, conflictRef: { id: ref.id, revision: ref.revision } } },
+          );
+        }
+      }
+    }
+  }
 }
 
 /** Re-derive the sha256 hash over stored canonical text (§23). */

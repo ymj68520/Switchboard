@@ -49,6 +49,8 @@ export type HostContextLogicalTool =
   | "list_observations"
   | "promote_evidence"
   | "revalidate_evidence"
+  | "select_section"
+  | "prepare_proposal"
   | "approve_proposal";
 
 export interface BuildHostContextInput {

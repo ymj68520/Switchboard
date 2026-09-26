@@ -56,7 +56,7 @@ describe("get_context (§20–§22, E24)", () => {
       const current = executePhasePlanTool(ctx, "get_context", args);
       expect(current.status).toBe("ok");
       const context = current.context as { epoch: string; run: { runId: string }; globalMemory: { hardConstraints: unknown[] } };
-      expect(context.epoch).toMatch(/^[0-9a-f]{64}$/);
+      expect(context.epoch).toMatch(/^context-epoch:v2:[0-9a-f]{64}$/);
       expect(current.context_epoch).toBe(context.epoch);
       expect(context.run.runId).toBe(fixture.runId);
       expect(context.globalMemory.hardConstraints).toHaveLength(1);
@@ -66,7 +66,7 @@ describe("get_context (§20–§22, E24)", () => {
         detail: "recovery",
         _hostContext: hostToken(secret, "get_context", { detail: "recovery" }, idsOf(fixture)),
       });
-      expect((recovery.recoveryCapsule as string).split("\n")[0]).toBe("[Phase Plan Recovery v1]");
+      expect((recovery.recoveryCapsule as string).split("\n")[0]).toBe("[Phase Plan Recovery v2]");
       expect(recovery.context_epoch).toBe(current.context_epoch);
       // Read-only: committed state untouched.
       expect(memoryCounts(fixture.store).commits).toBe(1);
@@ -228,7 +228,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
       const raw = rawConnection(storePathsFor(fixture.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(7);
+        expect(Object.values(row)[0]).toBe(8);
       } finally {
         raw.close();
       }
@@ -237,7 +237,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
 });
 
 describe("Phase 8 tool surface (§42, E31)", () => {
-  it("Phase 10 (§50): exposes exactly eight tools — revalidate_evidence joins the Phase 9 set", () => {
+  it("Phase 11 (§74): exposes exactly ten tools — select_section and prepare_proposal join the Phase 10 set", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
@@ -246,10 +246,12 @@ describe("Phase 8 tool surface (§42, E31)", () => {
       "list_observations",
       "promote_evidence",
       "revalidate_evidence",
+      "select_section",
+      "prepare_proposal",
       "approve_proposal",
     ]);
     const joined = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
-    for (const banned of ["prepare", "takeover", "abort", "submit_synthesis", "request_finalization", "set_evidence_state"]) {
+    for (const banned of ["takeover", "abort", "submit_synthesis", "request_finalization", "set_evidence_state", "set_section_status"]) {
       expect(joined).not.toContain(banned);
     }
   });

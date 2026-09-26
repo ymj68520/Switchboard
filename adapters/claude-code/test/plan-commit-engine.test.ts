@@ -117,7 +117,7 @@ describe("happy-path E2E (§88)", () => {
           tx.prepare("SELECT content_json AS contentJson, compact_projection AS compact FROM memory_revisions WHERE kind = 'decision' AND artifact_id = 'DEC-1' AND revision = 1").get(),
         ) as { contentJson: string; compact: string };
         // EXACT representation, not semantically-similar.
-        expect(JSON.parse(committed.contentJson)).toEqual(frozenChange.content);
+        expect(JSON.parse(committed.contentJson)).toEqual((frozenChange as { content: unknown }).content);
         expect(committed.compact).toBe(frozenChange.compactProjection);
       } finally {
         closeFixture(fixture);

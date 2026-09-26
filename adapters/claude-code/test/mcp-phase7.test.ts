@@ -92,7 +92,7 @@ function hostToken(
 }
 
 describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", () => {
-  it("exposes exactly the Phase 10 tool set (§50, eight tools); approve_proposal carries real boolean requiresUserInteraction", () => {
+  it("exposes exactly the Phase 11 tool set (§74, ten tools); approve_proposal carries real boolean requiresUserInteraction", () => {
     expect(PHASE_PLAN_TOOLS.map((tool) => tool.name)).toEqual([
       "start_or_resume",
       "get_state",
@@ -101,6 +101,8 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
       "list_observations",
       "promote_evidence",
       "revalidate_evidence",
+      "select_section",
+      "prepare_proposal",
       "approve_proposal",
     ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
@@ -112,8 +114,11 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
     expect(Object.keys(approve.inputSchema.properties as Record<string, unknown>).sort()).toEqual(
       ["_hostContext", "proposal_hash", "proposal_id", "proposal_revision"],
     );
-    // no prepare_proposal or other committed-mutation surface (E37)
-    expect(PHASE_PLAN_TOOLS.some((tool) => tool.name.includes("prepare"))).toBe(false);
+    // no Phase-12+ surfaces and no raw state setters (Phase 11 §74)
+    const joinedTools = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
+    for (const banned of ["submit_synthesis", "submit_validation", "request_finalization", "handoff", "takeover_run", "abort_run", "set_section_status", "set_active_work"]) {
+      expect(joinedTools).not.toContain(banned);
+    }
   });
 });
 
@@ -551,7 +556,7 @@ describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61:
       const raw = rawConnection(storePathsFor(h.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(7);
+        expect(Object.values(row)[0]).toBe(8);
       } finally {
         raw.close();
       }

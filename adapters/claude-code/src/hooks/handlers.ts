@@ -102,6 +102,8 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "list_observations" ||
     logical === "promote_evidence" ||
     logical === "revalidate_evidence" ||
+    logical === "select_section" ||
+    logical === "prepare_proposal" ||
     logical === "approve_proposal"
   );
 }
@@ -417,17 +419,20 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
-  // approve_proposal, promote_evidence, and revalidate_evidence require an
-  // owned active run for their write contexts; reads (get_state/get_context/
-  // read_memory/list_observations) degrade to a run-less outcome: nothing is
-  // signed, so the MCP layer fails closed and never reaches a workspace-wide
-  // run selection (Phase 8 §40/§41 — no auto-takeover).
+  // approve_proposal, promote_evidence, revalidate_evidence, select_section,
+  // and prepare_proposal require an owned active run for their write
+  // contexts; reads (get_state/get_context/read_memory/list_observations)
+  // degrade to a run-less outcome: nothing is signed, so the MCP layer fails
+  // closed and never reaches a workspace-wide run selection (Phase 8 §40/§41
+  // — no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
     if (
       logical === "approve_proposal" ||
       logical === "promote_evidence" ||
-      logical === "revalidate_evidence"
+      logical === "revalidate_evidence" ||
+      logical === "select_section" ||
+      logical === "prepare_proposal"
     ) {
       return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
     }
@@ -435,7 +440,6 @@ async function handlePhasePlanPreToolUse(
     // signed (fail closed; the tool call then surfaces HOST_CONTEXT_REQUIRED).
     return emptyOutput();
   }
-
   let workspace: WorkspaceRecord | null = null;
   if (input.cwd === undefined || input.cwd.trim() === "") {
     return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; workspace cannot be verified");
@@ -446,18 +450,23 @@ async function handlePhasePlanPreToolUse(
   }
   // §44 — cwd drift: mutation contexts are never signed outside the bound
   // workspace; reads stay available.
-  if (logical === "approve_proposal" && !cwdInsideWorkspace(input.cwd, workspace)) {
+  const isMutationTool =
+    logical === "approve_proposal" ||
+    logical === "promote_evidence" ||
+    logical === "revalidate_evidence" ||
+    logical === "select_section" ||
+    logical === "prepare_proposal";
+  if (isMutationTool && !cwdInsideWorkspace(input.cwd, workspace)) {
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }
-  // §29 — approve_proposal additionally requires the session to BE in Plan
-  // Mode before a mutation context is signed at all. Read tools (§39)
-  // deliberately do NOT require plan mode: a recovered run must stay
-  // readable while A1 mode restoration is pending.
-  if (logical === "approve_proposal" && input.permissionMode !== "plan") {
+  // §29 — approve_proposal and prepare_proposal require the session to BE in
+  // Plan Mode before a mutation context is signed at all (§59). Read tools
+  // (§39) and evidence writes (§45) deliberately do NOT require plan mode.
+  if ((logical === "approve_proposal" || logical === "prepare_proposal") && input.permissionMode !== "plan") {
     return deny(
       eventName,
       "PLAN_MODE_REQUIRED",
-      `approve_proposal requires permission_mode=plan (observed '${input.permissionMode ?? "unknown"}'); invoke /phase-plan to restore planning mode`,
+      `${logical} requires permission_mode=plan (observed '${input.permissionMode ?? "unknown"}'); invoke /phase-plan to restore planning mode`,
     );
   }
 

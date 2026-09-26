@@ -48,6 +48,12 @@ export function simulateCandidateSnapshot(input: {
     const target = changeTarget(change);
     const identity = `${kind}:${change.artifactId}`;
 
+    // Phase 11 §31: workflow facts write no memory revision — validated
+    // against the FINAL candidate world after the mutation loop.
+    if (change.op === "COMPLETE_SECTION" || change.op === "REOPEN_SECTION") {
+      return;
+    }
+
     if (target === null) {
       if (baseByIdentity.has(identity)) {
         throw proposalInvalid(`frozen change ${index} creates ${kind} '${change.artifactId}' which already exists in the base`, at);
@@ -84,6 +90,38 @@ export function simulateCandidateSnapshot(input: {
     throw proposalInvalid("candidate snapshot would contain more than one architecture revision");
   }
   assertValidSectionDag(candidateSectionDag(changes, baseRefs));
+
+  // Phase 11 §31/§40 — workflow facts are exact-revision-bound against the
+  // final candidate world: REOPEN pins a real base revision and lands on the
+  // candidate revision; COMPLETE binds exactly the candidate revision.
+  for (const change of changes) {
+    if (change.op === "REOPEN_SECTION") {
+      const base = baseByKey.get(`section:${change.target.id}:${change.target.revision}`);
+      if (base === undefined) {
+        throw proposalInvalid(
+          `frozen REOPEN_SECTION target section '${change.target.id}@${change.target.revision}' is not present in the current base`,
+        );
+      }
+      const final = candidate.get(`section:${change.artifactId}`);
+      if (final === undefined || final.revision !== change.result.revision) {
+        throw proposalInvalid(
+          `frozen REOPEN_SECTION result does not match the candidate revision of section '${change.artifactId}'`,
+        );
+      }
+    }
+    if (change.op === "COMPLETE_SECTION") {
+      const final = candidate.get(`section:${change.artifactId}`);
+      if (
+        final === undefined ||
+        final.revision !== change.result.revision ||
+        change.target.revision !== change.result.revision
+      ) {
+        throw proposalInvalid(
+          `frozen COMPLETE_SECTION does not bind exactly the candidate revision of section '${change.artifactId}'`,
+        );
+      }
+    }
+  }
 
   return { candidateRefs };
 }

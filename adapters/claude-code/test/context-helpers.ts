@@ -100,8 +100,14 @@ export function commitCheckpoint(
   return commitPrepared(fixture, prepared.proposal.proposalId, prepared.proposal.revision, prepared.proposal.proposalHash);
 }
 
+/** Structural minimum for committing: any fixture carrying store+engine+ownership. */
+export type CommittableFixture = Pick<
+  ContextFixture,
+  "store" | "engine" | "runId" | "workspaceId" | "sessionId" | "generation" | "runRevision"
+> & { runRevision: number };
+
 export function commitPrepared(
-  fixture: ContextFixture,
+  fixture: CommittableFixture,
   proposalId: string,
   proposalRevision: number,
   proposalHash: string,

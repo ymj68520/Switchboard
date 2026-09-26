@@ -24,8 +24,20 @@
 import type { MemoryRevisionContent } from "../core/memory-artifacts.js";
 import type { MemoryRef } from "../core/memory-refs.js";
 import type { ProposalScope, ProposalType } from "../core/proposal.js";
+import type { SectionContract } from "../core/memory-artifacts.js";
+import type { SectionWorkflowState } from "../core/section-workflow.js";
 
-export const CONTEXT_MODEL_VERSION = 1 as const;
+/**
+ * Phase 11 (§16): the v1 shape could not unambiguously express Section
+ * workflow states, the active Section, or dependency contracts — the context
+ * model formally advances to version 2. The version-1 structural contract is
+ * never silently changed: v1 consumers see a new version marker, never
+ * reinterpreted old fields.
+ */
+export const CONTEXT_MODEL_VERSION = 2 as const;
+
+/** The frozen epoch identity marker (§19): workflow facts changed the inputs. */
+export const CONTEXT_EPOCH_VERSION = "context-epoch:v2" as const;
 
 /** L0 — static identity of the planning protocol layer. */
 export interface ContextProtocol {
@@ -102,6 +114,38 @@ export interface ContextAwaitingProposal {
   summary: string;
 }
 
+/**
+ * L3 — one committed Section with its OPERATIONAL workflow state (§18).
+ * Deterministic order (by section id); the ref is the exact HEAD revision.
+ */
+export interface ContextWorkflowSection {
+  ref: MemoryRef;
+  title: string;
+  status: SectionWorkflowState;
+  /** Present exactly when status ≠ open (§6 — retained under needs_review). */
+  completedRevision?: number;
+  /** Dependency section ids declared by this exact revision. */
+  dependencies: string[];
+}
+
+/**
+ * L3 — the durable active Section (§10/§11): identity from planning_active_
+ * work, exact revision/title resolved from the CURRENT HEAD snapshot.
+ */
+export interface ContextActiveScope {
+  kind: "section";
+  sectionId: string;
+  revision: number;
+  title: string;
+  workflowStatus: SectionWorkflowState;
+}
+
+/** L3 — the frozen SectionContract of one DIRECT dependency of the active Section (§51). */
+export interface ContextDependencyContract {
+  ref: MemoryRef;
+  contract: SectionContract;
+}
+
 export interface ContextWorking {
   awaitingProposal: ContextAwaitingProposal | null;
 }
@@ -112,6 +156,8 @@ export type ContextOperation =
   | "get_context"
   | "read_memory"
   | "start_or_resume"
+  | "select_section"
+  | "prepare_proposal"
   | "approve_proposal";
 
 /** Internal provenance of one assembly (directive §44) — tests/debug aid. */
@@ -130,8 +176,14 @@ export interface PhasePlanContext {
   run: ContextRunState;
   head: ContextHead;
   globalMemory: ContextGlobalMemory;
-  /** §8: no authoritative active scope exists yet — never guessed (§10). */
-  activeScope: null;
+  /** §10/§11 — the durable active Section, resolved against current HEAD. */
+  activeScope: ContextActiveScope | null;
+  /** §18 — workflow states for every committed Section, deterministic order. */
+  sectionWorkflow: {
+    sections: ContextWorkflowSection[];
+  };
+  /** §51 — contracts of the active Section's DIRECT dependencies only. */
+  activeDependencyContracts: ContextDependencyContract[];
   working: ContextWorking;
   operations: ContextOperation[];
   sourceTrace: ContextSourceTrace;
@@ -152,8 +204,8 @@ export interface CommittedRevisionView {
 
 /**
  * The read-model port the assembler consumes. Implementations MUST source
- * every value from the Plan Store's Phase 5/6 read APIs — never from
- * conversation text, compact summaries, or model input (§26/§31).
+ * every value from the Plan Store's read APIs — never from conversation
+ * text, compact summaries, or model input (§26/§31).
  */
 export interface ContextSource {
   getRun(runId: string): ContextRunState | null;
@@ -161,4 +213,12 @@ export interface ContextSource {
   listHeadSnapshotRefs(runId: string): MemoryRef[];
   readRevision(ref: MemoryRef): CommittedRevisionView | null;
   getAwaitingProposal(runId: string): ContextAwaitingProposal | null;
+  /** The run's durable active Section id, or null (§10). */
+  getActiveSection(runId: string): string | null;
+  /** Materialized workflow states for the run's sections (§18). */
+  listSectionWorkflowStates(runId: string): Array<{
+    sectionId: string;
+    status: SectionWorkflowState;
+    completedRevision: number | null;
+  }>;
 }

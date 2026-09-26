@@ -102,7 +102,7 @@ d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
         expect(evidenceRef.evidenceId).toMatch(/^ev_/);
         const changes = [
           {
-            op: "ADD_DECISION",
+            op: "ADD_DECISION" as const,
             content: {
               title: `Live Phase 10 gate decision ${phase10Revise ? "r2" : "r1"} ${tag}`,
               statement: "Decision frozen against the exact evidence revision named in requiredEvidence.",

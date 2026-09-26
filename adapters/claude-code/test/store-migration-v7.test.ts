@@ -83,6 +83,15 @@ function rewindToSchema6(root: string): void {
     db.exec("DROP TABLE IF EXISTS evidence_validation_events");
     db.exec("DROP INDEX IF EXISTS idx_evidence_validation_events_revision");
     db.exec("DROP INDEX IF EXISTS idx_evidence_derived_refs_upstream");
+    // Phase 11: also unwind any v8 objects — the rewind targets an exact
+    // schema-6 shape, so re-initialization rebuilds the FULL 7→8 chain.
+    db.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_update");
+    db.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_delete");
+    db.exec("DROP TRIGGER IF EXISTS section_workflow_states_no_delete");
+    db.exec("DROP TABLE IF EXISTS section_workflow_events");
+    db.exec("DROP TABLE IF EXISTS section_workflow_states");
+    db.exec("DROP TABLE IF EXISTS planning_active_work");
+    db.exec("DROP INDEX IF EXISTS idx_section_workflow_events_section");
     db.exec("DELETE FROM schema_migrations WHERE version >= 7");
     db.exec("PRAGMA user_version = 6");
   } finally {
@@ -101,7 +110,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(7);
+        expect(store.getSchemaVersion()).toBe(8);
         const read = (sql: string, ...params: unknown[]): unknown =>
           (store.withRead((tx) => tx.prepare(sql).get(...params)) as Record<string, unknown>);
         // Old rows survive EXACTLY (E2).
@@ -131,11 +140,12 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
         expect(event.toState).toBe("needs_validation");
         expect(event.reason).toBe("schema7_failclosed_initialization");
 
-        // History [1..7]; one consistent backup taken before the migration.
+        // History [1..8] (the full chain rebuilds 7 AND 8); one consistent
+        // backup taken before the migration.
         const history = store
           .withRead((tx) => tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
           .map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
         expect(publishedBackups(backupsDir)).toHaveLength(1);
       } finally {
         store.close();
@@ -175,7 +185,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       (failing as unknown as { apply: () => never }).apply = (() => {
         throw new Error("injected 007 failure");
       }) as never;
-      const registry = [...production.filter((m) => m.to < 7), failing];
+      const registry = [...production.filter((m) => m.to < 7), failing, ...production.filter((m) => m.to > 7)];
       await expect(initializePlanStore({ pluginDataRoot: root, migrations: registry })).rejects.toMatchObject({
         code: "STORE_MIGRATION_FAILED",
         causeText: expect.stringContaining("injected 007 failure"),
@@ -185,6 +195,9 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       expect(names).not.toContain("evidence_validation_events");
       expect(names).not.toContain("evidence_current_states");
       expect(names).not.toContain("proposal_evidence_refs");
+      expect(names).not.toContain("section_workflow_events");
+      expect(names).not.toContain("section_workflow_states");
+      expect(names).not.toContain("planning_active_work");
       // The untouched schema-6 world is fully intact.
       expect(names).toContain("evidence_revisions");
       expect(names).toContain("audit_events");
@@ -201,7 +214,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       rewindToSchema6(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(7);
+        expect(store.getSchemaVersion()).toBe(8);
         const { assertWriteCompat } = await import("../src/store/transaction.js");
         let writeRan = false;
         expect(() =>

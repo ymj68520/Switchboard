@@ -1,5 +1,6 @@
 /**
- * context_epoch — deterministic projection epoch (Phase 8 directive §5/§6).
+ * context_epoch — deterministic projection epoch (Phase 8 directive §5/§6;
+ * Phase 11 §19/§20).
  *
  * The epoch is an OPTIMIZATION / stale-context hint only. It is never a
  * mutation gate: real correctness is enforced by SessionBinding generation,
@@ -7,35 +8,55 @@
  * epoch supplied by the model can therefore never override any fence — the
  * read tools simply return the CURRENT epoch.
  *
- * Inputs (directive §5): run identity/revision, HEAD commit/snapshot pair,
- * the awaiting proposal identity/revision/hash, and the active scope. All
- * of these change exactly when the visible authoritative planning context
- * changes. Deliberately EXCLUDED (§5/§38):
+ * Inputs (Phase 8 §5 + Phase 11 §19): run identity/revision, HEAD commit/
+ * snapshot pair, the awaiting proposal identity/revision/hash, the active
+ * Section, and the deterministic Section workflow digest. The digest makes
+ * select/complete/needs_review/reopen transitions visible in the epoch even
+ * when the run revision and HEAD are untouched (e.g. the Evidence review
+ * bridge deliberately bumps neither).
+ *
+ * Deliberately EXCLUDED (Phase 8 §5/§38 + Phase 11 §20):
  *   - wall clock / random UUIDs / conversation turn numbers / Claude compact
  *     counts (non-deterministic or conversation-derived);
- *   - SessionBinding generation: the binding is an authorization fence, not
- *     planning knowledge; HostContext separately protects ownership. Context
- *     content does not describe the binding, so including it would make the
- *     epoch churn on re-attach without any visible context change.
+ *   - SessionBinding generation (an authorization fence, not planning
+ *     knowledge);
+ *   - Evidence freshness state AS SUCH (Phase 10 invariant, kept): Evidence
+ *     only reaches the epoch through the real Section workflow facts the
+ *     bridge derives from it.
  */
 
 import { createHash } from "node:crypto";
 
 import { canonicalJson } from "../core/canonical-json.js";
-import type { ContextSource } from "./types.js";
+import { CONTEXT_EPOCH_VERSION, type ContextSource } from "./types.js";
 
 export interface ContextEpochInputs {
+  epochVersion: typeof CONTEXT_EPOCH_VERSION;
   runId: string;
   runRevision: number;
   headCommitId: string | null;
   headSnapshotId: string | null;
   awaitingProposal: { id: string; revision: number; hash: string } | null;
-  activeScope: { kind: string; sectionId?: string } | null;
+  activeSection: { sectionId: string } | null;
+  /** Deterministic [{sectionId, status, completedRevision}] digest input (§19). */
+  sectionWorkflow: Array<{ sectionId: string; status: string; completedRevision: number | null }>;
 }
 
-/** SHA-256 over the canonical form of the epoch inputs — full hex. */
-export function deriveContextEpoch(inputs: ContextEpochInputs): string {
+/**
+ * The workflow digest: canonical JSON over the sorted workflow-state list.
+ * Sorted by section id so the same store state always yields the same bytes.
+ */
+export function sectionWorkflowDigest(
+  sections: ContextEpochInputs["sectionWorkflow"],
+): string {
+  const sorted = [...sections].sort((a, b) => (a.sectionId < b.sectionId ? -1 : a.sectionId > b.sectionId ? 1 : 0));
+  return createHash("sha256").update(canonicalJson(sorted), "utf8").digest("hex");
+}
+
+/** `context-epoch:v2:<hex>` over the canonical form of the epoch inputs. */
+export function deriveContextEpoch(inputs: Omit<ContextEpochInputs, "epochVersion">): string {
   const payload = {
+    epochVersion: CONTEXT_EPOCH_VERSION,
     runId: inputs.runId,
     runRevision: inputs.runRevision,
     headCommitId: inputs.headCommitId,
@@ -48,22 +69,27 @@ export function deriveContextEpoch(inputs: ContextEpochInputs): string {
             revision: inputs.awaitingProposal.revision,
             hash: inputs.awaitingProposal.hash,
           },
-    activeScope: inputs.activeScope,
+    activeSection: inputs.activeSection,
+    sectionWorkflowDigest: sectionWorkflowDigest(inputs.sectionWorkflow),
   };
-  return createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
+  const hex = createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
+  return `${CONTEXT_EPOCH_VERSION}:${hex}`;
 }
 
 /**
  * Epoch derivation that reads ONLY the cheap authoritative inputs (run row,
- * HEAD pair, awaiting proposal) — no snapshot-member expansion. This is the
- * form used on the normal-turn delta path (directive §34), which must stay a
- * fast read (§40). Returns null when the run does not exist.
+ * HEAD pair, awaiting proposal, active section, workflow states) — no
+ * snapshot-member expansion. This is the form used on the normal-turn delta
+ * path (Phase 8 directive §34), which must stay a fast read (§40). Returns
+ * null when the run does not exist.
  */
 export function deriveContextEpochFromSource(source: ContextSource, runId: string): string | null {
   const run = source.getRun(runId);
   if (run === null) return null;
   const head = source.getHeadPair(runId);
   const awaiting = source.getAwaitingProposal(runId);
+  const activeSectionId = source.getActiveSection(runId);
+  const workflow = source.listSectionWorkflowStates(runId);
   return deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -73,8 +99,11 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
       awaiting === null
         ? null
         : { id: awaiting.proposalId, revision: awaiting.revision, hash: awaiting.hash },
-    // §8: active scope does not exist yet — constant null until the Section
-    // workflow phase establishes it.
-    activeScope: null,
+    activeSection: activeSectionId === null ? null : { sectionId: activeSectionId },
+    sectionWorkflow: workflow.map((state) => ({
+      sectionId: state.sectionId,
+      status: state.status,
+      completedRevision: state.completedRevision,
+    })),
   });
 }

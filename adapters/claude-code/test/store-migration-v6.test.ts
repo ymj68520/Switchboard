@@ -44,7 +44,7 @@ function rewindToSchema5(root: string): void {
         db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
     }
-    for (const table of ["evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations"]) {
+    for (const table of ["section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations"]) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     db.exec("DELETE FROM schema_migrations WHERE version >= 6");
@@ -80,7 +80,7 @@ describe("migration 5 → 6 observation-evidence-foundation (§3/§62, E1/E2)", 
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(7);
+        expect(store.getSchemaVersion()).toBe(8);
         // Old data survives EXACTLY (E2).
         expect(count(root, "planning_runs")).toBe(before.runs);
         expect(count(root, "session_bindings")).toBe(before.bindings);
@@ -100,12 +100,12 @@ describe("migration 5 → 6 observation-evidence-foundation (§3/§62, E1/E2)", 
           "evidence_artifacts",
           "evidence_revisions",
           "evidence_observation_refs",
-          "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs",
+          "section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs",
         ]));
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>,
         ).map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
         // The audit CHECK actually accepts the new event type (§72): a probe
         // insert succeeds inside a transaction that is then rolled back, and
         // an unknown type is rejected by the CHECK.
@@ -180,7 +180,7 @@ describe("migration 5 → 6 observation-evidence-foundation (§3/§62, E1/E2)", 
 
       // A clean retry reaches v6 and preserves the schema-5 world.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(7);
+      expect(retry.getSchemaVersion()).toBe(8);
       expect(count(root, "plan_commits")).toBeGreaterThan(0);
       retry.close();
     } finally {

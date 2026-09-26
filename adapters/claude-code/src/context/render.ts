@@ -11,7 +11,7 @@
 
 import type { PhasePlanContext } from "./types.js";
 
-export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v1]";
+export const RECOVERY_CAPSULE_HEADER = "[Phase Plan Recovery v2]";
 
 /** One named capsule section with its budget priority. */
 export interface CapsuleSegment {
@@ -84,13 +84,58 @@ export function architectureSegment(context: PhasePlanContext): CapsuleSegment {
   };
 }
 
-export function activeScopeSegment(): CapsuleSegment {
-  // The context's `activeScope` is typed null until the Section workflow
-  // phase (§8); the line keeps the §17 capsule shape stable.
+export function activeScopeSegment(context: PhasePlanContext): CapsuleSegment {
+  // Phase 11: the durable active Section (§10/§11), resolved against the
+  // current HEAD snapshot by the assembler.
+  const active = context.activeScope;
   return {
     name: "active scope",
     required: true,
-    text: "Active scope: none",
+    text:
+      active === null
+        ? "Active scope: none"
+        : `Active scope: section ${active.sectionId}@${active.revision} (${active.workflowStatus}) — ${active.title}`,
+  };
+}
+
+/** §50 — compact workflow summary; never full Section designs. */
+export function sectionWorkflowSegment(context: PhasePlanContext): CapsuleSegment {
+  const entries = context.sectionWorkflow.sections.map((section) => {
+    const completed =
+      section.completedRevision !== undefined ? ` (completed @${section.completedRevision})` : "";
+    return `- ${section.ref.id}@${section.ref.revision}: ${section.status}${completed} — ${section.title}`;
+  });
+  return {
+    name: "section workflow",
+    required: true,
+    text: ["Section workflow:", entries.length === 0 ? "  (no sections)" : indent(entries)].join("\n"),
+  };
+}
+
+/** §51 — the active Section's DIRECT dependency contracts, compact form. */
+export function dependencyContractsSegment(context: PhasePlanContext): CapsuleSegment {
+  if (context.activeScope === null) {
+    return { name: "dependency contracts", required: false, text: "Dependency contracts: (no active section)" };
+  }
+  if (context.activeDependencyContracts.length === 0) {
+    return { name: "dependency contracts", required: false, text: "Dependency contracts: (none)" };
+  }
+  const entries = context.activeDependencyContracts.map((entry) => {
+    const c = entry.contract;
+    return [
+      `- ${entry.ref.id}@${entry.ref.revision} contract:`,
+      indent([
+        `provides=[${c.provides.join("; ")}]`,
+        `requires=[${c.requires.join("; ")}]`,
+        `invariants=[${c.invariants.join("; ")}]`,
+        `interfaces=[${c.interfaces.join("; ")}]`,
+      ]),
+    ].join("\n");
+  });
+  return {
+    name: "dependency contracts",
+    required: true,
+    text: ["Dependency contracts (direct dependencies of the active section):", ...entries].join("\n"),
   };
 }
 
@@ -124,7 +169,11 @@ export function awaitingProposalSegment(context: PhasePlanContext): CapsuleSegme
         `revision=${proposal.revision}`,
         `hash=${proposal.hash}`,
         `type=${proposal.type}`,
-        `scope=${proposal.scope.kind === "section" ? `section:${proposal.scope.sectionId}` : "architecture"}`,
+        `scope=${
+          proposal.scope.kind === "section"
+            ? `section:${proposal.scope.sectionId}`
+            : proposal.scope.kind
+        }`,
         `title=${proposal.title}`,
         `summary=${proposal.summary}`,
       ]),

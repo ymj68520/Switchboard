@@ -37,6 +37,12 @@ import { parsePlanningRunRow, type PlanningRun } from "../core/planning-run.js";
 import { RuntimeError } from "../runtime/errors.js";
 import { evidenceNeedsValidationError } from "./evidence-gate.js";
 import { evaluateCriticalEvidenceGateInTx } from "./evidence-freshness-service.js";
+import {
+  getSectionWorkflowStateInTx,
+} from "../store/section-workflow.js";
+import {
+  sectionWorkflowError,
+} from "./section-workflow-service.js";
 import { insertProposalEvidenceRefsInTx } from "../store/evidence-freshness.js";
 import { getSnapshotRefsInTx } from "../store/plan-memory.js";
 import { appendAuditEventInTx, getHeadPairInTx, type HeadPair } from "../store/plan-commits.js";
@@ -169,14 +175,36 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
   }
 
   /**
-   * Proposal-type availability (§11/§56) and stage/scope capability (§12/§80)
-   * — server-side, never delegated to future MCP tool visibility.
+   * Proposal-type availability (§11/§56) and the Phase 11 stage/scope
+   * capability matrix (§53), server-side — never delegated to future MCP
+   * tool visibility:
+   *
+   *   discovery    → design_checkpoint @ architecture ONLY; the FIRST
+   *                  architecture prepare atomically advances the run
+   *                  (Discovery → Architecture bridge, §24)
+   *   architecture → design_checkpoint / architecture_completion / amendment
+   *                  @ architecture
+   *   detail       → design_checkpoint @ detail (DAG creation, §26);
+   *                  design_checkpoint / section_completion / amendment
+   *                  @ section; amendment @ architecture (§54 — no stage
+   *                  change back to architecture)
+   *   synthesis+   → no prepare capability at all
    */
   function gateTypeAndStage(run: PlanningRun, type: ProposalType, scope: ProposalScope): void {
     if (!isProductionProposalType(type)) {
       throw new RuntimeError("PROPOSAL_TYPE_UNAVAILABLE", `proposal type '${type}' is not available in this phase`, {
         detail: { type },
       });
+    }
+    if (run.stage === "discovery") {
+      if (type !== "design_checkpoint" || scope.kind !== "architecture") {
+        throw proposalInvalid("discovery-stage proposals must be architecture design_checkpoints (the prepare atomically advances the run)", {
+          stage: run.stage,
+          type,
+          scope,
+        });
+      }
+      return;
     }
     if (run.stage === "architecture") {
       if (scope.kind !== "architecture") {
@@ -190,14 +218,165 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           detail: { stage: run.stage, type },
         });
       }
-      if (scope.kind !== "section") {
-        throw proposalInvalid("detail-stage proposals require section scope", { stage: run.stage, scope });
+      if (scope.kind === "detail") {
+        if (type !== "design_checkpoint") {
+          throw proposalInvalid("detail-scope proposals must be design_checkpoints (dynamic Section DAG)", {
+            stage: run.stage,
+            type,
+            scope,
+          });
+        }
+        return;
+      }
+      if (scope.kind === "section") {
+        return;
+      }
+      // scope architecture in Detail: amendment only (§54), no stage change.
+      if (type !== "amendment") {
+        throw proposalInvalid("architecture-scope proposals in detail are amendments only", {
+          stage: run.stage,
+          type,
+          scope,
+        });
       }
       return;
     }
     throw new RuntimeError("CAPABILITY_NOT_AVAILABLE", `proposal preparation is not available at stage '${run.stage}'`, {
       detail: { stage: run.stage, type },
     });
+  }
+
+  /**
+   * Phase 11 §29/§38/§39/§53 — Section-scope discipline and workflow-op
+   * authorization, evaluated against the NORMALIZED changes:
+   *   - a Section-scope proposal may only mutate the scoped Section
+   *   - COMPLETE_SECTION requires type section_completion @ section scope,
+   *     targeting exactly the scoped Section (§30)
+   *   - REOPEN_SECTION requires type amendment or section_completion @
+   *     section scope (§39, with §40's atomic reopen+complete composition)
+   *   - a completed Section cannot be silently revised: any SET_SECTION_
+   *     REVISION touching a workflow-completed Section requires a
+   *     REOPEN_SECTION op for the same Section in the SAME proposal (§38)
+   */
+  function gateSectionWorkflowOpsInTx(
+    tx: StoreTx,
+    input: {
+      runId: string;
+      type: ProposalType;
+      scope: ProposalScope;
+      changes: ReturnType<typeof normalizeProposalChanges>["changes"];
+    },
+  ): void {
+    const reopenedIds = new Set<string>();
+    for (const change of input.changes) {
+      if (change.op === "REOPEN_SECTION") {
+        reopenedIds.add(change.artifactId);
+      }
+    }
+    for (const change of input.changes) {
+      if (change.op === "SET_SECTION_REVISION" && change.target !== null) {
+        const state = getSectionWorkflowStateInTx(tx, input.runId, change.artifactId);
+        if (state !== null && state.status === "completed" && !reopenedIds.has(change.artifactId)) {
+          throw sectionWorkflowError(
+            "SECTION_WORKFLOW_INVALID",
+            `section '${change.artifactId}' is completed; revising it requires an explicit REOPEN_SECTION in the same proposal`,
+            { runId: input.runId, sectionId: change.artifactId, status: state.status },
+          );
+        }
+      }
+    }
+    if (input.scope.kind === "detail") {
+      // §26 — dynamic Section DAG decomposition / cross-section checkpoint:
+      // SET_SECTION_REVISION creates and extends the DAG; workflow facts
+      // never ride a detail-scope proposal.
+      for (const change of input.changes) {
+        if (change.op === "COMPLETE_SECTION" || change.op === "REOPEN_SECTION") {
+          throw proposalInvalid(`${change.op} requires section scope`, { scope: input.scope, op: change.op });
+        }
+      }
+      return;
+    }
+    if (input.scope.kind !== "section") {
+      for (const change of input.changes) {
+        if (change.op === "COMPLETE_SECTION" || change.op === "REOPEN_SECTION") {
+          throw proposalInvalid(`${change.op} requires section scope`, { scope: input.scope, op: change.op });
+        }
+        if (change.op === "SET_SECTION_REVISION") {
+          throw proposalInvalid("SET_SECTION_REVISION requires section or detail scope", { scope: input.scope });
+        }
+      }
+      return;
+    }
+    const scopedSectionId = input.scope.sectionId;
+    const scopedState = getSectionWorkflowStateInTx(tx, input.runId, scopedSectionId);
+    if (scopedState === null) {
+      throw sectionWorkflowError(
+        "SECTION_NOT_FOUND",
+        `section-scope proposal names section '${scopedSectionId}' which does not exist in this run; new sections are created through detail-scope DAG proposals`,
+        { runId: input.runId, sectionId: scopedSectionId },
+      );
+    }
+    for (const change of input.changes) {
+      if (change.op === "SET_SECTION_REVISION" && change.artifactId !== scopedSectionId) {
+        throw proposalInvalid(
+          `section-scope proposal may only revise section '${scopedSectionId}', not '${change.artifactId}'`,
+          { scope: input.scope, sectionId: change.artifactId },
+        );
+      }
+      if (change.op === "COMPLETE_SECTION") {
+        if (input.type !== "section_completion") {
+          throw proposalInvalid("COMPLETE_SECTION requires proposal_type section_completion", {
+            type: input.type,
+            sectionId: change.artifactId,
+          });
+        }
+        if (change.artifactId !== scopedSectionId) {
+          throw proposalInvalid("COMPLETE_SECTION must target the scoped section", {
+            scope: input.scope,
+            sectionId: change.artifactId,
+          });
+        }
+      }
+      if (change.op === "REOPEN_SECTION") {
+        if (input.type !== "amendment" && input.type !== "section_completion") {
+          throw proposalInvalid("REOPEN_SECTION requires proposal_type amendment or section_completion", {
+            type: input.type,
+            sectionId: change.artifactId,
+          });
+        }
+        if (change.artifactId !== scopedSectionId) {
+          throw proposalInvalid("REOPEN_SECTION must target the scoped section", {
+            scope: input.scope,
+            sectionId: change.artifactId,
+          });
+        }
+        const state = getSectionWorkflowStateInTx(tx, input.runId, change.artifactId);
+        if (state === null || (state.status !== "completed" && state.status !== "needs_review")) {
+          throw sectionWorkflowError(
+            "SECTION_WORKFLOW_INVALID",
+            `REOPEN_SECTION target '${change.artifactId}' is ${state?.status ?? "unregistered"}; only completed or needs_review sections can reopen`,
+            { runId: input.runId, sectionId: change.artifactId, status: state?.status ?? null },
+          );
+        }
+      }
+    }
+    // §44 — re-completion without design change: a section_completion whose
+    // only Section change is COMPLETE_SECTION needs no revision bump, and the
+    // scoped section must not already be completed at that same revision.
+    if (input.type === "section_completion") {
+      const completeOp = input.changes.find((change) => change.op === "COMPLETE_SECTION");
+      if (completeOp !== undefined && completeOp.op === "COMPLETE_SECTION") {
+        const state = getSectionWorkflowStateInTx(tx, input.runId, completeOp.artifactId);
+        const reopened = reopenedIds.has(completeOp.artifactId);
+        if (state !== null && state.status === "completed" && !reopened) {
+          throw sectionWorkflowError(
+            "SECTION_ALREADY_COMPLETED",
+            `section '${completeOp.artifactId}' is already completed at revision ${String(state.completedRevision)}; reopen it first`,
+            { runId: input.runId, sectionId: completeOp.artifactId, completedRevision: state.completedRevision },
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -441,8 +620,8 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           }
         }
 
-        const run = gateProposalMutationInTx(tx, input);
-        gateTypeAndStage(run, input.type, input.scope);
+        const runPre = gateProposalMutationInTx(tx, input);
+        gateTypeAndStage(runPre, input.type, input.scope);
         const { head, baseRefs } = baseWorldInTx(tx, input.runId);
         const normalized = normalizeAndValidate({
           runId: input.runId,
@@ -460,6 +639,39 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           throw new RuntimeError("PROPOSAL_ALREADY_AWAITING", `run '${input.runId}' already has an awaiting proposal`, {
             detail: { runId: input.runId },
           });
+        }
+        // Phase 11 §29/§30/§38/§39 — Section-scope discipline and explicit
+        // reopen authorization, evaluated against the normalized changes.
+        gateSectionWorkflowOpsInTx(tx, {
+          runId: input.runId,
+          type: input.type,
+          scope: input.scope,
+          changes: normalized.changes,
+        });
+
+        // §24 — Discovery → Architecture bridge: the FIRST architecture
+        // checkpoint legally prepared at discovery advances the run IN THIS
+        // TRANSACTION (DISCOVERY_COMPLETE, revision +1) and freezes against
+        // the NEW revision. Any failure above rolls the whole prepare back —
+        // discovery can never be lost without a proposal.
+        let run = runPre;
+        if (runPre.stage === "discovery") {
+          const now = clock.nowIso();
+          const advanced = tx
+            .prepare(
+              "UPDATE planning_runs SET stage = 'architecture', revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
+            )
+            .run(now, runPre.runId, runPre.revision) as { changes?: number };
+          if ((advanced.changes ?? 0) !== 1) {
+            throw runStateError("STALE_RUN_REVISION", "run revision changed during the Discovery→Architecture transition", {
+              runId: runPre.runId,
+              expected: runPre.revision,
+            });
+          }
+          run = { ...runPre, stage: "architecture", revision: runPre.revision + 1, updatedAt: now };
+          // Provenance note: audit_events keeps its frozen five-type CHECK
+          // (§74 spirit). The authoritative transition facts live in
+          // planning_runs (stage/revision) and the PROPOSAL_PREPARED audit row.
         }
 
         // Identity first (FK parent), then the frozen revision + state.
@@ -547,6 +759,13 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           runId: input.runId,
           workspaceId: input.workspaceId,
           requiredEvidence: input.requiredEvidence ?? [],
+        });
+        // Phase 11 §29/§30/§38/§39 — same Section workflow discipline on revise.
+        gateSectionWorkflowOpsInTx(tx, {
+          runId: input.runId,
+          type: input.type,
+          scope: input.scope,
+          changes: normalized.changes,
         });
 
         // ONE transaction: @N awaiting → superseded, then @N+1 frozen awaiting.

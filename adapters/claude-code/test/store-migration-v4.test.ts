@@ -9,6 +9,8 @@ import { createWorkspaceBindingMigration } from "../src/store/migrations/002-wor
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createProposalApprovalCommitMigration } from "../src/store/migrations/005-proposal-approval-plan-commit.js";
 import { createObservationEvidenceMigration } from "../src/store/migrations/006-observation-evidence-foundation.js";
+import { createEvidenceFreshnessMigration } from "../src/store/migrations/007-evidence-freshness-foundation.js";
+import { createSectionWorkflowMigration } from "../src/store/migrations/008-section-workflow.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore } from "../src/store/sqlite-store.js";
@@ -21,11 +23,11 @@ function makeSchema3Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
-    for (const table of ["evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts"]) {
+    for (const table of ["section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "evidence_observation_refs", "evidence_revisions", "evidence_artifacts", "observations", "audit_events", "plan_commits", "approvals", "proposal_states", "proposal_revisions", "proposals", "plan_heads", "snapshot_members", "plan_snapshots", "memory_revisions", "memory_artifacts"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     for (const kind of ["update", "delete"]) {
-      for (const table of ["observations", "evidence_artifacts", "evidence_revisions", "evidence_observation_refs", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "audit_events"]) {
+      for (const table of ["observations", "evidence_artifacts", "evidence_revisions", "evidence_observation_refs", "section_workflow_events", "section_workflow_states", "planning_active_work", "evidence_validation_events", "evidence_current_states", "proposal_evidence_refs", "evidence_derived_refs", "audit_events"]) {
         raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
     }
@@ -38,10 +40,14 @@ for (const kind of ["update", "delete"]) {
     raw.exec("DROP TRIGGER IF EXISTS evidence_validation_events_no_delete");
     raw.exec("DROP TRIGGER IF EXISTS evidence_validation_events_no_revival");
     raw.exec("DROP TRIGGER IF EXISTS evidence_current_states_no_delete");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_update");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_events_no_delete");
+    raw.exec("DROP TRIGGER IF EXISTS section_workflow_states_no_delete");
     raw.exec("DROP TRIGGER IF EXISTS proposal_evidence_refs_no_update");
     raw.exec("DROP TRIGGER IF EXISTS proposal_evidence_refs_no_delete");
     raw.exec("DROP INDEX IF EXISTS idx_evidence_validation_events_revision");
     raw.exec("DROP INDEX IF EXISTS idx_evidence_derived_refs_upstream");
+    raw.exec("DROP INDEX IF EXISTS idx_section_workflow_events_section");
     raw.exec("DELETE FROM schema_migrations WHERE version >= 4");
     raw.exec("PRAGMA user_version = 3");
     raw.exec("CREATE TABLE phase4_sentinel (note TEXT NOT NULL)");
@@ -97,6 +103,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
           { version: 5, name: "proposal-approval-plan-commit" },
           { version: 6, name: "observation-evidence-foundation" },
           { version: 7, name: "evidence-freshness-foundation" },
+          { version: 8, name: "section-workflow" },
         ]);
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get())).toEqual({ n: 1 });
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs WHERE run_id = ?").get(runId))).toEqual({ n: 1 });
@@ -111,7 +118,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-7-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-8-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -153,6 +160,8 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
             failing,
             createProposalApprovalCommitMigration(),
             createObservationEvidenceMigration(),
+            createEvidenceFreshnessMigration(),
+            createSectionWorkflowMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -175,7 +184,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
         raw.close();
       }
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(7);
+      expect(retry.getSchemaVersion()).toBe(8);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

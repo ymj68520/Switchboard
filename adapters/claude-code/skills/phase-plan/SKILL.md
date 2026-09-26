@@ -35,6 +35,12 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
   not call `start_or_resume` without it.
 - `approve_proposal` always asks the user for explicit approval; present the
   exact proposal id, revision, and hash before calling it.
+- Architecture completion moves the run to Detail. In Detail, inspect the
+  Section workflow in `get_context`, `select_section` to pick ONE section,
+  work from its direct dependency contracts, checkpoint through
+  `prepare_proposal`, and finish a section with a `section_completion`
+  proposal. A run reaches Synthesis only when every section is completed at
+  its current revision and none needs review.
 - After a resume or compaction, rely on the injected Phase Plan Recovery
   Capsule for authoritative state. If exact artifact detail is needed, call
   `get_context` (structured projection + context epoch) or `read_memory`

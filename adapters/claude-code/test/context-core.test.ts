@@ -50,7 +50,7 @@ describe("assembler: empty-run baseline (E7/E22/E33)", () => {
       const second = assembleContext(source, fixture.runId);
       // Byte-identical structured context for identical Store state (E33/E14).
       expect(JSON.stringify(first)).toBe(JSON.stringify(second));
-      expect(first.version).toBe(1);
+      expect(first.version).toBe(2);
       expect(first.run).toMatchObject({ runId: fixture.runId, stage: "architecture", lifecycle: "active" });
       expect(first.head).toEqual({ commitId: null, snapshotId: null });
       expect(first.globalMemory).toEqual({
@@ -62,7 +62,7 @@ describe("assembler: empty-run baseline (E7/E22/E33)", () => {
       });
       expect(first.activeScope).toBeNull();
       expect(first.working.awaitingProposal).toBeNull();
-      expect(first.operations).toEqual(["get_state", "get_context", "read_memory", "start_or_resume"]);
+      expect(first.operations).toEqual(["get_state", "get_context", "read_memory", "start_or_resume", "prepare_proposal"]);
       expect(first.sourceTrace).toMatchObject({ runRevision: fixture.runRevision, headCommitId: null, headSnapshotId: null, snapshotRefCount: 0, awaitingProposalRevision: null });
       // No committed mutation (E22/§48).
       expect(memoryCounts(fixture.store)).toEqual(before);
@@ -142,9 +142,11 @@ describe("context_epoch (E4/E5/E6, §36/§37/§38)", () => {
       headSnapshotId: "S" as string | null,
       awaitingProposal: { id: "P", revision: 1, hash: "sha256:x" } as { id: string; revision: number; hash: string } | null,
       activeScope: null as { kind: string } | null,
+      activeSection: null as { sectionId: string } | null,
+      sectionWorkflow: [] as Array<{ sectionId: string; status: string; completedRevision: number | null }>,
     };
     const epoch = deriveContextEpoch(base);
-    expect(epoch).toMatch(/^[0-9a-f]{64}$/);
+    expect(epoch).toMatch(/^context-epoch:v2:[0-9a-f]{64}$/);
     expect(deriveContextEpoch({ ...base })).toBe(epoch);
     expect(deriveContextEpoch({ ...base, headCommitId: null })).not.toBe(epoch);
     expect(deriveContextEpoch({ ...base, awaitingProposal: null })).not.toBe(epoch);
@@ -288,7 +290,14 @@ describe("proposal isolation (E10/E11, §14/§55)", () => {
         title: "Checkpoint",
         summary: "checkpoint summary",
       });
-      expect(context.operations).toEqual(["get_state", "get_context", "read_memory", "start_or_resume", "approve_proposal"]);
+      expect(context.operations).toEqual([
+        "get_state",
+        "get_context",
+        "read_memory",
+        "start_or_resume",
+        "prepare_proposal",
+        "approve_proposal",
+      ]);
     });
   });
 
@@ -313,7 +322,7 @@ describe("read model no-mutation + structural guarantees (E22/E23, §26)", () =>
       const context = assembleContext(source, fixture.runId);
       deriveContextEpochFromSource(source, fixture.runId);
       deriveContextEpochFromSource(source, fixture.runId);
-      expect(JSON.parse(canonicalJson(context)).version).toBe(1);
+      expect(JSON.parse(canonicalJson(context)).version).toBe(2);
       expect(memoryCounts(fixture.store)).toEqual(before);
     });
   });

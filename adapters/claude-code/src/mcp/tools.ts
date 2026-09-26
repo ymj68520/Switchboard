@@ -1,14 +1,16 @@
 /**
- * Phase 9 MCP tool surface (Phase 9 directive §21/§22/§44/§45/§58).
+ * Phase 11 MCP tool surface (Phase 11 directive §12/§21/§50/§74).
  *
- * Exactly seven tools — the Phase 8 set plus the two Phase 9 observation/
- * evidence tools:
+ * Exactly ten tools — the Phase 10 set plus the two Phase 11 workflow tools:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
  *   get_state        (read-only, session-scoped)
  *   get_context      (read-only structured L0–L5 context projection + epoch)
  *   read_memory      (read-only exact MemoryRef retrieval)
  *   list_observations(read-only Observation ledger summaries, §21/§22)
  *   promote_evidence (explicit Observation→Evidence promotion, §28/§44/§45)
+ *   revalidate_evidence (Evidence freshness revalidation, Phase 10 §20–§29)
+ *   select_section   (durable active-Section selection, Detail stage)
+ *   prepare_proposal (the production model-facing prepare surface, §21)
  *   approve_proposal (the Formal Approval bridge into the Phase 6 engine,
  *                     marked anthropic/requiresUserInteraction=true)
  *
@@ -20,15 +22,19 @@
  * the Phase 6 engine on every call. Read tools accept a read-only HostContext
  * without requiring permission_mode=plan (§39) but never widen scope: the run
  * is resolved from the signed session + workspace, never from model input.
- * promote_evidence records PROVENANCE, not design authority — it needs no
- * human Approval (§45) and no plan mode, but it does need an attached active
- * run, and design consequences still require Proposal → Approval → PlanCommit.
+ * prepare_proposal carries NO human approval (§21/§61): Formal Approval still
+ * happens only through approve_proposal.
  */
 
 import { getWorkspaceById } from "../store/repositories.js";
 import { getAwaitingProposalRecord } from "../store/proposals.js";
 import { getHeadCommitRecord } from "../store/plan-commits.js";
-import { listPlanningRunsForWorkspaceRecord } from "../store/planning-runs.js";
+import { getPlanningRunRecord, listPlanningRunsForWorkspaceRecord } from "../store/planning-runs.js";
+import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
+import { createSectionWorkflowService } from "../application/section-workflow-service.js";
+import { createProposalService } from "../application/proposal-service.js";
+import type { ProposalScope, ProposalType, RawProposalChange } from "../core/proposal.js";
+import type { ProposalEvidenceRef } from "../core/proposal-canonical.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import type { BlobStore } from "../store/blob-store.js";
@@ -254,6 +260,72 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
     },
   },
   {
+    name: "select_section",
+    description:
+      "Select the Section you will work on (Detail stage only). Sets the run's durable active Section; the run revision "
+      + "advances exactly once per scope change, fencing any awaiting proposal. Re-selecting the already-active Section is "
+      + "idempotent. Supply only the section id — run identity and revision are server-derived.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        section_id: { type: "string", description: "Section artifact id from the current HEAD snapshot (e.g. SEC-1)." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["section_id", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "prepare_proposal",
+    description:
+      "Freeze your proposed design changes into an awaiting-approval Proposal (the first half of Proposal → human Approval → "
+      + "PlanCommit). Everything authoritative is server-derived: ids, revisions, base run revision, and HEAD. "
+      + "proposal_type: design_checkpoint | architecture_completion | section_completion | amendment. scope.kind: architecture | "
+      + "detail | section. Changing a completed section requires an explicit REOPEN_SECTION change in the same proposal. "
+      + "This tool is NOT the human approval — call approve_proposal afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        proposal_type: { type: "string", enum: ["design_checkpoint", "architecture_completion", "section_completion", "amendment"] },
+        scope: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["architecture", "detail", "section"] },
+            section_id: { type: "string", description: "Required when kind=section." },
+          },
+          required: ["kind"],
+          additionalProperties: false,
+        },
+        title: { type: "string" },
+        summary: { type: "string" },
+        changes: {
+          type: "array",
+          description:
+            "Normalized-change requests (op + typed content + compactProjection). New sections may carry a request-local "
+            + "localRef alias other changes can depend on; aliases never persist. COMPLETE_SECTION/REOPEN_SECTION carry "
+            + "{op, sectionId, compactProjection} and are resolved to exact revisions server-side.",
+          items: { type: "object" },
+        },
+        required_evidence: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              evidence_id: { type: "string" },
+              revision: { type: "integer", minimum: 1 },
+            },
+            required: ["evidence_id", "revision"],
+            additionalProperties: false,
+          },
+          description: "Exact Evidence revisions this proposal rests on; critical ones must be fresh now.",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["proposal_type", "scope", "title", "summary", "changes", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "approve_proposal",
     description:
       "Formally approve the run's awaiting proposal with EXACT id/revision/hash and commit it as an immutable PlanCommit. "
@@ -466,6 +538,15 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
   }
   const head = getHeadCommitRecord(ctx.store, preferred.run.runId);
   const awaiting = getAwaitingProposalRecord(ctx.store, preferred.run.runId);
+  // Phase 11 §62 — compact workflow view: active Section + status counts,
+  // never full Section contents.
+  const activeSectionId = getActiveSection(ctx.store, preferred.run.runId);
+  const workflowStates = listSectionWorkflowStates(ctx.store, preferred.run.runId);
+  const sectionCounts = {
+    open: workflowStates.filter((state) => state.status === "open").length,
+    completed: workflowStates.filter((state) => state.status === "completed").length,
+    needsReview: workflowStates.filter((state) => state.status === "needs_review").length,
+  };
   return {
     run: {
       id: preferred.run.runId,
@@ -477,6 +558,12 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
       generation: preferred.binding.generation,
       state: preferred.binding.state,
     },
+    ...(activeSectionId !== null || workflowStates.length > 0
+      ? {
+          ...(activeSectionId !== null ? { activeSection: { section_id: activeSectionId } } : {}),
+          sectionCounts,
+        }
+      : {}),
     ...(head === null
       ? {}
       : { head: { snapshotId: head.resultingSnapshotId, commitId: head.commitId } }),
@@ -846,6 +933,155 @@ export function handleRevalidateEvidence(ctx: PhasePlanToolContext, rawArgs: Rec
 }
 
 // ---------------------------------------------------------------------------
+// select_section (Phase 11 §10–§15) — durable active-Section selection
+// ---------------------------------------------------------------------------
+
+export function handleSelectSection(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["section_id"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "select_section", businessInput: rawArgs });
+  // §12 — the model supplies ONLY the section id: run identity, workspace,
+  // binding, and the expected run revision are all server-derived.
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  if (typeof rawArgs.section_id !== "string" || rawArgs.section_id.trim() === "") {
+    throw inputInvalid("section_id must be a non-empty string");
+  }
+  const current = getPlanningRunRecord(ctx.store, envelope.runId);
+  if (current === null) {
+    throw domainError("RUN_NOT_FOUND", `the attached run '${envelope.runId}' no longer exists`);
+  }
+  const service = createSectionWorkflowService(ctx.store, ctx.clock);
+  const result = service.selectSection({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    expectedRunRevision: current.revision,
+    sectionId: rawArgs.section_id,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    active_section: { section_id: result.activeSectionId },
+    run: { id: result.run.runId, stage: result.run.stage, revision: result.run.revision },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// prepare_proposal (Phase 11 §21–§24/§53/§59/§60) — the production model-
+// facing prepare surface; the Formal Approval remains approve_proposal (§61)
+// ---------------------------------------------------------------------------
+
+const PROPOSAL_TYPE_VALUES = ["design_checkpoint", "architecture_completion", "section_completion", "amendment"] as const;
+
+export function handlePrepareProposal(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["proposal_type", "scope", "title", "summary", "changes", "required_evidence"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "prepare_proposal", businessInput: rawArgs });
+
+  // §59 — Plan Mode is the host-owned planning boundary for design mutation.
+  if (envelope.permissionMode !== "plan") {
+    throw domainError("PLAN_MODE_REQUIRED", `prepare_proposal requires permission_mode=plan (observed '${envelope.permissionMode}')`);
+  }
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+
+  if (typeof rawArgs.proposal_type !== "string" || !(PROPOSAL_TYPE_VALUES as readonly string[]).includes(rawArgs.proposal_type)) {
+    throw inputInvalid(`proposal_type must be one of: ${PROPOSAL_TYPE_VALUES.join(", ")}`);
+  }
+  const scopeRaw = rawArgs.scope;
+  if (typeof scopeRaw !== "object" || scopeRaw === null) {
+    throw inputInvalid("scope must be an object");
+  }
+  const scopeRecord = scopeRaw as Record<string, unknown>;
+  if (scopeRecord.kind !== "architecture" && scopeRecord.kind !== "detail" && scopeRecord.kind !== "section") {
+    throw inputInvalid('scope.kind must be "architecture", "detail", or "section"');
+  }
+  if (scopeRecord.kind === "section" && (typeof scopeRecord.section_id !== "string" || scopeRecord.section_id === "")) {
+    throw inputInvalid('scope.section_id is required when scope.kind="section"');
+  }
+  const scope: ProposalScope =
+    scopeRecord.kind === "section"
+      ? { kind: "section", sectionId: scopeRecord.section_id as string }
+      : { kind: scopeRecord.kind };
+  for (const field of ["title", "summary"] as const) {
+    if (typeof rawArgs[field] !== "string" || (rawArgs[field] as string).trim() === "") {
+      throw inputInvalid(`${field} must be a non-empty string`);
+    }
+  }
+  if (!Array.isArray(rawArgs.changes)) {
+    throw inputInvalid("changes must be an array");
+  }
+  const changes = rawArgs.changes as RawProposalChange[];
+  for (const change of changes) {
+    if (typeof change !== "object" || change === null || typeof (change as { op?: unknown }).op !== "string") {
+      throw inputInvalid("every change must be an object with an op field");
+    }
+  }
+  const requiredEvidence: ProposalEvidenceRef[] = [];
+  if (rawArgs.required_evidence !== undefined) {
+    if (!Array.isArray(rawArgs.required_evidence)) throw inputInvalid("required_evidence must be an array");
+    for (const entry of rawArgs.required_evidence) {
+      if (typeof entry !== "object" || entry === null) throw inputInvalid("required_evidence entries must be {evidence_id, revision}");
+      const record = entry as Record<string, unknown>;
+      if (typeof record.evidence_id !== "string" || record.evidence_id === "") {
+        throw inputInvalid("required_evidence entries must carry a non-empty evidence_id");
+      }
+      if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 1) {
+        throw inputInvalid("required_evidence revision must be a positive integer");
+      }
+      requiredEvidence.push({ evidenceId: record.evidence_id, revision: record.revision });
+    }
+  }
+
+  // §22 — every authority input is server-derived. The expected run revision
+  // comes from the Store at call time; the write transaction's WHERE-revision
+  // guard turns any concurrent drift into STALE_RUN_REVISION.
+  const current = getPlanningRunRecord(ctx.store, envelope.runId);
+  if (current === null) {
+    throw domainError("RUN_NOT_FOUND", `the attached run '${envelope.runId}' no longer exists`);
+  }
+  const service = createProposalService(ctx.store, ctx.clock);
+  // §60 — the operation id derives from the SIGNED HostContext tool use.
+  const prepared = service.prepareProposal({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    sessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration,
+    expectedRunRevision: current.revision,
+    type: rawArgs.proposal_type as ProposalType,
+    scope,
+    title: rawArgs.title as string,
+    summary: rawArgs.summary as string,
+    changes,
+    requiredEvidence,
+    prepareRequestId: `prepare:${envelope.toolUseId}`,
+  });
+  const sectionIds = [...new Set(prepared.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
+  return {
+    status: "awaiting_approval",
+    proposal: {
+      proposal_id: prepared.proposal.proposalId,
+      revision: prepared.proposal.revision,
+      proposal_hash: prepared.proposal.proposalHash,
+      type: prepared.proposal.type,
+      scope: prepared.proposal.scope,
+      title: prepared.proposal.title,
+      base_run_revision: prepared.proposal.baseRunRevision,
+    },
+    candidate: {
+      change_count: prepared.proposal.changes.length,
+      candidate_ref_count: prepared.candidateRefs.length,
+      section_ids: sectionIds,
+    },
+    next: "call approve_proposal with the exact proposal_id, revision, and proposal_hash (requires human approval)",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // approve_proposal (directive §27–§32) — the Formal Approval bridge
 // ---------------------------------------------------------------------------
 
@@ -920,6 +1156,10 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handlePromoteEvidence(ctx, rawArgs);
     case "revalidate_evidence":
       return handleRevalidateEvidence(ctx, rawArgs);
+    case "select_section":
+      return handleSelectSection(ctx, rawArgs);
+    case "prepare_proposal":
+      return handlePrepareProposal(ctx, rawArgs);
     case "approve_proposal":
       return handleApproveProposal(ctx, rawArgs);
     default:
