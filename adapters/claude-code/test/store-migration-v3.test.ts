@@ -29,6 +29,17 @@ function makeSchema2Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
+    for (const table of ["execution_handoffs", "execution_handoff_events", "execution_handoff_states", "execution_bindings"]) {
+      raw.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    raw.exec("DROP INDEX IF EXISTS idx_execution_handoff_events_handoff");
+    raw.exec("DROP INDEX IF EXISTS idx_execution_bindings_active_session");
+    raw.exec("DROP INDEX IF EXISTS idx_execution_bindings_session");
+    for (const kind of ["update", "delete"]) {
+      for (const table of ["execution_handoffs", "execution_handoff_events"]) {
+        raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+      }
+    }
     for (const table of ["final_plans", "proposal_final_plan_refs", "final_plan_candidate_refs", "final_plan_candidates", "evidence_audit_entries", "evidence_audit_snapshots"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
@@ -125,6 +136,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
           { version: 8, name: "section-workflow" },
           { version: 9, name: "synthesis-validation-foundation" },
 	  { version: 10, name: "finalization-final-plan" },
+	  { version: 11, name: "execution-handoff-foundation" },
         ]);
         const runs = store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get()) as { n: number };
         expect(runs.n).toBe(0);
@@ -141,7 +153,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-10-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-11-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -213,7 +225,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(10);
+      expect(retry.getSchemaVersion()).toBe(11);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

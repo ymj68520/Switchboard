@@ -53,6 +53,18 @@ export function askWithUpdatedInput(hookEventName: string, updatedInput: Record<
   });
 }
 
+/** PreToolUse: replace arguments and allow the call outright (verified authority). */
+export function allowWithUpdatedInput(hookEventName: string, updatedInput: Record<string, unknown>, reason: string): HookOutput {
+  return jsonOutput({
+    hookSpecificOutput: {
+      hookEventName,
+      permissionDecision: "allow",
+      permissionDecisionReason: reason,
+      updatedInput,
+    },
+  });
+}
+
 /** PreToolUse: replace arguments without forcing any permission decision (read paths). */
 export function updatedInputNoDecision(hookEventName: string, updatedInput: Record<string, unknown>): HookOutput {
   return jsonOutput({
@@ -112,6 +124,14 @@ export const DRIFT_GUARD_REASON =
 /** The frozen ExitPlanMode deny reason (directive §41). */
 export const EXIT_PLAN_MODE_REASON =
   "Phase Plan has not completed Final Approval/Handoff. The PlanningRun is still active; ExitPlanMode cannot end it.";
+
+/** The Phase 14 §10 ExitPlanMode deny reason while execution handoff is pending. */
+export const HANDOFF_PENDING_EXIT_PLAN_MODE_REASON =
+  "The Final Plan is approved, but the deterministic Execution Handoff has not been delivered. Use phase_plan.handoff.";
+
+/** The Phase 14 §45 PreToolUse deny reason for execution tools while handoff is pending. */
+export const HANDOFF_PENDING_EXECUTION_GUARD_REASON =
+  "Final Plan is approved and execution handoff is pending. Complete phase_plan.handoff before using execution tools; Build cannot begin before durable handoff delivery.";
 
 /** Serialize a HookOutput for stdout. Empty outputs write nothing. */
 export function renderHookOutput(output: HookOutput): string {

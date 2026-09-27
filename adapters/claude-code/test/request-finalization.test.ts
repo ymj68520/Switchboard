@@ -205,7 +205,7 @@ describe("request_finalization (§26–§29/§98)", () => {
   });
 
   it("request_finalization is the 14th tool (§87)", () => {
-    expect(PHASE_PLAN_TOOLS).toHaveLength(14);
+    expect(PHASE_PLAN_TOOLS).toHaveLength(15);
   });
 
   it("the model can never prepare a final_plan proposal (§38/§97/E30)", async () => {

@@ -228,7 +228,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
       const raw = rawConnection(storePathsFor(fixture.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(10);
+        expect(Object.values(row)[0]).toBe(11);
       } finally {
         raw.close();
       }
@@ -253,6 +253,7 @@ describe("Phase 8 tool surface (§42, E31)", () => {
       "submit_validation",
       "request_reopen",
       "request_finalization",
+      "handoff",
     ]);
     const joined = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
     for (const banned of ["takeover", "abort", "set_evidence_state", "set_section_status"]) {

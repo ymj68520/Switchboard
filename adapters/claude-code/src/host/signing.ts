@@ -2,9 +2,10 @@
  * Domain-separated HMAC signing over the deterministic canonical JSON seam
  * (Phase 7 directive §7).
  *
- * One persistent secret backs at least two independent message domains:
- *   - phase-plan:entry-intent:v1  — signed /phase-plan entry tokens
- *   - phase-plan:host-context:v1  — signed HostContext envelopes
+ * One persistent secret backs at least three independent message domains:
+ *   - phase-plan:entry-intent:v1        — signed /phase-plan entry tokens
+ *   - phase-plan:host-context:v1        — signed Planning HostContext envelopes
+ *   - phase-plan:execution-context:v1   — signed Execution HostContext envelopes (§54)
  *
  * Domain separation derives an independent per-domain key
  * (domainKey = HMAC-SHA256(secret, domain)) and signs
@@ -19,6 +20,7 @@ import { canonicalJson } from "../core/canonical-json.js";
 
 export const ENTRY_INTENT_DOMAIN = "phase-plan:entry-intent:v1";
 export const HOST_CONTEXT_DOMAIN = "phase-plan:host-context:v1";
+export const EXECUTION_CONTEXT_DOMAIN = "phase-plan:execution-context:v1";
 
 /** Signature encoding: URL-safe base64, no padding. */
 export function encodeSignature(signature: Buffer): string {

@@ -77,7 +77,8 @@ export type HostContextLogicalTool =
   | "submit_synthesis"
   | "submit_validation"
   | "request_reopen"
-  | "request_finalization";
+  | "request_finalization"
+  | "handoff";
 
 export interface BuildHostContextInput {
   sessionId: string;

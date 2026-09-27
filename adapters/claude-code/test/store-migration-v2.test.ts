@@ -37,6 +37,17 @@ function makeSchema1Store(root: string): void {
   const { databasePath } = storePathsFor(root);
   const raw = rawConnection(databasePath, 5000);
   try {
+    for (const table of ["execution_handoffs", "execution_handoff_events", "execution_handoff_states", "execution_bindings"]) {
+      raw.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    raw.exec("DROP INDEX IF EXISTS idx_execution_handoff_events_handoff");
+    raw.exec("DROP INDEX IF EXISTS idx_execution_bindings_active_session");
+    raw.exec("DROP INDEX IF EXISTS idx_execution_bindings_session");
+    for (const kind of ["update", "delete"]) {
+      for (const table of ["execution_handoffs", "execution_handoff_events"]) {
+        raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+      }
+    }
     for (const table of ["final_plans", "proposal_final_plan_refs", "final_plan_candidate_refs", "final_plan_candidates", "evidence_audit_entries", "evidence_audit_snapshots"]) {
       raw.exec(`DROP TABLE IF EXISTS ${table}`);
     }
@@ -123,6 +134,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
           { version: 8, name: "section-workflow" },
           { version: 9, name: "synthesis-validation-foundation" },
 	  { version: 10, name: "finalization-final-plan" },
+	  { version: 11, name: "execution-handoff-foundation" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM phase2_sentinel").all(),
@@ -134,7 +146,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-10-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-11-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       // The backup captures the SOURCE state (schema 1 + sentinel).
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
@@ -201,7 +213,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(10);
+      expect(retry.getSchemaVersion()).toBe(11);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -217,7 +229,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       makeSchema1Store(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(10);
+        expect(store.getSchemaVersion()).toBe(11);
       } finally {
         store.close();
       }
@@ -261,11 +273,11 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       createSchema0Database(databasePath, "chain-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(10);
+        expect(store.getSchemaVersion()).toBe(11);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
         ) as { version: number }[];
-        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -274,7 +286,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
         store.close();
       }
       expect(publishedBackups(backupsDir)).toHaveLength(1);
-      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-10-/);
+      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-11-/);
     } finally {
       removeTempPluginDataRoot(root);
     }

@@ -102,7 +102,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // Every caller ends in a valid state reporting the SAME store identity.
       for (const result of results) {
         expect(result.ok, JSON.stringify(result)).toBe(true);
-        expect(result.schemaVersion).toBe(10);
+        expect(result.schemaVersion).toBe(11);
       }
       const storeIds = new Set(results.map((r) => r.storeId));
       expect(storeIds.size).toBe(1);
@@ -111,7 +111,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // sentinel preserved, integrity clean, exactly one published backup.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(10);
+        expect(store.getSchemaVersion()).toBe(11);
         expect(store.getStoreMetadata().storeId).toBe(results[0]?.storeId);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
@@ -127,6 +127,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
           { version: 8, name: "section-workflow" },
           { version: 9, name: "synthesis-validation-foundation" },
 	  { version: 10, name: "finalization-final-plan" },
+	  { version: 11, name: "execution-handoff-foundation" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
@@ -152,6 +153,10 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "evidence_observation_refs",
         "evidence_revisions",
         "evidence_validation_events",
+        "execution_bindings",
+        "execution_handoff_events",
+        "execution_handoff_states",
+        "execution_handoffs",
         "final_plan_candidate_refs",
         "final_plan_candidates",
         "final_plans",
@@ -198,13 +203,13 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 11);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, 12);
 
       const worker = await bundleWorker(bundledDir);
       const result = await runWorker(worker, root, 2000);
       expect(result).toMatchObject({ ok: false, code: "STORE_SCHEMA_TOO_NEW" });
       // Untouched.
-      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(11);
+      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(12);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });

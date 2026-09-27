@@ -71,6 +71,17 @@ function rewindToSchema7(root: string): void {
   try {
     // Phase 12: rewind must also remove the v9 synthesis/validation objects
     // (children first; each table owns its no_update/no_delete triggers).
+    for (const table of ["execution_handoffs", "execution_handoff_events", "execution_handoff_states", "execution_bindings"]) {
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    db.exec("DROP INDEX IF EXISTS idx_execution_handoff_events_handoff");
+    db.exec("DROP INDEX IF EXISTS idx_execution_bindings_active_session");
+    db.exec("DROP INDEX IF EXISTS idx_execution_bindings_session");
+    for (const kind of ["update", "delete"]) {
+      for (const table of ["execution_handoffs", "execution_handoff_events"]) {
+        db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+      }
+    }
     for (const table of ["final_plans", "proposal_final_plan_refs", "final_plan_candidate_refs", "final_plan_candidates", "evidence_audit_entries", "evidence_audit_snapshots"]) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
@@ -113,7 +124,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(10);
+        expect(store.getSchemaVersion()).toBe(11);
         const read = (sql: string, ...params: unknown[]): unknown =>
           store.withRead((tx) => tx.prepare(sql).get(...params)) as Record<string, unknown>;
         // Old rows survive EXACTLY.
@@ -136,9 +147,9 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
         const history = store
           .withRead((tx) => tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
           .map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         expect(publishedBackups(backupsDir)).toHaveLength(1);
-        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-10-/);
+        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-11-/);
       } finally {
         store.close();
       }
@@ -182,7 +193,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       rewindToSchema7(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(10);
+        expect(store.getSchemaVersion()).toBe(11);
         const { assertWriteCompat } = await import("../src/store/transaction.js");
         let writeRan = false;
         expect(() =>

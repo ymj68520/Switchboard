@@ -51,6 +51,11 @@ import { createSynthesisService } from "../application/synthesis-service.js";
 import { createFinalizationService, loadFinalizationContextInTx } from "../application/finalization-service.js";
 import { getFinalPlanInTx } from "../store/finalization.js";
 import { renderFinalPlanCandidateMarkdown } from "../core/finalization.js";
+import { renderExecutionContract, type ExecutionHandoffV1 } from "../core/execution-handoff.js";
+import { createHandoffService, parseFinalPlanCanonical } from "../application/handoff-service.js";
+import { getExecutionHandoffInTx, getExecutionHandoffStateInTx, findAttachedExecutionBindingForSessionInTx } from "../store/execution.js";
+import { assertExecutionHostContextForTool, parseSignedHostContext, type ExecutionHostContextV1 } from "../host/execution-context.js";
+import { assertWritableBindingInTx } from "../store/session-bindings.js";
 import {
   getLatestSynthesisInputInTx,
   getSynthesisManifestByInputInTx,
@@ -472,6 +477,22 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "handoff",
+    description:
+      "Only valid after an approved Final Plan. Deterministically delivers the execution contract and completes "
+      + "the planning lifecycle. Takes no business input — the ExecutionHandoff is a server-derived projection of the "
+      + "approved FinalPlan (no force/bypass/skip fields exist). The host transitions this session to execution mode "
+      + "during the call; Plan Memory becomes read-only afterward and Build continues in the same session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function inputInvalid(message: string, cause?: string): RuntimeError {
@@ -547,6 +568,19 @@ export function handleStartOrResume(ctx: PhasePlanToolContext, rawArgs: Record<s
   if (workspace === null) {
     throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
   }
+
+  // §83 — a Build-bound session cannot silently start an unbaselined new
+  // PlanningRun (ExecutionIssue/subsequent-run baseline is Phase 15). Other
+  // sessions in this workspace are unaffected (§84 — never a workspace lock).
+  const execBound = ctx.store.withRead((tx) => findAttachedExecutionBindingForSessionInTx(tx, envelope.sessionId));
+  if (execBound !== null) {
+    throw new RuntimeError(
+      "EXECUTION_REPLAN_NOT_AVAILABLE",
+      "this session is bound to a delivered execution contract; replanning from a completed FinalPlan is not available",
+      { detail: { finalPlanId: execBound.finalPlanId } },
+    );
+  }
+
   verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });
 
   const action = args.action === undefined ? "auto" : args.action;
@@ -659,6 +693,14 @@ function resolveCurrentRun(ctx: PhasePlanToolContext, sessionId: string, workspa
 export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   assertExactBusinessFields(rawArgs, []);
   const token = requireHostContext(rawArgs);
+  // §57/§58 — under the signed execution authority get_state returns the
+  // compact Build view of the completed run; a Planning HostContext can never
+  // reach it (domain-separated signatures, §54).
+  const signed = parseSignedHostContext(ctx.secret, token);
+  if (signed.authority === "execution") {
+    const exec = assertExecutionHostContextForTool(ctx.secret, token, { tool: "get_state", businessInput: rawArgs });
+    return executionBuildState(ctx, exec);
+  }
   const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_state", businessInput: rawArgs });
 
   const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
@@ -726,7 +768,22 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
                 },
               }
             : {}),
-          handoff: { authorized: finalPlanRow !== null, delivered: false },
+          // Phase 14 — the real delivery projection from the execution domain
+          // (was the derived {authorized, delivered:false} view in Phase 13).
+          handoff: (() => {
+            const handoffView = ctx.store.withRead((tx) => {
+              const row = getExecutionHandoffInTx(tx, stageRunId);
+              if (row === null) return null;
+              const state = getExecutionHandoffStateInTx(tx, stageRunId);
+              return {
+                authorized: true,
+                handoff_id: row.handoffId,
+                handoff_hash: row.handoffHash,
+                delivered: state?.status === "delivered",
+              };
+            });
+            return handoffView ?? { authorized: finalPlanRow !== null, delivered: false };
+          })(),
         }
       : {}),
   };
@@ -738,8 +795,6 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
 
 export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   assertExactBusinessFields(rawArgs, ["detail"]);
-  const token = requireHostContext(rawArgs);
-  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_context", businessInput: rawArgs });
 
   let detail: ContextDetail = "current";
   if (rawArgs.detail !== undefined) {
@@ -748,6 +803,23 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
     }
     detail = rawArgs.detail;
   }
+
+  const token = requireHostContext(rawArgs);
+  // §59/§60 — under the signed execution authority get_context(detail=build)
+  // returns the deterministic ExecutionHandoff projection; no other detail is
+  // reachable (the planning workflow is terminal and its context stays closed).
+  const signed = parseSignedHostContext(ctx.secret, token);
+  if (signed.authority === "execution") {
+    if (detail !== "build") {
+      throw domainError(
+        "CAPABILITY_NOT_AVAILABLE",
+        `under the execution authority only detail="build" is available (requested '${detail}')`,
+      );
+    }
+    const exec = assertExecutionHostContextForTool(ctx.secret, token, { tool: "get_context", businessInput: rawArgs });
+    return executionBuildContext(ctx, exec);
+  }
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_context", businessInput: rawArgs });
 
   const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
   if (preferred === null || preferred.run === null) {
@@ -919,7 +991,6 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
 export function handleReadMemory(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   assertExactBusinessFields(rawArgs, ["kind", "id", "revision", "detail"]);
   const token = requireHostContext(rawArgs);
-  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "read_memory", businessInput: rawArgs });
 
   // §24 — exact refs only: kind/id/revision are required; no latest/current/
   // by-title/fuzzy authority shortcut exists, and run_id is not model input.
@@ -939,6 +1010,17 @@ export function handleReadMemory(ctx: PhasePlanToolContext, rawArgs: Record<stri
     }
     detail = rawArgs.detail;
   }
+
+  // §62–§66 — the authority decides FIRST: an execution token never reaches
+  // the planning verifier (domain separation, §54) and vice versa. Under the
+  // execution authority read_memory is exact-ref only AND limited to the
+  // approved FinalPlan closure; historical revisions fail closed (§64).
+  const execSigned = parseSignedHostContext(ctx.secret, token);
+  if (execSigned.authority === "execution") {
+    const exec = assertExecutionHostContextForTool(ctx.secret, token, { tool: "read_memory", businessInput: rawArgs });
+    return executionReadMemory(ctx, exec, { kind: rawArgs.kind, id: rawArgs.id, revision: rawArgs.revision, detail });
+  }
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "read_memory", businessInput: rawArgs });
 
   const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
   if (preferred === null || preferred.run === null) {
@@ -1685,6 +1767,226 @@ export function handleRequestFinalization(ctx: PhasePlanToolContext, rawArgs: Re
 }
 
 // ---------------------------------------------------------------------------
+// Build read-side (Phase 14 §57–§67) — execution-authority projections
+// ---------------------------------------------------------------------------
+
+/** §58 — the compact completed-run view. Never exposes other session ids. */
+function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostContextV1): Record<string, unknown> {
+  return ctx.store.withRead((tx) => {
+    const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
+      sessionId: exec.sessionId,
+      workspaceId: exec.workspaceId,
+      runId: exec.runId,
+      finalPlanId: exec.finalPlanId,
+      generation: exec.executionBindingGeneration,
+    });
+    const handoff = JSON.parse(authority.handoff.canonicalJson) as ExecutionHandoffV1;
+    return {
+      authority: "execution",
+      run: { id: authority.run.runId, lifecycle: authority.run.lifecycle, stage: authority.run.stage },
+      finalPlan: {
+        id: authority.finalPlanRow.finalPlanId,
+        revision: authority.finalPlanRow.revision,
+        hash: authority.finalPlanRow.finalPlanHash,
+      },
+      executionHandoff: {
+        id: authority.handoff.handoffId,
+        hash: authority.handoff.handoffHash,
+        delivered: true,
+      },
+      executionBinding: { generation: authority.binding.generation, state: authority.binding.state },
+      repositoryBaseline: handoff.repositoryBaseline,
+    };
+  });
+}
+
+/** §59/§61 — the deterministic Execution Contract projection; no epoch v5 exists
+ * because FinalPlan and handoff are immutable — the handoff hash is the anchor. */
+function executionBuildContext(ctx: PhasePlanToolContext, exec: ExecutionHostContextV1): Record<string, unknown> {
+  const state = executionBuildState(ctx, exec);
+  const handoff = ctx.store.withRead((tx) => {
+    const row = getExecutionHandoffInTx(tx, exec.runId);
+    return row === null ? null : (JSON.parse(row.canonicalJson) as ExecutionHandoffV1);
+  });
+  if (handoff === null) {
+    throw domainError("EXECUTION_CONTEXT_NOT_AVAILABLE", "the execution handoff row is missing");
+  }
+  const canonical = state as Record<string, unknown>;
+  return {
+    ...canonical,
+    handoff: {
+      id: canonical.executionHandoff ? (canonical.executionHandoff as Record<string, unknown>).id : undefined,
+      hash: canonical.executionHandoff ? (canonical.executionHandoff as Record<string, unknown>).hash : undefined,
+      canonical: handoff,
+    },
+    executionContract: renderExecutionContract(handoff, {
+      handoffId: ((canonical.executionHandoff as Record<string, unknown>).id) as string,
+      handoffHash: ((canonical.executionHandoff as Record<string, unknown>).hash) as string,
+    }),
+  };
+}
+
+/** §62–§66 — exact-ref reads limited to the approved FinalPlan closure. */
+function executionReadMemory(
+  ctx: PhasePlanToolContext,
+  exec: ExecutionHostContextV1,
+  ref: { kind: string; id: string; revision: number; detail: MemoryDetailLevel },
+): Record<string, unknown> {
+  // Authority check and content read are two separate read transactions:
+  // the context read model owns its own store.withRead boundary.
+  const runId = ctx.store.withRead((tx) => {
+    const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
+      sessionId: exec.sessionId,
+      workspaceId: exec.workspaceId,
+      runId: exec.runId,
+      finalPlanId: exec.finalPlanId,
+      generation: exec.executionBindingGeneration,
+    });
+    const plan = parseFinalPlanCanonical(authority.finalPlanRow.canonicalJson, authority.run.runId);
+    createHandoffService(ctx.store, ctx.clock).assertExecutionMemoryRefInTx(plan, {
+      kind: ref.kind,
+      id: ref.id,
+      revision: ref.revision,
+    });
+    return authority.run.runId;
+  });
+  const view = createStoreContextSource(ctx.store).readRevision({
+    runId,
+    kind: ref.kind as MemoryRef["kind"],
+    id: ref.id,
+    revision: ref.revision,
+  });
+    if (view === null) {
+      throw domainError(
+        "EXECUTION_MEMORY_REF_NOT_AUTHORIZED",
+        `no memory revision exists for ${ref.kind} '${ref.id}'@${ref.revision}`,
+      );
+    }
+    const refView = { runId, kind: ref.kind, id: ref.id, revision: ref.revision };
+    switch (ref.detail) {
+      case "identity":
+        return { status: "ok", authority: "execution", ref: refView };
+      case "summary":
+        return { status: "ok", authority: "execution", ref: refView, compactProjection: view.compactProjection };
+      case "contract":
+        // §66 — SectionContract access under the execution authority.
+        if (ref.kind !== "section") {
+          throw domainError("CAPABILITY_NOT_AVAILABLE", `detail="contract" is only available for section artifacts (requested ${ref.kind})`);
+        }
+        return { status: "ok", authority: "execution", ref: refView, contract: view.contractJson === null ? null : JSON.parse(view.contractJson) };
+      default:
+        return {
+          status: "ok",
+          authority: "execution",
+          ref: refView,
+          content: view.content,
+          compactProjection: view.compactProjection,
+          ...(view.contractJson === null ? {} : { contract: JSON.parse(view.contractJson) }),
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handoff (Phase 14 §32–§42/§92/§134) — the sole Plan → Build delivery tool
+// ---------------------------------------------------------------------------
+
+function handoffResponse(
+  handoff: ExecutionHandoffV1,
+  identity: { handoffId: string; handoffHash: string },
+  finalPlan: { id: string; hash: string },
+  idempotent: boolean,
+): Record<string, unknown> {
+  return {
+    status: "ok",
+    ...(idempotent ? { idempotent: true } : {}),
+    handoff_id: identity.handoffId,
+    handoff_hash: identity.handoffHash,
+    final_plan: { id: finalPlan.id, hash: finalPlan.hash },
+    repository_baseline: handoff.repositoryBaseline,
+    execution_contract: renderExecutionContract(handoff, identity),
+    // §92 — no session id, no binding generation, no plugin-data paths.
+    next:
+      "the host completes delivery via PostToolUse; after that this PlanningRun is completed, Plan Memory is read-only, "
+      + "and Build reads go through get_state / get_context(detail=build) / read_memory under the execution authority",
+  };
+}
+
+export function handleHandoff(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  // §32 — ZERO business fields; no force/bypass/skip/complete_run exists.
+  assertExactBusinessFields(rawArgs, []);
+  const token = requireHostContext(rawArgs);
+  const signed = parseSignedHostContext(ctx.secret, token);
+  if (signed.authority === "execution") {
+    // §134 — the exact original delivered invocation replays idempotently.
+    const exec = assertExecutionHostContextForTool(ctx.secret, token, { tool: "handoff", businessInput: rawArgs });
+    return ctx.store.withRead((tx) => {
+      const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
+        sessionId: exec.sessionId,
+        workspaceId: exec.workspaceId,
+        runId: exec.runId,
+        finalPlanId: exec.finalPlanId,
+        generation: exec.executionBindingGeneration,
+      });
+      const handoff = JSON.parse(authority.handoff.canonicalJson) as ExecutionHandoffV1;
+      return handoffResponse(
+        handoff,
+        { handoffId: authority.handoff.handoffId, handoffHash: authority.handoff.handoffHash },
+        { id: authority.finalPlanRow.finalPlanId, hash: authority.finalPlanRow.finalPlanHash },
+        true,
+      );
+    });
+  }
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "handoff", businessInput: rawArgs });
+  // §33 — main session only; the validator (or any subagent) can never handoff.
+  if (envelope.version === 2 && envelope.agent !== undefined) {
+    throw domainError("VALIDATOR_MUTATION_FORBIDDEN", "handoff is a main-session capability; subagents cannot initiate the Plan → Build transition");
+  }
+  if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+    throw domainError("STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+  }
+  const workspace = getWorkspaceById(ctx.store, envelope.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
+  }
+  // §134 — a new invocation against a delivered handoff names the exact code
+  // (the planning binding is detached by then, so check before ownership).
+  const delivered = ctx.store.withRead((tx) => {
+    const state = getExecutionHandoffStateInTx(tx, envelope.runId as string);
+    return state?.status === "delivered";
+  });
+  if (delivered) {
+    throw domainError("HANDOFF_ALREADY_DELIVERED", "the execution handoff for this run was already delivered");
+  }
+  // §7 — writable planning ownership is re-verified from the Store.
+  ctx.store.withWrite((tx) => {
+    assertWritableBindingInTx(tx, {
+      runId: envelope.runId as string,
+      workspaceId: envelope.workspaceId,
+      sessionId: envelope.sessionId,
+      generation: envelope.bindingGeneration as number,
+    });
+    return null;
+  });
+  // §35 — reload authority, derive/reuse the canonical handoff, create/reuse
+  // the ExecutionBinding, append DELIVERY_ATTEMPT — one transaction, and the
+  // PlanningRun is NOT completed here (§36: PostToolUse is the boundary).
+  const service = createHandoffService(ctx.store, ctx.clock);
+  const result = service.prepareHandoffDelivery({
+    runId: envelope.runId,
+    workspaceId: envelope.workspaceId,
+    workspaceRoot: workspace.canonicalRoot,
+    sessionId: envelope.sessionId,
+    toolUseId: envelope.toolUseId,
+  });
+  return handoffResponse(
+    result.handoff,
+    { handoffId: result.handoffId, handoffHash: result.handoffHash },
+    { id: result.finalPlan.id, hash: result.finalPlan.hash },
+    result.reused,
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
   switch (name) {
@@ -1716,6 +2018,8 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleRequestReopen(ctx, rawArgs);
     case "request_finalization":
       return handleRequestFinalization(ctx, rawArgs);
+    case "handoff":
+      return handleHandoff(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

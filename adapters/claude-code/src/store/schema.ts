@@ -10,6 +10,7 @@
 import type { StoreConnection } from "./connection.js";
 import { storeError } from "./errors.js";
 import type { StoreTx } from "./transaction.js";
+import { executionHandoffHash, type ExecutionHandoffV1 } from "../core/execution-handoff.js";
 
 /** Read the authoritative schema version (live read, never cached). */
 export function readSchemaVersion(db: StoreConnection | StoreTx): number {
@@ -258,6 +259,31 @@ const SCHEMA_V10_INDEXES = [
   "idx_evidence_audit_entries_audit",
   "idx_final_plan_candidates_run",
   "idx_proposal_final_plan_refs_candidate",
+] as const;
+
+/** Execution handoff/binding tables required once the store has reached v11 (Phase 14 §11). */
+const SCHEMA_V11_TABLES = [
+  "execution_handoffs",
+  "execution_handoff_events",
+  "execution_handoff_states",
+  "execution_bindings",
+] as const;
+
+/** Immutability triggers required once the store has reached v11: the handoff
+ * contract and its event log are append-only history (§13/§16). The operational
+ * state and binding tables are deliberately mutable (§14/§20). */
+const SCHEMA_V11_TRIGGERS = [
+  "execution_handoffs_no_update",
+  "execution_handoffs_no_delete",
+  "execution_handoff_events_no_update",
+  "execution_handoff_events_no_delete",
+] as const;
+
+/** Constraint indexes backing the v11 execution lookups. */
+const SCHEMA_V11_INDEXES = [
+  "idx_execution_handoff_events_handoff",
+  "idx_execution_bindings_active_session",
+  "idx_execution_bindings_session",
 ] as const;
 
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
@@ -964,6 +990,158 @@ function validateSchemaV10(db: StoreConnection | StoreTx, problems: string[]): v
 }
 
 /**
+ * Structural + data checks for schema v11 (Phase 14 §97/§136): execution
+ * tables and immutability triggers exist; a handoff binds the same-run
+ * approved FinalPlan and its stored hash matches its canonical payload; one
+ * canonical handoff per run/FinalPlan; the materialized delivery state points
+ * at the newest event with a coherent status; DELIVERED has PREPARED lineage;
+ * an ExecutionBinding belongs to the run's own workspace; a completed run
+ * carrying a Phase-14 handoff has that handoff delivered, and a delivered
+ * handoff has its approved FinalPlan in place. Store-open NEVER replays the
+ * handoff history (§136) — only these bounded facts.
+ */
+function validateSchemaV11(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V11_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 11`);
+    }
+  }
+  for (const trigger of SCHEMA_V11_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 11`);
+    }
+  }
+  for (const index of SCHEMA_V11_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 11`);
+    }
+  }
+  if (SCHEMA_V11_TABLES.some((table) => !objectNames.has(table))) {
+    return;
+  }
+  const baseWorldPresent = objectNames.has("final_plans") && objectNames.has("planning_runs");
+  if (!baseWorldPresent) {
+    return;
+  }
+  // A handoff must bind the same-run approved FinalPlan (§97).
+  const handoffFinalPlanDrift = db
+    .prepare(
+      "SELECT h.run_id AS runId, h.handoff_id AS handoffId FROM execution_handoffs h "
+      + "LEFT JOIN final_plans f ON f.run_id = h.run_id AND f.final_plan_id = h.final_plan_id "
+      + "WHERE f.final_plan_id IS NULL OR f.final_plan_hash != h.final_plan_hash LIMIT 1",
+    )
+    .get() as { runId?: string; handoffId?: string } | undefined;
+  if (handoffFinalPlanDrift !== undefined) {
+    problems.push(
+      `execution handoff '${handoffFinalPlanDrift.handoffId}' in run '${handoffFinalPlanDrift.runId}' does not bind its run's approved FinalPlan`,
+    );
+  }
+  // The stored handoff hash must match the canonical payload (§97).
+  const handoffRows = db
+    .prepare("SELECT run_id AS runId, handoff_id AS handoffId, canonical_json AS canonicalJson, handoff_hash AS handoffHash FROM execution_handoffs")
+    .all() as Array<{ runId: string; handoffId: string; canonicalJson: string; handoffHash: string }>;
+  for (const row of handoffRows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.canonicalJson);
+    } catch {
+      problems.push(`execution handoff '${row.handoffId}' in run '${row.runId}' has unparsable canonical payload`);
+      continue;
+    }
+    if (
+      parsed === null
+      || typeof parsed !== "object"
+      || executionHandoffHash(parsed as ExecutionHandoffV1) !== row.handoffHash
+    ) {
+      problems.push(`execution handoff '${row.handoffId}' in run '${row.runId}' hash does not match its canonical payload`);
+    }
+  }
+  // One canonical handoff per run and per FinalPlan is DDL-enforced; probe the
+  // materialized state coherence (§97): last_event_seq is the newest event and
+  // the status matches the last event's type.
+  const stateDrift = db
+    .prepare(
+      "SELECT s.run_id AS runId, s.handoff_id AS handoffId FROM execution_handoff_states s "
+      + "WHERE s.last_event_seq != (SELECT COALESCE(MAX(e.event_seq), 0) FROM execution_handoff_events e "
+      + "WHERE e.run_id = s.run_id AND e.handoff_id = s.handoff_id) "
+      + "OR (s.status = 'delivered' AND (SELECT e.event_type FROM execution_handoff_events e "
+      + "WHERE e.run_id = s.run_id AND e.handoff_id = s.handoff_id AND e.event_seq = s.last_event_seq) != 'DELIVERED') "
+      + "OR (s.status = 'prepared' AND (SELECT e.event_type FROM execution_handoff_events e "
+      + "WHERE e.run_id = s.run_id AND e.handoff_id = s.handoff_id AND e.event_seq = s.last_event_seq) = 'DELIVERED') LIMIT 1",
+    )
+    .get() as { runId?: string; handoffId?: string } | undefined;
+  if (stateDrift !== undefined) {
+    problems.push(
+      `execution handoff state for '${stateDrift.handoffId}' in run '${stateDrift.runId}' is not coherent with its event history`,
+    );
+  }
+  // Every DELIVERED must descend from a PREPARED of the same handoff (§97).
+  const deliveredWithoutPrepared = db
+    .prepare(
+      "SELECT d.run_id AS runId, d.handoff_id AS handoffId FROM execution_handoff_events d "
+      + "WHERE d.event_type = 'DELIVERED' AND NOT EXISTS (SELECT 1 FROM execution_handoff_events p "
+      + "WHERE p.run_id = d.run_id AND p.handoff_id = d.handoff_id AND p.event_type = 'PREPARED' "
+      + "AND p.event_seq < d.event_seq) LIMIT 1",
+    )
+    .get() as { runId?: string; handoffId?: string } | undefined;
+  if (deliveredWithoutPrepared !== undefined) {
+    problems.push(
+      `execution handoff '${deliveredWithoutPrepared.handoffId}' in run '${deliveredWithoutPrepared.runId}' has a DELIVERED event without PREPARED lineage`,
+    );
+  }
+  // An ExecutionBinding must belong to its run's own workspace (§97).
+  const bindingWorkspaceDrift = db
+    .prepare(
+      "SELECT b.final_plan_id AS finalPlanId FROM execution_bindings b "
+      + "JOIN planning_runs r ON r.run_id = b.run_id "
+      + "WHERE r.workspace_id != b.workspace_id LIMIT 1",
+    )
+    .get() as { finalPlanId?: string } | undefined;
+  if (bindingWorkspaceDrift !== undefined) {
+    problems.push(
+      `execution binding for FinalPlan '${bindingWorkspaceDrift.finalPlanId}' does not belong to its run's workspace`,
+    );
+  }
+  // A completed run with a Phase-14 handoff must have it delivered, and a
+  // delivered handoff must have its approved FinalPlan in place (§97).
+  const completedUndelivered = db
+    .prepare(
+      "SELECT h.run_id AS runId, h.handoff_id AS handoffId FROM execution_handoffs h "
+      + "JOIN planning_runs r ON r.run_id = h.run_id "
+      + "LEFT JOIN execution_handoff_states s ON s.run_id = h.run_id AND s.handoff_id = h.handoff_id "
+      + "WHERE r.lifecycle = 'completed' AND (s.status IS NULL OR s.status != 'delivered') LIMIT 1",
+    )
+    .get() as { runId?: string; handoffId?: string } | undefined;
+  if (completedUndelivered !== undefined) {
+    problems.push(
+      `completed run '${completedUndelivered.runId}' still carries undelivered execution handoff '${completedUndelivered.handoffId}'`,
+    );
+  }
+  const deliveredWithoutApproval = db
+    .prepare(
+      "SELECT h.run_id AS runId, h.handoff_id AS handoffId FROM execution_handoffs h "
+      + "JOIN execution_handoff_states s ON s.run_id = h.run_id AND s.handoff_id = h.handoff_id "
+      + "LEFT JOIN final_plans f ON f.run_id = h.run_id AND f.final_plan_id = h.final_plan_id "
+      + "LEFT JOIN proposal_states ps ON ps.run_id = f.run_id AND ps.proposal_id = f.proposal_id "
+      + "AND ps.revision = f.proposal_revision AND ps.status = 'approved' "
+      + "WHERE s.status = 'delivered' AND (f.final_plan_id IS NULL OR ps.proposal_id IS NULL) LIMIT 1",
+    )
+    .get() as { runId?: string; handoffId?: string } | undefined;
+  if (deliveredWithoutApproval !== undefined) {
+    problems.push(
+      `delivered execution handoff '${deliveredWithoutApproval.handoffId}' in run '${deliveredWithoutApproval.runId}' has no approved FinalPlan`,
+    );
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -1023,6 +1201,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 10) {
     validateSchemaV10(db, problems);
+  }
+  if (version >= 11) {
+    validateSchemaV11(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

@@ -6,7 +6,11 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "SessionStart"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "SessionStart"
+            ]
           }
         ]
       }
@@ -17,7 +21,11 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "SessionEnd"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "SessionEnd"
+            ]
           }
         ]
       }
@@ -28,7 +36,11 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "UserPromptSubmit"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "UserPromptSubmit"
+            ]
           }
         ]
       }
@@ -40,7 +52,11 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "UserPromptExpansion"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "UserPromptExpansion"
+            ]
           }
         ]
       }
@@ -51,31 +67,57 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PreToolUse"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "PreToolUse"
+            ]
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Read|Grep|Glob|Bash|PowerShell)$",
+        "matcher": "Read|Grep|Glob|Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PostToolUse"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "PostToolUse"
+            ]
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_phase-plan_phase-plan__handoff",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "PostToolUse"
+            ]
           }
         ]
       }
     ],
     "PermissionRequest": [
       {
-        "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal)$",
+        "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal|handoff)$",
         "hooks": [
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs", "hook", "PermissionRequest"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "PermissionRequest"
+            ]
           }
         ]
       }

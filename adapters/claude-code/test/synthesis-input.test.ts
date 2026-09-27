@@ -233,6 +233,17 @@ describe("§19/§70/§110 — legacy schema-8 synthesis runs", () => {
       // touching the run row: stage synthesis, no input possible.
       const db = rawConnection(storePathsFor(f.root).databasePath, 5000);
       try {
+            for (const table of ["execution_handoffs", "execution_handoff_events", "execution_handoff_states", "execution_bindings"]) {
+          db.exec(`DROP TABLE IF EXISTS ${table}`);
+        }
+        db.exec("DROP INDEX IF EXISTS idx_execution_handoff_events_handoff");
+        db.exec("DROP INDEX IF EXISTS idx_execution_bindings_active_session");
+        db.exec("DROP INDEX IF EXISTS idx_execution_bindings_session");
+        for (const kind of ["update", "delete"]) {
+          for (const table of ["execution_handoffs", "execution_handoff_events"]) {
+            db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
+          }
+        }
         for (const table of ["final_plans", "proposal_final_plan_refs", "final_plan_candidate_refs", "final_plan_candidates", "evidence_audit_entries", "evidence_audit_snapshots"]) {
           db.exec(`DROP TABLE IF EXISTS ${table}`);
         }
@@ -241,7 +252,7 @@ describe("§19/§70/§110 — legacy schema-8 synthesis runs", () => {
             db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
           }
         }
-        db.exec("DELETE FROM schema_migrations WHERE version = 10");
+        db.exec("DELETE FROM schema_migrations WHERE version >= 10");
         for (const table of ["synthesis_manifest_refs", "synthesis_manifests", "semantic_validation_findings", "semantic_validation_reports", "synthesis_input_refs", "synthesis_input_evidence", "synthesis_inputs"]) {
           db.exec(`DROP TABLE IF EXISTS ${table}`);
         }

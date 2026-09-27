@@ -43,6 +43,8 @@ import type {
 import {
   DRIFT_GUARD_REASON,
   EXIT_PLAN_MODE_REASON,
+  HANDOFF_PENDING_EXIT_PLAN_MODE_REASON,
+  HANDOFF_PENDING_EXECUTION_GUARD_REASON,
   allowWithPermissions,
   blockPrompt,
   contextOutput,
@@ -51,6 +53,7 @@ import {
   emptyOutput,
   askWithUpdatedInput,
   updatedInputNoDecision,
+  allowWithUpdatedInput,
   type HookOutput,
 } from "./output.js";
 import {
@@ -64,6 +67,25 @@ import {
   type HostContextLogicalTool,
 } from "../host/host-context.js";
 import { entryIntentIsCurrent, issueEntryIntent, verifyEntryIntent } from "../host/entry-intent.js";
+import {
+  buildExecutionHostContextEnvelope,
+  encodeExecutionHostContextToken,
+} from "../host/execution-context.js";
+import { createHandoffService, isHandoffPendingInTx } from "../application/handoff-service.js";
+import { renderExecutionContract, type ExecutionHandoffV1 } from "../core/execution-handoff.js";
+import {
+  findAttachedExecutionBindingForSessionInTx,
+  findDeliveredHandoffForSessionToolUseInTx,
+  findRunIdByDeliveryIdentityInTx,
+  getExecutionBindingInTx,
+  getExecutionHandoffInTx,
+  getExecutionHandoffStateInTx,
+  listExecutionBindingsForSessionInTx,
+  reattachExecutionBindingInTx,
+  detachExecutionBindingInTx,
+} from "../store/execution.js";
+import { getFinalPlanInTx } from "../store/finalization.js";
+import { parsePlanningRunRow } from "../core/planning-run.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
 import { assembleContext } from "../context/assembler.js";
 import { deriveContextEpochFromSource } from "../context/epoch.js";
@@ -110,7 +132,8 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "submit_synthesis" ||
     logical === "submit_validation" ||
     logical === "request_reopen" ||
-    logical === "request_finalization"
+    logical === "request_finalization" ||
+    logical === "handoff"
   );
 }
 
@@ -125,6 +148,9 @@ const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>([
   "submit_validation",
   "request_reopen",
   "request_finalization",
+  // Phase 14 §33 — handoff is main-session only; the attested agent fields
+  // let the MCP handler deny subagent initiation (VALIDATOR_MUTATION_FORBIDDEN).
+  "handoff",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -139,6 +165,54 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
   // prompt — directive §40). startup never auto-attaches other sessions' runs.
   const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
   const workspaceId = registration.workspace.workspaceId;
+
+  // Phase 14 §79 — Build recovery: an exact-session detached ExecutionBinding
+  // reattaches on resume (generation +1); clear/fork/startup never inherit
+  // because a new session id owns no binding rows (§80/§81).
+  const execBindings = deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, input.sessionId));
+  if (input.source === "resume") {
+    for (const binding of execBindings) {
+      if (binding.state === "detached" && binding.workspaceId === workspaceId) {
+        try {
+          deps.store.withWrite((tx) =>
+            reattachExecutionBindingInTx(
+              tx,
+              { runId: binding.runId, sessionId: input.sessionId, workspaceId },
+              deps.clock.nowIso(),
+            ),
+          );
+        } catch {
+          // advisory; the read-authority revalidation provides correctness
+        }
+      }
+    }
+  }
+  // §77 — a delivered handoff with an attached binding injects the immutable
+  // Execution Contract as the Build recovery capsule (startup/resume/compact).
+  const executionRecovery = deps.store.withRead((tx) => {
+    for (const binding of execBindings) {
+      const attached = getExecutionBindingInTx(tx, binding.runId);
+      if (attached === null || attached.state !== "attached" || attached.sessionId !== input.sessionId) continue;
+      const handoff = getExecutionHandoffInTx(tx, binding.runId);
+      const state = getExecutionHandoffStateInTx(tx, binding.runId);
+      if (handoff !== null && state?.status === "delivered") {
+        return {
+          runId: binding.runId,
+          handoff: JSON.parse(handoff.canonicalJson) as ExecutionHandoffV1,
+          handoffId: handoff.handoffId,
+          handoffHash: handoff.handoffHash,
+        };
+      }
+    }
+    return null;
+  });
+  if (executionRecovery !== null) {
+    const contract = renderExecutionContract(executionRecovery.handoff, {
+      handoffId: executionRecovery.handoffId,
+      handoffHash: executionRecovery.handoffHash,
+    });
+    return contextOutput("SessionStart", `Phase Plan execution session restored:\n\n${contract}`);
+  }
 
   if (input.source === "resume") {
     // Exact-session reattach only (frozen spec §23.4): same session id, same
@@ -179,6 +253,33 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
       "Do not continue planning on stale context; invoke /phase-plan.",
     );
   }
+  // Phase 14 §85 — handoff-pending recovery. When the approved FinalPlan is
+  // waiting for delivery this is NOT A1 planning drift (§44/§86): the run is
+  // not restored to Plan Mode; the handoff completes in whatever mode the
+  // session is in.
+  const pendingRun = attached.run;
+  const pending = deps.store.withRead((tx) => isHandoffPendingInTx(tx, pendingRun));
+  if (pending) {
+    context.push(
+      "Final Plan is approved.",
+      "Execution handoff is pending.",
+      "Complete phase_plan.handoff before using Build tools.",
+    );
+    const prepared = deps.store.withRead((tx) => {
+      const handoff = getExecutionHandoffInTx(tx, pendingRun.runId);
+      const state = handoff === null ? null : getExecutionHandoffStateInTx(tx, pendingRun.runId);
+      return handoff !== null && state?.status === "prepared"
+        ? { id: handoff.handoffId, hash: handoff.handoffHash }
+        : null;
+    });
+    if (prepared !== null) {
+      context.push(`Prepared handoff: ${prepared.id} (${prepared.hash}).`);
+    }
+    if (input.permissionMode !== "plan") {
+      context.push("Handoff can be retried directly in the current mode; Plan Mode restoration is not required.");
+    }
+    return contextOutput("SessionStart", context.join("\n\n"));
+  }
   // Amendment A1 §7: SessionStart recovers planning STATE, never the host's
   // Plan Mode. When the mode is missing the recovered run stays fail-closed
   // (UserPromptSubmit/PreToolUse guards) until /phase-plan re-entry.
@@ -204,6 +305,20 @@ export function handleSessionEnd(deps: HookHandlerDeps, _input: SessionEndInput)
       bindings.detach({ runId: entry.binding.runId, sessionId: _input.sessionId });
     } catch {
       // swallow: SessionEnd is advisory; takeover fencing provides correctness
+    }
+  }
+  // Phase 14 §79 — the ExecutionBinding detaches too (generation +1) so every
+  // outstanding signed execution context fences; exact-session resume
+  // reattaches it (SessionStart). Best-effort like the planning detach.
+  const execBindings = deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, _input.sessionId));
+  for (const binding of execBindings) {
+    if (binding.state !== "attached") continue;
+    try {
+      deps.store.withWrite((tx) =>
+        detachExecutionBindingInTx(tx, { runId: binding.runId, sessionId: _input.sessionId }, deps.clock.nowIso()),
+      );
+    } catch {
+      // swallow: SessionEnd is advisory; generation fencing provides correctness
     }
   }
   return emptyOutput();
@@ -234,6 +349,11 @@ function blobsForDeps(deps: HookHandlerDeps): BlobStore {
  * Successful captures write nothing to stdout (protocol-clean).
  */
 export async function handlePostToolUse(deps: HookHandlerDeps, input: PostToolUseInput): Promise<HookOutput> {
+  // Phase 14 §37 — the handoff delivery acknowledgement boundary: only a
+  // matching exact delivery attempt can complete the transition (§93).
+  if (logicalToolName(input.toolName) === "handoff") {
+    return handleHandoffDeliveryPostToolUse(deps, input);
+  }
   if (observationClassForTool(input.toolName) === null) {
     return emptyOutput(); // §8: unknown tools are never guessed; debug-only skip
   }
@@ -284,6 +404,90 @@ export async function handlePostToolUse(deps: HookHandlerDeps, input: PostToolUs
 }
 
 // ---------------------------------------------------------------------------
+// PostToolUse handoff finalizer (Phase 14 §36–§39/§93)
+// ---------------------------------------------------------------------------
+
+/** Parse the MCP tool_response envelope into the delivered handoff identity. */
+function parseHandoffToolResponse(toolResponse: unknown): { handoffId: string; handoffHash: string } | null {
+  let payload: unknown = toolResponse;
+  if (typeof payload === "object" && payload !== null && Array.isArray((payload as { content?: unknown }).content)) {
+    const first = (payload as { content: Array<{ type?: string; text?: string }> }).content[0];
+    if (first === undefined || typeof first.text !== "string") return null;
+    try {
+      payload = JSON.parse(first.text);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  if (record.ok !== true) return null; // denied/failed handoff: nothing to deliver
+  if (typeof record.handoff_id !== "string" || typeof record.handoff_hash !== "string") return null;
+  return { handoffId: record.handoff_id, handoffHash: record.handoff_hash };
+}
+
+/**
+ * §37 — the trusted delivery finalizer. The MCP return alone proves nothing
+ * about what the host did; this hook validates the exact delivery attempt,
+ * the stored handoff identity, and only then records DELIVERED + run
+ * completion in one transaction (§39: idempotent; §93: never trusts the
+ * response alone).
+ */
+function handleHandoffDeliveryPostToolUse(deps: HookHandlerDeps, input: PostToolUseInput): HookOutput {
+  const response = parseHandoffToolResponse(input.toolResponse);
+  if (response === null) {
+    return emptyOutput(); // the tool did not deliver (denied/error) — nothing to finalize
+  }
+  try {
+    // Never nest store reads: the session lookup opens its own read txn.
+    const attached = findAttachedActiveRun(deps.store, input.sessionId);
+    const runId = attached !== null && attached.run !== null
+      ? attached.run.runId
+      : deps.store.withRead((tx) =>
+          // Crash-recovery replays: the planning binding may already be detached.
+          findRunIdByDeliveryIdentityInTx(tx, { sessionId: input.sessionId, toolUseId: input.toolUseId }),
+        );
+    if (runId === null) {
+      return contextOutput(
+        "PostToolUse",
+        [
+          "Phase Plan handoff delivery could not be attributed to a PlanningRun (HANDOFF_DELIVERY_INVALID).",
+          "Invoke phase_plan.handoff again to complete the transition.",
+        ].join("\n"),
+      );
+    }
+    createHandoffService(deps.store, deps.clock).finalizeDelivery({
+      runId,
+      sessionId: input.sessionId,
+      toolUseId: input.toolUseId,
+      responseHandoffId: response.handoffId,
+      responseHandoffHash: response.handoffHash,
+    });
+    // §38 — short deterministic completion context; the canonical contract
+    // was already returned by the MCP tool response (never re-rendered here).
+    return contextOutput(
+      "PostToolUse",
+      [
+        "Phase Plan execution handoff delivered.",
+        "PlanningRun is completed.",
+        "Build under the immutable ExecutionHandoff contract.",
+        "Plan Memory is read-only.",
+      ].join("\n"),
+    );
+  } catch (err) {
+    const code = err instanceof RuntimeError ? err.code : "INTERNAL_ERROR";
+    return contextOutput(
+      "PostToolUse",
+      [
+        `Phase Plan handoff delivery completion failed (${code}).`,
+        `error=${code}: ${err instanceof Error ? err.message : String(err)}`,
+        "The handoff tool returned, but durable delivery is not recorded. Invoke phase_plan.handoff again to complete the transition.",
+      ].join("\n"),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // UserPromptSubmit drift guard (directive §39/§40)
 // ---------------------------------------------------------------------------
 
@@ -300,6 +504,28 @@ export function handleUserPromptSubmit(deps: HookHandlerDeps, input: UserPromptS
   const prompt = input.prompt.trimStart();
   if (prompt.startsWith("/phase-plan") || prompt.includes(PHASE_PLAN_ENTRY_MARKER)) {
     return emptyOutput();
+  }
+  // Phase 14 §44 — handoff-pending is NOT A1 planning drift: planning already
+  // ended with the approved FinalPlan. The turn proceeds with a short
+  // deterministic notice; execution tools stay guarded until delivery (§45).
+  const planningRun = attached.run;
+  const pending = deps.store.withRead((tx) => isHandoffPendingInTx(tx, planningRun));
+  if (pending) {
+    const lines = [
+      "Final Plan is approved and execution handoff is pending.",
+      "Complete phase_plan.handoff before using execution tools.",
+    ];
+    if (input.permissionMode !== "plan") {
+      return contextOutput("UserPromptSubmit", lines.join("\n"));
+    }
+    const epoch = deriveContextEpochFromSource(createStoreContextSource(deps.store), planningRun.runId);
+    return contextOutput(
+      "UserPromptSubmit",
+      [
+        ...(epoch === null ? [] : [`Phase Plan context epoch: ${epoch}`, "Use phase_plan.get_context if context appears stale."]),
+        ...lines,
+      ].join("\n"),
+    );
   }
   if (input.permissionMode !== "plan") {
     // Known active binding + not plan → fail closed (directive §40).
@@ -352,8 +578,12 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
   // §41 — ExitPlanMode can never end an active PlanningRun early (any mode).
   if (logical === "ExitPlanMode") {
     const attached = findAttachedActiveRun(deps.store, input.sessionId);
-    if (attached !== null) {
-      return denyTool(eventName, EXIT_PLAN_MODE_REASON);
+    if (attached !== null && attached.run !== null) {
+      // Phase 14 §10 — while the FinalPlan is approved but undelivered the
+      // reason names the deterministic handoff; after completion the guard
+      // naturally no longer applies (the run is terminal).
+      const pending = deps.store.withRead((tx) => isHandoffPendingInTx(tx, attached.run));
+      return denyTool(eventName, pending ? HANDOFF_PENDING_EXIT_PLAN_MODE_REASON : EXIT_PLAN_MODE_REASON);
     }
     return emptyOutput();
   }
@@ -364,9 +594,21 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
 
   // §42 — host-state drift guard: active run + not plan mode → allowlist only.
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
-  if (attached !== null && input.permissionMode !== "plan") {
+  if (attached !== null && attached.run !== null && input.permissionMode !== "plan") {
     if (DRIFT_ALLOWLIST.has(logical)) {
       return emptyOutput();
+    }
+    // Phase 14 §45 — while handoff is pending this is not A1: execution must
+    // not begin before durable handoff delivery. `phase_plan.handoff` itself
+    // is a phase-plan tool handled above and stays reachable (§87/§89).
+    // ToolSearch is the host's read-only tool-discovery mechanism — the model
+    // needs it to address phase_plan.handoff at all; it is not an execution tool.
+    const pending = deps.store.withRead((tx) => isHandoffPendingInTx(tx, attached.run));
+    if (pending) {
+      if (logical === "ToolSearch") {
+        return emptyOutput();
+      }
+      return deny(eventName, "HANDOFF_DELIVERY_PENDING", HANDOFF_PENDING_EXECUTION_GUARD_REASON);
     }
     return deny(
       eventName,
@@ -440,13 +682,80 @@ async function handlePhasePlanPreToolUse(
 
   // approve_proposal, promote_evidence, revalidate_evidence, select_section,
   // prepare_proposal, submit_synthesis, submit_validation, request_reopen,
-  // and request_finalization require an owned active run for their write
-  // contexts; reads (get_state/get_context/read_memory/list_observations)
+  // request_finalization, and handoff require an owned active run for their
+  // write contexts; reads (get_state/get_context/read_memory/list_observations)
   // degrade to a run-less outcome: nothing is signed, so the MCP layer fails
   // closed and never reaches a workspace-wide run selection (Phase 8 §40/§41 —
   // no auto-takeover).
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
   if (attached === null || attached.run === null) {
+    // Phase 14 §56/§57 — Build read-side authority: when the run is completed
+    // with a delivered handoff and this session holds the attached
+    // ExecutionBinding, reads are signed with an EXECUTION HostContext
+    // (domain-separated; the planning verifier can never accept it).
+    if (logical === "get_state" || logical === "get_context" || logical === "read_memory") {
+      const executionBinding = deps.store.withRead((tx) => {
+        const binding = findAttachedExecutionBindingForSessionInTx(tx, input.sessionId);
+        if (binding === null || binding.workspaceId === "") return null;
+        const handoff = getExecutionHandoffInTx(tx, binding.runId);
+        const state = handoff === null ? null : getExecutionHandoffStateInTx(tx, binding.runId);
+        if (handoff === null || state?.status !== "delivered") return null;
+        return binding;
+      });
+      if (executionBinding !== null) {
+        const execToken = encodeExecutionHostContextToken(
+          deps.secret,
+          buildExecutionHostContextEnvelope({
+            sessionId: input.sessionId,
+            ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+            workspaceId: executionBinding.workspaceId,
+            runId: executionBinding.runId,
+            finalPlanId: executionBinding.finalPlanId,
+            executionBindingGeneration: executionBinding.generation,
+            permissionMode: input.permissionMode ?? "unknown",
+            toolUseId: input.toolUseId,
+            toolName: input.toolName,
+            businessInputHash: businessInputHashOf(toolInput),
+          }),
+        );
+        // The signed binding revalidation IS the permission decision: this
+        // read is authorized under the execution contract (§56), so grant it
+        // outright instead of leaving it to the host's mode classifier.
+        return allowWithUpdatedInput(
+          eventName,
+          { ...toolInput, _hostContext: execToken },
+          "Build read authorized under the delivered ExecutionHandoff (attached ExecutionBinding, exact generation).",
+        );
+      }
+      return emptyOutput();
+    }
+    if (logical === "handoff") {
+      // Phase 14 §134 — the exact delivered invocation identity replays
+      // idempotently after completion: re-sign an EXECUTION authority context
+      // (never a planning one — the planning binding is detached by then).
+      const replay = deps.store.withRead((tx) =>
+        findDeliveredHandoffForSessionToolUseInTx(tx, { sessionId: input.sessionId, toolUseId: input.toolUseId }),
+      );
+      if (replay !== null) {
+        const execToken = encodeExecutionHostContextToken(
+          deps.secret,
+          buildExecutionHostContextEnvelope({
+            sessionId: input.sessionId,
+            ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+            workspaceId: replay.workspaceId,
+            runId: replay.runId,
+            finalPlanId: replay.finalPlanId,
+            executionBindingGeneration: replay.generation,
+            permissionMode: input.permissionMode ?? "unknown",
+            toolUseId: input.toolUseId,
+            toolName: input.toolName,
+            businessInputHash: businessInputHashOf(toolInput),
+          }),
+        );
+        return updatedInputNoDecision(eventName, { ...toolInput, _hostContext: execToken });
+      }
+      return deny(eventName, "STALE_SESSION_BINDING", "no active Phase Plan run is attached to the current session");
+    }
     if (
       logical === "approve_proposal" ||
       logical === "promote_evidence" ||
@@ -483,7 +792,8 @@ async function handlePhasePlanPreToolUse(
     logical === "submit_synthesis" ||
     logical === "submit_validation" ||
     logical === "request_reopen" ||
-    logical === "request_finalization";
+    logical === "request_finalization" ||
+    logical === "handoff";
   if (isMutationTool && !cwdInsideWorkspace(input.cwd, workspace)) {
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }
@@ -542,6 +852,39 @@ async function handlePhasePlanPreToolUse(
           }),
         );
   const updatedInput = { ...toolInput, _hostContext: hostToken };
+  if (logical === "handoff") {
+    // Phase 14 §87/§88/§89 — the eligibility gate happens BEFORE any host
+    // mode change (§7): only the derived handoffPending state may proceed.
+    const handoffRun = attached.run;
+    const eligibility = deps.store.withRead((tx) => {
+      const pending = isHandoffPendingInTx(tx, handoffRun);
+      if (pending) return { pending: true, delivered: false };
+      const state = handoffRun === null ? null : getExecutionHandoffStateInTx(tx, handoffRun.runId);
+      return { pending: false, delivered: state?.status === "delivered" };
+    });
+    if (!eligibility.pending) {
+      return deny(
+        eventName,
+        eligibility.delivered ? "HANDOFF_ALREADY_DELIVERED" : "HANDOFF_NOT_AUTHORIZED",
+        eligibility.delivered
+          ? "the execution handoff was already delivered; the PlanningRun is completed"
+          : "handoff requires an approved FinalPlan and the final stage with delivery still pending",
+      );
+    }
+    if (input.permissionMode === "plan") {
+      // §88 — the normal path: PermissionRequest performs the session-scoped
+      // setMode(default) transition; this "ask" is host-mode orchestration,
+      // never a design approval (§6 — no extra human dialog exists).
+      return askWithUpdatedInput(
+        eventName,
+        updatedInput,
+        "Deliver the execution handoff: transitions this session to execution mode under the approved Final Plan (host-mode orchestration; not a design approval).",
+      );
+    }
+    // §89 — recovery: the session is already in default/manual mode (a crash
+    // after setMode); retry directly — never default → plan → default.
+    return updatedInputNoDecision(eventName, updatedInput);
+  }
   if (logical === "approve_proposal") {
     // §29 — never "allow": the mandatory human prompt must still happen.
     return askWithUpdatedInput(eventName, updatedInput, "approve_proposal requires explicit user approval.");
@@ -585,6 +928,60 @@ export function handlePermissionRequest(deps: HookHandlerDeps, input: Permission
     } catch (err) {
       // Tampered/unverifiable tokens deny through the decision object —
       // exit 2 is not honored for PermissionRequest.
+      const code = err instanceof RuntimeError ? err.code : "HOST_CONTEXT_INVALID";
+      return denyPermissionRequest(`${code}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (logical === "handoff") {
+    // Phase 14 §7/§88 — the PermissionRequest gate re-verifies the FULL
+    // eligibility from the Store BEFORE returning setMode(default, session);
+    // the host must never switch modes and then discover an invalid FinalPlan.
+    const rawHostContext = input.toolInput._hostContext;
+    if (typeof rawHostContext !== "string" || rawHostContext === "") {
+      return emptyOutput();
+    }
+    try {
+      const envelope = assertHostContextForTool(deps.secret, rawHostContext, {
+        tool: "handoff",
+        businessInput: input.toolInput,
+      });
+      if (envelope.sessionId !== input.sessionId) {
+        return denyPermissionRequest("HOST_CONTEXT_INVALID: host context is bound to a different session");
+      }
+      if (envelope.promptId !== undefined && input.promptId !== undefined && envelope.promptId !== input.promptId) {
+        return denyPermissionRequest("HOST_CONTEXT_INVALID: host context is bound to a different prompt");
+      }
+      if (envelope.runId === undefined) {
+        return denyPermissionRequest("HANDOFF_NOT_AUTHORIZED: host context carries no run binding");
+      }
+      const eligible = deps.store.withRead((tx) => {
+        const runRow = tx
+          .prepare(
+            "SELECT run_id AS runId, workspace_id AS workspaceId, lifecycle, stage, revision, goal, "
+            + "created_at AS createdAt, updated_at AS updatedAt FROM planning_runs WHERE run_id = ?",
+          )
+          .get(envelope.runId) as Record<string, unknown> | undefined;
+        if (runRow === undefined) return false;
+        const run = parsePlanningRunRow(runRow);
+        if (run.workspaceId !== envelope.workspaceId) return false;
+        if (run.lifecycle !== "active" || run.stage !== "final") return false;
+        const finalPlan = getFinalPlanInTx(tx, run.runId);
+        if (finalPlan === null) return false;
+        const handoff = getExecutionHandoffInTx(tx, run.runId);
+        if (handoff === null) return true;
+        const state = getExecutionHandoffStateInTx(tx, run.runId);
+        return state?.status !== "delivered";
+      });
+      if (!eligible) {
+        return denyPermissionRequest(
+          "HANDOFF_NOT_AUTHORIZED: the current run is not an active run at stage final with an approved, undelivered FinalPlan",
+        );
+      }
+      // §6/§88 — the session-scoped execution-mode transition (mirrors the
+      // Phase 7 Plan Mode entry; never a user/project/local settings write, §8).
+      return allowWithPermissions([{ type: "setMode", mode: "default", destination: "session" }]);
+    } catch (err) {
       const code = err instanceof RuntimeError ? err.code : "HOST_CONTEXT_INVALID";
       return denyPermissionRequest(`${code}: ${err instanceof Error ? err.message : String(err)}`);
     }
