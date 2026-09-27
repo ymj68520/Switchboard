@@ -1,5 +1,14 @@
 # Phase 14 Live Validation — Real-Host Plan → Build Handoff
 
+> Closure addendum (2026-09-27, same day): the sections below document the
+> first live run, whose PostToolUse delivery was lost to what was then
+> believed to be a matcher-only host quirk and was closed out by running the
+> shipped finalizer manually with a "faithful" payload. That manual closure
+> is now known to have rested on a reconstructed payload shape that masked a
+> real parser gap. **Fresh natural-host closure run: see the last section**
+> ("Fresh natural-host closure run — Run C, E80/E81 closed"). The first-run
+> record is preserved as valuable host-compatibility history.
+
 Host: Claude Code **2.1.283**, Windows 10.0.19044, Node **24.21.0**, plugin
 inline `--plugin-dir D:\Programing\agent\plan-plugin\adapters\claude-code`.
 Substrate: the Phase 13 live seam in the shared production store
@@ -112,3 +121,98 @@ workspace `settings.json`/`settings.local.json` was ever created.
 Node 24.21.0 and Node 22.23.2: **839 passed | 1 skipped** (tsc, eslint,
 build clean). OpenCode adapter: **634 passed** (independent line, untouched
 by Phase 14).
+
+## Fresh natural-host closure run — Run C, E80/E81 closed (2026-09-27)
+
+Directive: prove on a fresh real handoff that the exact-literal PostToolUse
+matcher triggers the production finalizer with **no manual hook invocation**.
+No Phase 13/14 frozen artifact was modified first (`git status` clean on
+`adapters/claude-code` + `docs/claudecode`, HEAD `20e1995`, tsc/build green).
+
+- **Run**: `plan_run-id` — Phase 13 pre-world built with the sanctioned
+  fixture/domain-service seam directly inside the **host-managed** plugin
+  data root (`C:\Users\Administrator\.claude\plugins\data\phase-plan-inline`),
+  workspace `<root>\project` (directory kind), active/final/rev 9, planning
+  SessionBinding attached, execution tables empty.
+- **FinalPlan**: `fplan_tc-11` (sha256:e1e62701…b804), approved, commit
+  `CMT-tc-10`, HEAD `snap_tc-8` = ARCH-1@1 + SEC-1@1 + SEC-2@1.
+- **Handoff**: `xhandoff_cf5c10cf-152e-465b-b8d0-7a97c344ff60`
+  (sha256:3800ec3f…d3d9d), repository baseline "directory workspace (no
+  revision)", byte-identical contract on screen and in store canonical_json.
+- **Claude version**: 2.1.283 (no auto-upgrade mid-run).
+
+### PostToolUse
+
+- host-triggered = **yes** (spawn watcher observed
+  `node …phase-plan-runtime.mjs hook PostToolUse` per successful call;
+  debug log: `Hook PostToolUse:mcp__plugin_phase-plan_phase-plan__handoff
+  (PostToolUse) success` + `provided additionalContext (144 chars)`)
+- manual dispatch = **no** for the closing delivery
+- exact literal matcher = **fired** — and was *never* the problem
+
+### What actually broke on the first natural deliveries (kept history)
+
+The first five natural attempts (real `tool_use_id`s `call_fb142168…`,
+`call_c72da20a…`, `call_bf5b654…`, `call_edffb5f7…`, plus one pre-fix retry
+`call_09576940…`) all ended with the finalizer exiting 0 **silently empty**.
+Diagnosis (user-level capture hook installed temporarily, reverted
+afterwards; `~/.claude/settings.json` sha256 byte-identical before/after):
+
+1. **Real payload shape**: 2.1.283 hands PostToolUse the MCP `tool_response`
+   as the **bare content array** `[{type:"text",text:"…"}]` — captured
+   verbatim from live stdin. `parseHandoffToolResponse` only accepted the
+   `{content:[…]}` envelope or a direct object, so it returned null and the
+   hook degraded silently (PostToolUse fail-closed is exit 0/empty by
+   design). The first run's "faithful payload" had been **reconstructed** in
+   the enveloped shape, which is why the manual finalizer test passed while
+   every natural delivery failed. Fixed in
+   `fix(claude): match handoff post-tool delivery exactly` (all four shapes
+   accepted; fail-closed semantics preserved; regression tests pin the bare
+   array shape).
+2. **Host env fact**: plugin hooks/MCP get a **host-injected**
+   `CLAUDE_PLUGIN_DATA` (the `phase-plan-inline` data root); a shell-level
+   override reaches the `claude` process but only leaks into *user-scope*
+   hooks — this is why the seam world must live in the host data root.
+3. **Host behavior facts**: PostToolUse never fires for *failed* MCP calls
+   (all failures above were silent by construction); `--session-id` cannot
+   be reused after its process dies ("Session ID is already in use";
+   renaming the session transcript unlocks it); §82's execution-binding
+   session lock makes a dead preparing session unrecoverable — crash
+   window B reuse is strictly same-session.
+
+### Delivery and completion (natural chain, post-fix)
+
+`call_eca25f97…` (real live `tool_use_id`, same session that prepared):
+
+- `execution_handoff_events`: seq 7 `DELIVERY_ATTEMPT` → seq 8 **`DELIVERED`
+  exactly once** (delivered_at 2026-09-27T05:33:03.729Z, state
+  `delivered`, hash-verified, idempotent replay confirmed by the model)
+- PlanningRun: **active → completed by the production PostToolUse
+  finalizer**, stage final unchanged, revision **9 → 10 exactly once**
+- Planning SessionBinding: attached → **detached (generation 3 → 4, once)**
+- ExecutionBinding: **attached, generation 1**, same session/workspace/
+  FinalPlan
+- Debug evidence chain: PreToolUse ask → PermissionRequest
+  `setMode(default, destination=session)` allow (no human dialog) → MCP
+  handoff 27 ms ok → natural host PostToolUse → §38 completion context
+
+### HEAD invariants (pre vs post delivery)
+
+PlanCommits 6→6, Approvals 6→6, Proposals 6→6, Snapshots 6→6, Memory
+revisions 3→3, Evidence audit 0→0, FinalPlan canonical sha256 unchanged,
+HEAD `snap_tc-8` (ARCH-1@1/SEC-1@1/SEC-2@1) unchanged — all identical.
+
+### Same session (E81) and Build smoke
+
+Same `claude` process/session throughout (before handoff == after):
+`get_state` compact completed view; `get_context(detail=build)` returned the
+deterministic Execution Contract; `read_memory ARCH-1@1` returned with
+**authority:"execution"** (reported identically for both reads by the
+model); `Write PHASE14_CLOSURE_SMOKE.txt` was NOT blocked by Phase Plan
+(Claude's normal permission dialog governed), then deleted. Mode after
+delivery: default ("manual mode on").
+
+### Regression
+
+Node 24.21.0 and Node 22.23.2: **841 passed | 1 skipped** (tsc, eslint,
+build clean) — includes the two new bare-array-shape finalizer tests.
