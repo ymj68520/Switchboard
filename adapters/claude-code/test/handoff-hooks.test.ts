@@ -225,6 +225,42 @@ describe("PostToolUse delivery finalizer (§37–§39/§93, E25/E70/E80)", () =>
     expect(getPlanningRunRecord(ctx.store, f.runId)!.lifecycle).toBe("completed");
   });
 
+  it("host shape B — a bare content-array tool_response (2.1.283 live stdin) finalizes too", async () => {
+    const { f, ctx, prepared } = await preparedWorld();
+    // Claude Code 2.1.283 delivers tool_response as the bare content array,
+    // not the {content:[...]} envelope (captured verbatim on a natural
+    // delivery during the Phase 14 closure run).
+    const out = await handlePostToolUse(depsOf(ctx), {
+      sessionId: f.sessionId,
+      permissionMode: "default",
+      hookEventName: "PostToolUse" as const,
+      toolName: "mcp__plugin_phase-plan_phase-plan__handoff",
+      toolInput: {},
+      toolUseId: "S1-HOOK-1", // the exact prepared attempt identity (§93)
+      toolResponse: [{ type: "text", text: JSON.stringify({
+        ok: true, status: "ok", handoff_id: prepared.handoff_id, handoff_hash: prepared.handoff_hash,
+      }) }],
+    } as Parameters<typeof handlePostToolUse>[1]);
+    const payload = outputOf(out) as { hookSpecificOutput: { additionalContext: string } };
+    expect(payload.hookSpecificOutput.additionalContext).toContain("Phase Plan execution handoff delivered.");
+    expect(getPlanningRunRecord(ctx.store, f.runId)!.lifecycle).toBe("completed");
+  });
+
+  it("a bare content array without a text first element is silently ignored", async () => {
+    const { f, ctx } = await preparedWorld();
+    const out = await handlePostToolUse(depsOf(ctx), {
+      sessionId: f.sessionId,
+      permissionMode: "default",
+      hookEventName: "PostToolUse" as const,
+      toolName: "mcp__plugin_phase-plan_phase-plan__handoff",
+      toolInput: {},
+      toolUseId: "S1-HOOK-ARRAY-BAD",
+      toolResponse: [{ type: "text" }],
+    } as Parameters<typeof handlePostToolUse>[1]);
+    expect(outputOf(out)).toEqual({});
+    expect(getPlanningRunRecord(ctx.store, f.runId)!.lifecycle).toBe("active");
+  });
+
   it("a forged response (wrong hash) never completes the transition and is fail-visible", async () => {
     const { f, ctx, prepared } = await preparedWorld();
     const out = await handlePostToolUse(depsOf(ctx), postInput(f, "S1-HOOK-1", {

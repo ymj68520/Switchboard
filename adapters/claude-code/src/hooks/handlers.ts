@@ -410,11 +410,21 @@ export async function handlePostToolUse(deps: HookHandlerDeps, input: PostToolUs
 /** Parse the MCP tool_response envelope into the delivered handoff identity. */
 function parseHandoffToolResponse(toolResponse: unknown): { handoffId: string; handoffHash: string } | null {
   let payload: unknown = toolResponse;
+  // Shape A — the MCP result envelope { content: [{type:"text",text:"..."}] }.
   if (typeof payload === "object" && payload !== null && Array.isArray((payload as { content?: unknown }).content)) {
-    const first = (payload as { content: Array<{ type?: string; text?: string }> }).content[0];
+    payload = (payload as { content: unknown[] }).content;
+  }
+  // Shape B — Claude Code 2.1.283 passes MCP tool_response as the bare
+  // content array itself (observed live on a natural delivery; the enveloped
+  // probe replica masked this until the closure run captured real stdin).
+  if (Array.isArray(payload)) {
+    const first = payload[0] as { type?: string; text?: unknown } | undefined;
     if (first === undefined || typeof first.text !== "string") return null;
+    payload = first.text;
+  }
+  if (typeof payload === "string") {
     try {
-      payload = JSON.parse(first.text);
+      payload = JSON.parse(payload);
     } catch {
       return null;
     }
