@@ -12,6 +12,7 @@ import { RuntimeError } from "../src/runtime/errors.js";
 import { handlePostToolUse, handlePreToolUse } from "../src/hooks/handlers.js";
 import type { HookOutput } from "../src/hooks/output.js";
 import type { PlanStore } from "../src/store/sqlite-store.js";
+import { initializePlanStore } from "../src/store/sqlite-store.js";
 import type { StoreClock } from "../src/store/migration-runner.js";
 import { issueEntryIntent } from "../src/host/entry-intent.js";
 import { executionIssueHash, EXECUTION_ISSUE_KINDS, affectedRefProblems } from "../src/core/execution-issue.js";
@@ -753,6 +754,118 @@ describe("successor creation from the immutable baseline (§22–§43)", () => {
     } finally {
       closeStore?.();
       removeTempPluginDataRoot(root);
+    }
+  });
+
+  it("schema validation accepts active work on an unmaterialized baseline needs_review scope, and still rejects orphans (§69/§16 live-host compact recovery)", async () => {
+    const root = makeTempPluginDataRoot("phase-plan-s15-active-");
+    let closeStore: (() => void) | null = null;
+    try {
+      const base = await makeProposalFixture(root, { sessionId: "S1" });
+      closeStore = () => base.store.close();
+      const fixture = withCounterServices(base);
+      driveToDetail(fixture);
+      const detail: import("./phase11-helpers.js").DetailFixture = { ...fixture, root, close: () => fixture.store.close() };
+      const dag = fixture.proposals.prepareProposal({
+        runId: fixture.runId,
+        workspaceId: fixture.workspaceId,
+        sessionId: fixture.sessionId,
+        bindingGeneration: fixture.generation,
+        expectedRunRevision: fixture.runRevision,
+        type: "design_checkpoint",
+        scope: { kind: "detail" },
+        title: "Two-section DAG",
+        summary: "Alpha ← Beta",
+        changes: dagChanges([
+          { title: "Alpha", localRef: "alpha" },
+          { title: "Beta", dependencies: ["alpha"] },
+        ]),
+      });
+      commitPrepared(fixture, dag.proposal.proposalId, dag.proposal.revision, dag.proposal.proposalHash);
+      const sectionIds = [...new Set(dag.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
+      for (const sectionId of sectionIds) {
+        selectSection(detail, sectionId);
+        completeSectionVia(detail, sectionId, 1);
+      }
+      const input = inputOf(detail);
+      const wrapped = { ...detail, inputId: input.inputId, inputHash: input.inputHash, sectionIds };
+      const ctx = toolContextOf(fixture);
+      driveToCleanValidation(wrapped, ctx, "S1");
+      const fin = callRequestFinalization(ctx, wrapped, { toolUseId: "S1-FIN" });
+      callApprove(ctx, wrapped, {
+        proposal_id: fin.final_proposal.proposal_id,
+        revision: fin.final_proposal.revision,
+        proposal_hash: fin.final_proposal.proposal_hash,
+      }, { toolUseId: "S1-APP" });
+      callHandoff(ctx, {
+        sessionId: fixture.sessionId,
+        workspaceId: fixture.workspaceId,
+        runId: fixture.runId,
+        generation: fixture.generation,
+      }, { toolUseId: "S1-DELIVER" });
+      const handoffRow = ctx.store.withRead((tx) => getExecutionHandoffInTx(tx, fixture.runId))!;
+      createHandoffService(ctx.store, ctx.clock).finalizeDelivery({
+        runId: fixture.runId,
+        sessionId: fixture.sessionId,
+        toolUseId: "S1-DELIVER",
+        responseHandoffId: handoffRow.handoffId,
+        responseHandoffHash: handoffRow.handoffHash,
+      });
+      callReportIssue(ctx, {
+        sessionId: fixture.sessionId, workspaceId: fixture.workspaceId, runId: fixture.runId,
+        finalPlanId: finalPlanOf(ctx, fixture.runId).row.finalPlanId, generation: 1,
+      }, {
+        kind: "section_contract",
+        summary: "alpha contract cannot be implemented",
+        detail: "the approved contract requires replanning.",
+        affected_refs: [{ type: "section", id: sectionIds[0]!, revision: 1 }],
+      }, { toolUseId: "TU-ACTIVE-ISSUE" });
+      const entry = callStartOrResume(ctx, fixture.sessionId, fixture.workspaceId, { toolUseId: "TU-ACTIVE-ENTRY" });
+      expect(entry.status).toBe("started_successor");
+      const successorRunId = entry.run.id as string;
+
+      // The live-host sequence: the successor selects a needs_review section
+      // BEFORE its baseline is materialized (HEAD intentionally absent).
+      const sectionWorkflow = (await import("../src/application/section-workflow-service.js")).createSectionWorkflowService(ctx.store, ctx.clock);
+      sectionWorkflow.selectSection({
+        runId: successorRunId,
+        workspaceId: fixture.workspaceId,
+        sessionId: fixture.sessionId,
+        bindingGeneration: 1,
+        expectedRunRevision: 1,
+        sectionId: sectionIds[0]!,
+      });
+
+      // A fresh store open (every hook/MCP process revalidates) must accept
+      // the baseline-scoped active work — the pre-materialization successor
+      // has no HEAD snapshot by design (§16).
+      ctx.store.close();
+      ctx.store = await initializePlanStore({ pluginDataRoot: root });
+      expect(ctx.store.getSchemaVersion()).toBe(SUPPORTED_SCHEMA_VERSION);
+
+      // Negative: active work outside HEAD and outside any unmaterialized
+      // baseline scope stays corruption (one active section per run, so the
+      // orphan gets its own run row).
+      ctx.store.withWrite((tx) => {
+        tx.prepare("INSERT INTO planning_runs (run_id, workspace_id, lifecycle, stage, revision, goal, created_at, updated_at) VALUES ('plan_orphan', ?, 'active', 'discovery', 1, 'orphan', '2026-01-01', '2026-01-01')").run(fixture.workspaceId);
+        tx.prepare("INSERT INTO planning_active_work (run_id, section_id, updated_at) VALUES ('plan_orphan', 'SEC-999', '2026-01-01')").run();
+        return null;
+      });
+      ctx.store.close();
+      await expect(initializePlanStore({ pluginDataRoot: root })).rejects.toMatchObject({
+        code: "STORE_SCHEMA_INVALID",
+        causeText: expect.stringContaining("active section 'SEC-999'"),
+      });
+    } finally {
+      closeStore?.();
+      // This test intentionally exercises the FAILED-open path (the negative
+      // reopen rejects mid-validation, leaking a WAL handle past its
+      // best-effort close on Windows), so directory cleanup is best-effort.
+      try {
+        removeTempPluginDataRoot(root);
+      } catch {
+        // temp dir removal is not part of what this test proves
+      }
     }
   });
 });

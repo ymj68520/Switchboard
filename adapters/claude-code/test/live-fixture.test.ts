@@ -1,5 +1,5 @@
 /**
- * Live-host fixture seam (Phase 7/8 live validation only).
+ * Live-host fixture seam (Phase 7–15 live validation only).
  *
  * Phase 7 mode (default): prepares a legitimate awaiting_approval Proposal on
  * the CURRENT active run of the host-managed store, using the same
@@ -40,16 +40,324 @@ const phase13 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase13";
 const phase13drift = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase13-drift";
 const phase10 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10";
 const phase10Revise = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase10-revise";
+const phase15 = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase15";
+const phase15Revise = process.env.PHASE_PLAN_LIVE_FIXTURE_MODE === "phase15-revise";
 const d = liveRoot === undefined ? describe.skip : describe;
+
+/**
+ * Phase 15 predecessor world (live-host closure): builds a COMPLETE
+ * predecessor on the host-managed store with the domain's own services —
+ * a fresh workspace + PlanningRun for the EXACT session id handed in via
+ * PHASE_PLAN_LIVE_SESSION, driven through architecture, a three-Section DAG
+ * (SEC-A ← SEC-B; SEC-C independent), full Section completions, synthesis,
+ * a clean validation report, request_finalization, the FinalPlan commit
+ * (test authorization — the sanctioned fixture seam), and the execution
+ * handoff PREPARED AND DELIVERED, leaving the run completed with the
+ * ExecutionBinding attached at generation 1 to the live session. No Phase 15
+ * object (issue/successor/baseline) is ever created here — the live host
+ * must produce every one of them.
+ */
+async function buildPhase15PredecessorWorld(store: PlanStore, clock: ReturnType<typeof systemStoreClock>): Promise<void> {
+  const sessionId = process.env.PHASE_PLAN_LIVE_SESSION!;
+  const workspaceRoot = process.env.PHASE_PLAN_LIVE_WORKSPACE!;
+  expect(sessionId).toMatch(/^[0-9a-fA-F-]{36}$/);
+  const { discoverAndRegisterWorkspace } = await import("../src/workspace/identity.js");
+  const { getWorkspaceById } = await import("../src/store/repositories.js");
+  const { registration } = await discoverAndRegisterWorkspace(store, workspaceRoot, clock);
+  const workspace = getWorkspaceById(store, registration.workspace.workspaceId)!;
+  const runs = createPlanningRunService(store, clock);
+  const { run, binding } = runs.createPlanningRun({
+    workspaceId: workspace.workspaceId,
+    sessionId,
+    goal: "Phase 15 live predecessor: approved design delivered to Build",
+  });
+  const generation = binding.generation;
+  let revision = run.revision;
+  const revalidate = (): number =>
+    (store.withRead((tx) => tx.prepare("SELECT revision AS r FROM planning_runs WHERE run_id = ?").get(run.runId) as { r: number })).r;
+  const ownership = () => ({
+    runId: run.runId,
+    workspaceId: workspace.workspaceId,
+    sessionId,
+    bindingGeneration: generation,
+    expectedRunRevision: revision,
+  });
+
+  const proposals = createProposalService(store, clock);
+  const engine = createPlanCommitEngine(store, clock);
+  const commit = (prepared: { proposal: { proposalId: string; revision: number; proposalHash: string } }) => {
+    const result = engine.commitAuthorizedProposal({
+      ...ownership(),
+      authorization: makeTestUserAuthorization({
+        proposalId: prepared.proposal.proposalId,
+        proposalRevision: prepared.proposal.revision,
+        proposalHash: prepared.proposal.proposalHash,
+      }),
+    });
+    revision = result.runRevision ?? revision;
+    return result;
+  };
+
+  runs.transitionRun({ ...ownership(), expectedRevision: revision, event: "DISCOVERY_COMPLETE" });
+  revision = revalidate();
+
+  const arch = proposals.prepareProposal({
+    ...ownership(),
+    type: "design_checkpoint",
+    scope: { kind: "architecture" },
+    title: "Phase 15 live predecessor architecture",
+    summary: "live predecessor architecture",
+    changes: [
+      {
+        op: "SET_ARCHITECTURE_REVISION" as const,
+        target: null,
+        content: {
+          summary: "Phase 15 live predecessor architecture",
+          components: ["BuildHarness"],
+          boundaries: ["workspace root"],
+          dataFlows: [],
+          principles: [],
+          unresolvedQuestionRefs: [],
+          decisionRefs: [],
+        },
+        compactProjection: "ARCH-P15@1",
+      },
+    ],
+  });
+  commit(arch);
+  const archDone = proposals.prepareProposal({
+    ...ownership(),
+    type: "architecture_completion",
+    scope: { kind: "architecture" },
+    title: "Phase 15 live architecture completion",
+    summary: "architecture is stable",
+    changes: [],
+  });
+  commit(archDone);
+
+  const sectionContent = (title: string, dependencies: string[]) => ({
+    title,
+    objective: `${title} objective`,
+    design: `${title} design per the approved baseline contract`,
+    interfaces: [],
+    invariants: [],
+    failureModes: [],
+    dependencies,
+    decisionRefs: [],
+    openQuestionRefs: [],
+    impactRefs: [],
+    contract: { provides: [], requires: [], invariants: [], interfaces: [], decisions: [] },
+  });
+  const dag = proposals.prepareProposal({
+    ...ownership(),
+    type: "design_checkpoint",
+    scope: { kind: "detail" },
+    title: "Phase 15 live section DAG",
+    summary: "SEC-A ← SEC-B; SEC-C independent",
+    changes: [
+      { op: "SET_SECTION_REVISION" as const, target: null, content: sectionContent("SEC-A", []), compactProjection: "section:SEC-A", localRef: "sec-a" },
+      { op: "SET_SECTION_REVISION" as const, target: null, content: sectionContent("SEC-B", ["sec-a"]), compactProjection: "section:SEC-B" },
+      { op: "SET_SECTION_REVISION" as const, target: null, content: sectionContent("SEC-C", []), compactProjection: "section:SEC-C" },
+    ],
+  });
+  commit(dag);
+  const sectionIds = [...new Set(dag.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
+
+  const sectionWorkflow = (await import("../src/application/section-workflow-service.js")).createSectionWorkflowService(store, clock);
+  for (const sectionId of sectionIds) {
+    sectionWorkflow.selectSection({ ...ownership(), sectionId });
+    revision = revalidate();
+    const completion = proposals.prepareProposal({
+      ...ownership(),
+      type: "section_completion",
+      scope: { kind: "section", sectionId },
+      title: `Complete ${sectionId}`,
+      summary: "live predecessor section completion",
+      changes: [{ op: "COMPLETE_SECTION" as const, sectionId, compactProjection: `complete:${sectionId}@1` }],
+    });
+    commit(completion);
+  }
+
+  const stageRow = store.withRead((tx) => tx.prepare("SELECT stage AS s FROM planning_runs WHERE run_id = ?").get(run.runId) as { s: string });
+  expect(stageRow.s).toBe("synthesis");
+  const input = store.withRead(
+    (tx) =>
+      tx.prepare("SELECT input_id AS inputId, input_hash AS inputHash FROM synthesis_inputs WHERE run_id = ? ORDER BY input_seq DESC LIMIT 1").get(run.runId),
+  ) as { inputId: string; inputHash: string };
+  const headId = store.withRead((tx) => tx.prepare("SELECT head_snapshot_id AS s FROM plan_heads WHERE run_id = ?").get(run.runId) as { s: string });
+  const revOf = (kind: string, id: string): number =>
+    (store.withRead(
+      (tx) => tx.prepare("SELECT revision AS r FROM snapshot_members WHERE snapshot_id = ? AND kind = ? AND artifact_id = ?").get(headId.s, kind, id) as { r: number },
+    )).r;
+  const sectionRefs = sectionIds.map((id) => ({ kind: "section" as const, id, revision: revOf("section", id) }));
+
+  const synthesisService = (await import("../src/application/synthesis-service.js")).createSynthesisService(store, clock);
+  const accepted = synthesisService.submitSynthesis({
+    ...ownership(),
+    permissionMode: "plan",
+    inputId: input.inputId,
+    inputHash: input.inputHash,
+    manifest: {
+      version: 1 as const,
+      inputId: input.inputId,
+      inputHash: input.inputHash,
+      crossSectionLinks: [
+        { statement: "SEC-B consumes the approved SEC-A contract boundary", supportingRefs: sectionRefs },
+      ],
+      implementationOrder: [
+        { stepId: "step-1", title: "Implement SEC-A", description: "build sec-a", dependsOn: [], supportingRefs: [sectionRefs[0]!] },
+        { stepId: "step-2", title: "Implement SEC-B", description: "build sec-b after sec-a", dependsOn: ["step-1"], supportingRefs: [sectionRefs[1]!] },
+        { stepId: "step-3", title: "Implement SEC-C", description: "build sec-c", dependsOn: [], supportingRefs: [sectionRefs[2]!] },
+      ],
+      limitations: [
+        { statement: "Runtime behavior is bounded by the committed section contracts", supportingRefs: sectionRefs },
+      ],
+      unresolvedFindings: [],
+    },
+    requestId: "fixture:phase15-synthesis",
+    callerAgent: null,
+  });
+  const report = synthesisService.submitValidation({
+    ...ownership(),
+    manifestId: accepted.manifestId,
+    manifestHash: accepted.manifestHash,
+    inputId: input.inputId,
+    inputHash: input.inputHash,
+    findings: [
+      { kind: "clean" as const, summary: "The manifest is a faithful derivation.", detail: "Phase 15 live predecessor clean report.", subjectRefs: [], supportingRefs: [] },
+    ],
+    requestId: "fixture:phase15-validation",
+    callerAgent: { agentId: "live-validator-phase15", agentType: "phase-plan:validator" },
+  });
+  expect(report.isClean).toBe(true);
+
+  const finalization = (await import("../src/application/finalization-service.js")).createFinalizationService(store, clock);
+  const frozen = finalization.requestFinalization({ ...ownership(), requestId: "fixture:phase15-finalize", callerAgent: null });
+  const finalCommit = engine.commitAuthorizedProposal({
+    ...ownership(),
+    authorization: makeTestUserAuthorization({
+      proposalId: frozen.proposalId,
+      proposalRevision: frozen.proposalRevision,
+      proposalHash: frozen.proposalHash,
+    }),
+  });
+  revision = finalCommit.runRevision ?? revision;
+
+  const handoffService = (await import("../src/application/handoff-service.js")).createHandoffService(store, clock);
+  const prepared = handoffService.prepareHandoffDelivery({
+    runId: run.runId,
+    workspaceId: workspace.workspaceId,
+    workspaceRoot,
+    sessionId,
+    toolUseId: "live-phase15-handoff",
+  });
+  handoffService.finalizeDelivery({
+    runId: run.runId,
+    sessionId,
+    toolUseId: "live-phase15-handoff",
+    responseHandoffId: prepared.handoffId,
+    responseHandoffHash: prepared.handoffHash,
+  });
+
+  const finalRun = store.withRead(
+    (tx) => tx.prepare("SELECT lifecycle AS l, stage AS s, revision AS r FROM planning_runs WHERE run_id = ?").get(run.runId) as { l: string; s: string; r: number },
+  );
+  expect(finalRun).toEqual({ l: "completed", s: "final", r: expect.any(Number) });
+  const executionBinding = store.withRead(
+    (tx) => tx.prepare("SELECT state AS s, generation AS g FROM execution_bindings WHERE run_id = ?").get(run.runId) as { s: string; g: number },
+  );
+  expect(executionBinding).toEqual({ s: "attached", g: 1 });
+
+  const sections = sectionIds.map((id) => {
+    const view = createStoreContextSource(store).readRevision({ runId: run.runId, kind: "section", id, revision: revOf("section", id) });
+    return { id, title: (view!.content as { title: string }).title, revision: revOf("section", id) };
+  });
+  console.log(
+    `LIVE_FIXTURE ${JSON.stringify({
+      mode: "phase15",
+      runId: run.runId,
+      runRevision: finalRun.r,
+      workspaceId: workspace.workspaceId,
+      workspaceKind: workspace.kind,
+      workspaceRoot: workspace.canonicalRoot,
+      repositoryBaseline: prepared.handoff.repositoryBaseline,
+      sessionId,
+      finalPlanId: prepared.finalPlan.id,
+      finalPlanHash: prepared.finalPlan.hash,
+      finalCommitId: finalCommit.commitId,
+      finalSnapshotId: finalCommit.snapshotId,
+      architectureRef: { id: "ARCH-1", revision: revOf("architecture", "ARCH-1") },
+      handoffId: prepared.handoffId,
+      handoffHash: prepared.handoffHash,
+      executionBinding: executionBinding,
+      sections,
+    })}`,
+  );
+}
 
 d("live fixture (guarded by PHASE_PLAN_LIVE_STORE)", () => {
   it("prepares one awaiting_approval proposal on the current active run", async () => {
-    expect(liveRoot).toBeDefined();
-    expect(fs.existsSync(path.join(liveRoot!, "store", "phase-plan.sqlite3"))).toBe(true);
-
     const clock = systemStoreClock();
     const store: PlanStore = await initializePlanStore({ pluginDataRoot: liveRoot! });
     try {
+        if (phase15) {
+          await buildPhase15PredecessorWorld(store, clock);
+          return;
+        }
+        if (phase15Revise) {
+          // Supersede the live successor's awaiting proposal via the domain's
+          // own revise path (prepare-time coherence fix): re-emit its frozen
+          // change set under a type the commit-time gate accepts.
+          const runId = process.env.PHASE_PLAN_LIVE_SUCCESSOR_RUN!;
+          const row = store.withRead(
+            (tx) =>
+              tx.prepare(
+                "SELECT ps.proposal_id AS proposalId, ps.revision AS revision, pr.canonical_json AS canonical, pr.scope_json AS scopeJson, pr.title AS title, pr.summary AS summary "
+                + "FROM proposal_states ps JOIN proposal_revisions pr ON pr.run_id = ps.run_id AND pr.proposal_id = ps.proposal_id AND pr.revision = ps.revision "
+                + "WHERE ps.run_id = ? AND ps.status = 'awaiting_approval' ORDER BY ps.created_at DESC LIMIT 1",
+              ).get(runId) as { proposalId: string; revision: number; canonical: string; scopeJson: string; title: string; summary: string },
+          );
+          const canonical = JSON.parse(row.canonical) as {
+            changes: Array<{ op: string; target: { kind: string; id: number | string; revision: number } | null; artifactId?: string; content?: unknown; compactProjection?: string }>;
+          };
+          const rawChanges = canonical.changes.map((change) => ({
+            op: change.op,
+            ...(change.target !== null && change.target !== undefined
+              ? { target: { kind: change.target.kind, id: change.target.id, revision: change.target.revision } }
+              : {}),
+            ...(change.content !== undefined ? { content: change.content } : {}),
+            ...(change.compactProjection !== undefined ? { compactProjection: change.compactProjection } : {}),
+          }));
+          const proposals = createProposalService(store, clock);
+          const scope = JSON.parse(row.scopeJson);
+          const revised = proposals.reviseProposal({
+            runId,
+            workspaceId: (store.withRead((tx) => tx.prepare("SELECT workspace_id AS w FROM planning_runs WHERE run_id = ?").get(runId) as { w: string }).w),
+            sessionId: process.env.PHASE_PLAN_LIVE_SESSION!,
+            bindingGeneration: Number(process.env.PHASE_PLAN_LIVE_GENERATION!),
+            expectedRunRevision: Number(process.env.PHASE_PLAN_LIVE_RUN_REVISION!),
+            proposalId: row.proposalId,
+            type: "design_checkpoint",
+            scope,
+            title: row.title,
+            summary: row.summary,
+            changes: rawChanges as never,
+          });
+          console.log(
+            `LIVE_FIXTURE ${JSON.stringify({
+              mode: "phase15-revise",
+              supersededProposalId: row.proposalId,
+              proposalId: revised.proposal.proposalId,
+              proposalRevision: revised.proposal.revision,
+              proposalHash: revised.proposal.proposalHash,
+              type: revised.proposal.type ?? "design_checkpoint",
+            })}`,
+          );
+          return;
+        }
+      expect(liveRoot).toBeDefined();
+      expect(fs.existsSync(path.join(liveRoot!, "store", "phase-plan.sqlite3"))).toBe(true);
+
       const current = store.withRead((tx) =>
         tx
           .prepare(
