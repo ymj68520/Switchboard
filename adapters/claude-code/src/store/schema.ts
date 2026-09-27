@@ -601,7 +601,7 @@ function validateSchemaV7(db: StoreConnection | StoreTx, problems: string[]): vo
  * Section in the run's current HEAD snapshot. Targeted LIMIT-1 queries only —
  * never a full-history replay at store open.
  */
-function validateSchemaV8(db: StoreConnection | StoreTx, problems: string[]): void {
+function validateSchemaV8(db: StoreConnection | StoreTx, version: number, problems: string[]): void {
   const objectNames = new Set(
     (
       db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
@@ -649,11 +649,23 @@ function validateSchemaV8(db: StoreConnection | StoreTx, problems: string[]): vo
     );
   }
   // Every Section identity has a workflow state row (backfill completeness).
+  // Phase 15: an inherited_completed Section of a successor baseline stays
+  // row-less BY DESIGN (§28 — completion comes from the baseline merge, never
+  // a fabricated local row), so those identities are exempt from v12 on.
   const missingState = db
     .prepare(
-      "SELECT a.run_id AS runId, a.artifact_id AS sectionId FROM memory_artifacts a "
-      + "WHERE a.kind = 'section' AND NOT EXISTS ("
-      + "SELECT 1 FROM section_workflow_states s WHERE s.run_id = a.run_id AND s.section_id = a.artifact_id) LIMIT 1",
+      version >= 12
+        ? "SELECT a.run_id AS runId, a.artifact_id AS sectionId FROM memory_artifacts a "
+          + "WHERE a.kind = 'section' AND NOT EXISTS ("
+          + "SELECT 1 FROM section_workflow_states s WHERE s.run_id = a.run_id AND s.section_id = a.artifact_id) "
+          + "AND NOT EXISTS ("
+          + "SELECT 1 FROM planning_run_baselines b "
+          + "JOIN planning_run_baseline_scopes bs ON bs.baseline_id = b.baseline_id "
+          + "WHERE b.successor_run_id = a.run_id AND bs.section_id = a.artifact_id "
+          + "AND bs.scope_state = 'inherited_completed') LIMIT 1"
+        : "SELECT a.run_id AS runId, a.artifact_id AS sectionId FROM memory_artifacts a "
+          + "WHERE a.kind = 'section' AND NOT EXISTS ("
+          + "SELECT 1 FROM section_workflow_states s WHERE s.run_id = a.run_id AND s.section_id = a.artifact_id) LIMIT 1",
     )
     .get() as { runId?: string; sectionId?: string } | undefined;
   if (missingState !== undefined) {
@@ -686,13 +698,28 @@ function validateSchemaV8(db: StoreConnection | StoreTx, problems: string[]): vo
       `completed revision ${badCompletedRevision.revision} for section '${badCompletedRevision.sectionId}' in run '${badCompletedRevision.runId}' references a missing section revision`,
     );
   }
-  // Active work must point at a Section in the run's current HEAD snapshot (§69).
+  // Active work must point at a Section in the run's current HEAD snapshot
+  // (§69) — OR, for a Phase 15 successor whose baseline is not yet
+  // materialized (HEAD intentionally absent until the first authorized
+  // commit), at a needs_review Section of that baseline. The exemption needs
+  // the v12 baseline tables, so it applies only from schema version 12 on.
   const badActiveWork = db
     .prepare(
-      "SELECT w.run_id AS runId, w.section_id AS sectionId FROM planning_active_work w "
-      + "WHERE NOT EXISTS ("
-      + "SELECT 1 FROM plan_heads h JOIN snapshot_members sm ON sm.snapshot_id = h.head_snapshot_id "
-      + "WHERE h.run_id = w.run_id AND sm.run_id = w.run_id AND sm.kind = 'section' AND sm.artifact_id = w.section_id) LIMIT 1",
+      version >= 12
+        ? "SELECT w.run_id AS runId, w.section_id AS sectionId FROM planning_active_work w "
+          + "WHERE NOT EXISTS ("
+          + "SELECT 1 FROM plan_heads h JOIN snapshot_members sm ON sm.snapshot_id = h.head_snapshot_id "
+          + "WHERE h.run_id = w.run_id AND sm.run_id = w.run_id AND sm.kind = 'section' AND sm.artifact_id = w.section_id) "
+          + "AND NOT EXISTS ("
+          + "SELECT 1 FROM planning_run_baselines b "
+          + "JOIN planning_run_baseline_scopes bs ON bs.baseline_id = b.baseline_id "
+          + "WHERE b.successor_run_id = w.run_id AND bs.section_id = w.section_id "
+          + "AND bs.scope_state = 'needs_review' AND NOT EXISTS ("
+          + "SELECT 1 FROM planning_run_baseline_materializations m WHERE m.baseline_id = b.baseline_id)) LIMIT 1"
+        : "SELECT w.run_id AS runId, w.section_id AS sectionId FROM planning_active_work w "
+          + "WHERE NOT EXISTS ("
+          + "SELECT 1 FROM plan_heads h JOIN snapshot_members sm ON sm.snapshot_id = h.head_snapshot_id "
+          + "WHERE h.run_id = w.run_id AND sm.run_id = w.run_id AND sm.kind = 'section' AND sm.artifact_id = w.section_id) LIMIT 1",
     )
     .get() as { runId?: string; sectionId?: string } | undefined;
   if (badActiveWork !== undefined) {
@@ -1376,7 +1403,7 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
     validateSchemaV7(db, problems);
   }
   if (version >= 8) {
-    validateSchemaV8(db, problems);
+    validateSchemaV8(db, version, problems);
   }
   if (version >= 9) {
     validateSchemaV9(db, problems);

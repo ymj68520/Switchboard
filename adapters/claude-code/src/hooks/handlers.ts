@@ -183,11 +183,35 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
   const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
   const workspaceId = registration.workspace.workspaceId;
 
+  // Phase 15 — once the session has moved on to successor planning (it owns
+  // a planning binding on an active run), the delivered predecessor contract
+  // no longer owns this session: Build recovery must not re-attach the old
+  // ExecutionBinding and the planning Recovery Capsule takes precedence.
+  const ownsPlanningLife =
+    findAttachedActiveRun(deps.store, input.sessionId) !== null ||
+    findDetachedActiveRun(deps.store, input.sessionId, workspaceId) !== null;
+  if (ownsPlanningLife) {
+    // Repair restart-recovery shadowing: detach an execution binding that an
+    // earlier SessionStart re-attached after the successor took ownership.
+    try {
+      deps.store.withWrite((tx) => {
+        for (const binding of listExecutionBindingsForSessionInTx(tx, input.sessionId)) {
+          if (binding.state === "attached" && binding.workspaceId === workspaceId) {
+            detachExecutionBindingInTx(tx, { runId: binding.runId, sessionId: input.sessionId }, deps.clock.nowIso());
+          }
+        }
+        return null;
+      });
+    } catch {
+      // advisory repair — the read-authority revalidation stays authoritative
+    }
+  }
+
   // Phase 14 §79 — Build recovery: an exact-session detached ExecutionBinding
   // reattaches on resume (generation +1); clear/fork/startup never inherit
   // because a new session id owns no binding rows (§80/§81).
-  const execBindings = deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, input.sessionId));
-  if (input.source === "resume") {
+  if (input.source === "resume" && !ownsPlanningLife) {
+    const execBindings = deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, input.sessionId));
     for (const binding of execBindings) {
       if (binding.state === "detached" && binding.workspaceId === workspaceId) {
         try {
@@ -206,23 +230,29 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
   }
   // §77 — a delivered handoff with an attached binding injects the immutable
   // Execution Contract as the Build recovery capsule (startup/resume/compact).
-  const executionRecovery = deps.store.withRead((tx) => {
-    for (const binding of execBindings) {
-      const attached = getExecutionBindingInTx(tx, binding.runId);
-      if (attached === null || attached.state !== "attached" || attached.sessionId !== input.sessionId) continue;
-      const handoff = getExecutionHandoffInTx(tx, binding.runId);
-      const state = getExecutionHandoffStateInTx(tx, binding.runId);
-      if (handoff !== null && state?.status === "delivered") {
-        return {
-          runId: binding.runId,
-          handoff: JSON.parse(handoff.canonicalJson) as ExecutionHandoffV1,
-          handoffId: handoff.handoffId,
-          handoffHash: handoff.handoffHash,
-        };
-      }
-    }
-    return null;
-  });
+  const execBindings = ownsPlanningLife
+    ? []
+    : deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, input.sessionId));
+  const executionRecovery =
+    ownsPlanningLife
+      ? null
+      : deps.store.withRead((tx) => {
+          for (const binding of execBindings) {
+            const attached = getExecutionBindingInTx(tx, binding.runId);
+            if (attached === null || attached.state !== "attached" || attached.sessionId !== input.sessionId) continue;
+            const handoff = getExecutionHandoffInTx(tx, binding.runId);
+            const state = getExecutionHandoffStateInTx(tx, binding.runId);
+            if (handoff !== null && state?.status === "delivered") {
+              return {
+                runId: binding.runId,
+                handoff: JSON.parse(handoff.canonicalJson) as ExecutionHandoffV1,
+                handoffId: handoff.handoffId,
+                handoffHash: handoff.handoffHash,
+              };
+            }
+          }
+          return null;
+        });
   if (executionRecovery !== null) {
     const contract = renderExecutionContract(executionRecovery.handoff, {
       handoffId: executionRecovery.handoffId,

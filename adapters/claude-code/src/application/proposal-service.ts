@@ -392,6 +392,16 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
     // only Section change is COMPLETE_SECTION needs no revision bump, and the
     // scoped section must not already be completed at that same revision.
     if (input.type === "section_completion") {
+      // Prepare-time mirror of the commit-time coherence rule: a
+      // section_completion MUST carry COMPLETE_SECTION — rejecting the
+      // incoherent combination here, not only at approval.
+      const hasCompleteOp = input.changes.some((change) => change.op === "COMPLETE_SECTION");
+      if (!hasCompleteOp) {
+        throw proposalInvalid("section_completion proposals require at least one COMPLETE_SECTION change", {
+          type: input.type,
+          scope: input.scope,
+        });
+      }
       const completeOp = input.changes.find((change) => change.op === "COMPLETE_SECTION");
       if (completeOp !== undefined && completeOp.op === "COMPLETE_SECTION") {
         const state = getSectionWorkflowStateInTx(tx, input.runId, completeOp.artifactId);
