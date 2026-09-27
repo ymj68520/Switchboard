@@ -69,6 +69,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
           "request_reopen",
           "request_finalization",
       "handoff",
+          "report_execution_issue",
         ]);
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
           "anthropic/requiresUserInteraction": true,
@@ -107,7 +108,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       await fs.writeFile(databasePath, "");
       // Leave a schema-2 marker via raw connection (test-only manipulation).
       const raw = rawConnection(databasePath, 500);
-      raw.exec("PRAGMA user_version = 12");
+      raw.exec("PRAGMA user_version = 13");
       raw.close();
 
       const result = await runMcpSmoke(process.execPath, BUNDLE, {
@@ -121,7 +122,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       expect(result.stderr).toContain("STORE_SCHEMA_TOO_NEW");
       expect(result.stdoutLines).toEqual([]);
       // Untouched: still the too-new marker, never downgraded.
-      expect(rawConnectionQueried(databasePath)).toBe(12);
+      expect(rawConnectionQueried(databasePath)).toBe(13);
     } finally {
       removeTempPluginDataRoot(pluginDataRoot);
     }

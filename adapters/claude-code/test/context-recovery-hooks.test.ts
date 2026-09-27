@@ -119,7 +119,7 @@ describe("UserPromptSubmit delta context (§34, E5)", () => {
       });
       expect(before.kind).toBe("json");
       const marker = ((before as { kind: "json"; payload: Record<string, unknown> }).payload.hookSpecificOutput as { additionalContext: string }).additionalContext;
-      expect(marker).toMatch(/^Phase Plan context epoch: context-epoch:v4:[0-9a-f]{64}\nUse phase_plan\.get_context if context appears stale\.$/);
+      expect(marker).toMatch(/^Phase Plan context epoch: context-epoch:v5:[0-9a-f]{64}\nUse phase_plan\.get_context if context appears stale\.$/);
 
       // After a commit the epoch marker changes (E5).
       commitCheckpoint(fixture, [{ op: "ADD_CONSTRAINT", content: CONSTRAINT_1, compactProjection: "CONST-1@1 committed" }]);

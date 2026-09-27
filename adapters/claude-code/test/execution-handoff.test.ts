@@ -17,6 +17,7 @@ import { getFinalPlanInTx } from "../src/store/finalization.js";
 import { getPlanningRunRecord } from "../src/store/planning-runs.js";
 import { getBinding } from "../src/store/session-bindings.js";
 import { getHeadCommitRecord } from "../src/store/plan-commits.js";
+import { issueEntryIntent } from "../src/host/entry-intent.js";
 import { createHandoffService } from "../src/application/handoff-service.js";
 import { listObservationSummaries } from "../src/application/observation-service.js";
 import { handlePostToolUse } from "../src/hooks/handlers.js";
@@ -519,7 +520,7 @@ describe("Phase 14 boundary (§47/§48/§68/§69/§83/§98/§133, E34/E55–E59/
     expect(codeOf(() => callHandoff(ctx, f, { toolUseId: "TU-TERM-2" }))).toBe("HANDOFF_ALREADY_DELIVERED");
   });
 
-  it("start_or_resume on a Build-bound session is EXECUTION_REPLAN_NOT_AVAILABLE (§83/E68)", async () => {
+  it("start_or_resume on a Build-bound session with no open issue is EXECUTION_ISSUE_REQUIRED (Phase 15 §23; was §83/E68)", async () => {
     const { f, ctx } = await makeApprovedFinalPlanFixture();
     const prepared = callHandoff(ctx, f, { toolUseId: "TU-REPLAN-1" });
     createHandoffService(ctx.store, ctx.clock).finalizeDelivery({
@@ -530,11 +531,12 @@ describe("Phase 14 boundary (§47/§48/§68/§69/§83/§98/§133, E34/E55–E59/
       responseHandoffHash: prepared.handoff_hash,
     });
     const ids = { sessionId: f.sessionId, workspaceId: f.workspaceId, generation: f.generation };
-    const entry = "entry-intent-token";
+    // §24 — a REAL fresh signed EntryIntent is required even on this path.
+    const entry = issueEntryIntent(ctx.secret, { sessionId: f.sessionId, promptId: "PROMPT-1" });
     const token = hostToken(ctx.secret, "start_or_resume", { _entryIntent: entry, goal: "next" }, ids, { permissionMode: "default", toolUseId: "TU-REPLAN-2" });
     expect(codeOf(() =>
       executePhasePlanTool(ctx, "start_or_resume", { _entryIntent: entry, goal: "next", _hostContext: token }),
-    )).toBe("EXECUTION_REPLAN_NOT_AVAILABLE");
+    )).toBe("EXECUTION_ISSUE_REQUIRED");
   });
 
   it("handoff replay under the execution authority returns the identical handoff idempotently (§134)", async () => {

@@ -127,3 +127,33 @@ export function pendingBackups(backupsDir: string): string[] {
   if (!fs.existsSync(backupsDir)) return [];
   return fs.readdirSync(backupsDir).filter((name) => name.startsWith(".pending-"));
 }
+
+/**
+ * Phase 15 — surgically remove the schema-12 execution-issue /
+ * successor-baseline objects (children before parents; foreign_keys are ON
+ * even on raw test connections) so legacy-store fixtures can present a genuine
+ * pre-v12 world after a full initialization.
+ */
+export function dropSchema12Objects(raw: StoreConnection): void {
+  for (const table of [
+    "planning_run_baseline_materializations",
+    "planning_run_baseline_scopes",
+    "planning_run_baseline_issues",
+    "execution_issue_adoptions",
+    "planning_run_baselines",
+    "execution_issue_refs",
+    "execution_issues",
+  ]) {
+    raw.exec(`DROP TABLE IF EXISTS ${table}`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_update`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_delete`);
+  }
+  for (const index of [
+    "idx_execution_issue_refs_issue",
+    "idx_execution_issue_adoptions_successor",
+    "idx_planning_run_baseline_issues_baseline",
+    "idx_planning_run_baseline_scopes_state",
+  ]) {
+    raw.exec(`DROP INDEX IF EXISTS ${index}`);
+  }
+}

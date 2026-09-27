@@ -16,7 +16,7 @@ import { getPlanningRunRecord } from "../src/store/planning-runs.js";
 import { getFinalPlanInTx } from "../src/store/finalization.js";
 import { getExecutionBindingInTx, getExecutionHandoffInTx, getExecutionHandoffStateInTx } from "../src/store/execution.js";
 import { callHandoff, makeApprovedFinalPlanFixture } from "./phase14-helpers.js";
-import { fixedClock, makeTempPluginDataRoot, publishedBackups, rawConnection, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
+import { fixedClock, makeTempPluginDataRoot, publishedBackups, rawConnection, removeTempPluginDataRoot, storePathsFor, dropSchema12Objects } from "./store-helpers.js";
 
 function pluginDataRootOf(store: PlanStore): string {
   // <pluginDataRoot>/store/phase-plan.sqlite3 → <pluginDataRoot>
@@ -38,6 +38,7 @@ function rewindToSchema10(databasePath: string): void {
         raw.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
       }
     }
+    dropSchema12Objects(raw);
     raw.exec("DELETE FROM schema_migrations WHERE version >= 11");
     raw.exec("PRAGMA user_version = 10");
   } finally {
@@ -105,7 +106,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       const history = (rawConnection(databasePath, 5000));
       try {
         const rows = history.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
       } finally {
         history.close();
       }
@@ -173,6 +174,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
           migrations: [
             ...createProductionMigrations({ generateStoreId: clock.newId, nowIso: clock.nowIso }).filter((m) => m.to <= 10),
             failing,
+            ...createProductionMigrations({ generateStoreId: clock.newId, nowIso: clock.nowIso }).filter((m) => m.to === 12),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED", causeText: expect.stringContaining("injected 011 failure") });
@@ -186,7 +188,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       // A normal open migrates it forward again.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(11);
+        expect(store.getSchemaVersion()).toBe(12);
       } finally {
         store.close();
       }

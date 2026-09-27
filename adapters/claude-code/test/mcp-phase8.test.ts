@@ -56,7 +56,7 @@ describe("get_context (§20–§22, E24)", () => {
       const current = executePhasePlanTool(ctx, "get_context", args);
       expect(current.status).toBe("ok");
       const context = current.context as { epoch: string; run: { runId: string }; globalMemory: { hardConstraints: unknown[] } };
-      expect(context.epoch).toMatch(/^context-epoch:v4:[0-9a-f]{64}$/);
+      expect(context.epoch).toMatch(/^context-epoch:v5:[0-9a-f]{64}$/);
       expect(current.context_epoch).toBe(context.epoch);
       expect(context.run.runId).toBe(fixture.runId);
       expect(context.globalMemory.hardConstraints).toHaveLength(1);
@@ -228,7 +228,7 @@ describe("read_memory (§23–§25, E25–E28)", () => {
       const raw = rawConnection(storePathsFor(fixture.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(11);
+        expect(Object.values(row)[0]).toBe(12);
       } finally {
         raw.close();
       }
@@ -254,6 +254,7 @@ describe("Phase 8 tool surface (§42, E31)", () => {
       "request_reopen",
       "request_finalization",
       "handoff",
+      "report_execution_issue",
     ]);
     const joined = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
     for (const banned of ["takeover", "abort", "set_evidence_state", "set_section_status"]) {

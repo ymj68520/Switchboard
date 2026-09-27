@@ -33,7 +33,7 @@ import {
   type SynthesisFixture,
 } from "./phase12-helpers.js";
 import { makeProposalFixture } from "./proposal-helpers.js";
-import { makeTempPluginDataRoot, rawConnection, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
+import { makeTempPluginDataRoot, rawConnection, removeTempPluginDataRoot, storePathsFor, dropSchema12Objects } from "./store-helpers.js";
 
 type AnyFixture = SynthesisFixture;
 
@@ -252,6 +252,7 @@ describe("§19/§70/§110 — legacy schema-8 synthesis runs", () => {
             db.exec(`DROP TRIGGER IF EXISTS ${table}_no_${kind}`);
           }
         }
+        dropSchema12Objects(db);
         db.exec("DELETE FROM schema_migrations WHERE version >= 10");
         for (const table of ["synthesis_manifest_refs", "synthesis_manifests", "semantic_validation_findings", "semantic_validation_reports", "synthesis_input_refs", "synthesis_input_evidence", "synthesis_inputs"]) {
           db.exec(`DROP TABLE IF EXISTS ${table}`);

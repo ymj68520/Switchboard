@@ -21,6 +21,7 @@ import {
   removeTempPluginDataRoot,
   storePathsFor,
   tableNames,
+  dropSchema12Objects,
 } from "./store-helpers.js";
 
 /** Build a real schema-7-shaped world with a committed Section artifact. */
@@ -107,6 +108,7 @@ function rewindToSchema7(root: string): void {
     db.exec("DROP TABLE IF EXISTS section_workflow_states");
     db.exec("DROP TABLE IF EXISTS planning_active_work");
     db.exec("DROP INDEX IF EXISTS idx_section_workflow_events_section");
+    dropSchema12Objects(db);
     db.exec("DELETE FROM schema_migrations WHERE version >= 8");
     db.exec("PRAGMA user_version = 7");
   } finally {
@@ -124,7 +126,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(11);
+        expect(store.getSchemaVersion()).toBe(12);
         const read = (sql: string, ...params: unknown[]): unknown =>
           store.withRead((tx) => tx.prepare(sql).get(...params)) as Record<string, unknown>;
         // Old rows survive EXACTLY.
@@ -147,9 +149,9 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
         const history = store
           .withRead((tx) => tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
           .map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         expect(publishedBackups(backupsDir)).toHaveLength(1);
-        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-11-/);
+        expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-7-12-/);
       } finally {
         store.close();
       }
@@ -193,7 +195,7 @@ describe("migration 7 → 8 section-workflow (§70/§71/§72, E1/E3/E57/E58)", (
       rewindToSchema7(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(11);
+        expect(store.getSchemaVersion()).toBe(12);
         const { assertWriteCompat } = await import("../src/store/transaction.js");
         let writeRan = false;
         expect(() =>

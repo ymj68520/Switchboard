@@ -8,6 +8,7 @@ import { createSectionWorkflowMigration } from "../src/store/migrations/008-sect
 import { createSynthesisValidationMigration } from "../src/store/migrations/009-synthesis-validation-foundation.js";
 import { createFinalizationFinalPlanMigration } from "../src/store/migrations/010-finalization-final-plan.js";
 import { createExecutionHandoffMigration } from "../src/store/migrations/011-execution-handoff-foundation.js";
+import { createExecutionIssueSuccessorBaselineMigration } from "../src/store/migrations/012-execution-issue-successor-baseline.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
@@ -99,6 +100,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createSynthesisValidationMigration(),
             createFinalizationFinalPlanMigration(),
             createExecutionHandoffMigration(),
+            createExecutionIssueSuccessorBaselineMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -149,6 +151,7 @@ describe("migration failure semantics (E14/§22)", () => {
             createSynthesisValidationMigration(),
             createFinalizationFinalPlanMigration(),
             createExecutionHandoffMigration(),
+            createExecutionIssueSuccessorBaselineMigration(),
           ],
           clock,
         }),

@@ -17,7 +17,7 @@ import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore } from "../src/store/sqlite-store.js";
 import { discoverAndRegisterWorkspace } from "../src/workspace/identity.js";
 import { createPlanningRunService } from "../src/application/planning-run-service.js";
-import { fixedClock, makeTempPluginDataRoot, publishedBackups, rawConnection, removeTempPluginDataRoot, storePathsFor } from "./store-helpers.js";
+import { fixedClock, makeTempPluginDataRoot, publishedBackups, rawConnection, removeTempPluginDataRoot, storePathsFor, dropSchema12Objects } from "./store-helpers.js";
 
 /**
  * Build a GENUINE schema-2 store: initialize at v3, then surgically remove
@@ -82,6 +82,7 @@ for (const kind of ["update", "delete"]) {
     raw.exec("DROP INDEX IF EXISTS idx_evidence_validation_events_revision");
     raw.exec("DROP INDEX IF EXISTS idx_evidence_derived_refs_upstream");
     raw.exec("DROP INDEX IF EXISTS idx_section_workflow_events_section");
+    dropSchema12Objects(raw);
     raw.exec("DELETE FROM schema_migrations WHERE version >= 3");
     raw.exec("PRAGMA user_version = 2");
     // Sentinel data from the schema-2 era must survive the migration.
@@ -137,6 +138,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
           { version: 9, name: "synthesis-validation-foundation" },
 	  { version: 10, name: "finalization-final-plan" },
 	  { version: 11, name: "execution-handoff-foundation" },
+			{ version: 12, name: "execution-issue-successor-baseline" },
         ]);
         const runs = store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get()) as { n: number };
         expect(runs.n).toBe(0);
@@ -153,7 +155,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-11-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-12-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -225,7 +227,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(11);
+      expect(retry.getSchemaVersion()).toBe(12);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

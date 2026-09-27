@@ -50,7 +50,7 @@ describe("assembler: empty-run baseline (E7/E22/E33)", () => {
       const second = assembleContext(source, fixture.runId);
       // Byte-identical structured context for identical Store state (E33/E14).
       expect(JSON.stringify(first)).toBe(JSON.stringify(second));
-      expect(first.version).toBe(4);
+      expect(first.version).toBe(5);
       expect(first.run).toMatchObject({ runId: fixture.runId, stage: "architecture", lifecycle: "active" });
       expect(first.head).toEqual({ commitId: null, snapshotId: null });
       expect(first.globalMemory).toEqual({
@@ -152,9 +152,10 @@ describe("context_epoch (E4/E5/E6, §36/§37/§38)", () => {
         finalProposal: null as { id: string; revision: number; hash: string } | null,
         finalPlan: null as { finalPlanId: string; hash: string } | null,
       },
+      successorBaseline: null as { baselineId: string; baselineHash: string; materialized: boolean } | null,
     };
     const epoch = deriveContextEpoch(base);
-    expect(epoch).toMatch(/^context-epoch:v4:[0-9a-f]{64}$/);
+    expect(epoch).toMatch(/^context-epoch:v5:[0-9a-f]{64}$/);
     expect(deriveContextEpoch({ ...base })).toBe(epoch);
     expect(deriveContextEpoch({ ...base, headCommitId: null })).not.toBe(epoch);
     expect(deriveContextEpoch({ ...base, awaitingProposal: null })).not.toBe(epoch);
@@ -166,6 +167,9 @@ describe("context_epoch (E4/E5/E6, §36/§37/§38)", () => {
     // §63 — finalization identity IS an epoch input.
     expect(deriveContextEpoch({ ...base, finalization: { ...base.finalization, candidate: { candidateId: "fpc_x", candidateHash: "sha256:c" } } })).not.toBe(epoch);
     expect(deriveContextEpoch({ ...base, finalization: { ...base.finalization, finalPlan: { finalPlanId: "fplan_x", hash: "sha256:p" } } })).not.toBe(epoch);
+    // Phase 15 §46 — successor baseline lineage IS an epoch input.
+    expect(deriveContextEpoch({ ...base, successorBaseline: { baselineId: "sbase_x", baselineHash: "sha256:b", materialized: false } })).not.toBe(epoch);
+    expect(deriveContextEpoch({ ...base, successorBaseline: { baselineId: "sbase_x", baselineHash: "sha256:b", materialized: true } })).not.toBe(epoch);
     // Binding generation is not even an input of the function (§38).
     expect("bindingGeneration" in base).toBe(false);
   });
@@ -337,7 +341,7 @@ describe("read model no-mutation + structural guarantees (E22/E23, §26)", () =>
       const context = assembleContext(source, fixture.runId);
       deriveContextEpochFromSource(source, fixture.runId);
       deriveContextEpochFromSource(source, fixture.runId);
-      expect(JSON.parse(canonicalJson(context)).version).toBe(4);
+      expect(JSON.parse(canonicalJson(context)).version).toBe(5);
       expect(memoryCounts(fixture.store)).toEqual(before);
     });
   });
