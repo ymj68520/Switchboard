@@ -349,6 +349,56 @@ export function setHeadSnapshotInTx(
   return { runId: input.runId, headSnapshotId: input.nextSnapshotId };
 }
 
+/**
+ * Phase 15 §51/§52 — byte-identical baseline carry-forward. Copies the exact
+ * artifact identities and revisions of the predecessor FinalPlan closure into
+ * the successor run: canonical content bytes, projections, contracts, AND the
+ * origin created_at stay identical — the successor snapshot references the
+ * SAME logical design at the SAME revisions, only re-anchored to its own run
+ * (the schema namespaces everything by run_id, so identity/revision carry
+ * over with no renumbering). Caller owns the PlanCommit transaction; the
+ * origin manifest is returned for the materialization record (§53).
+ */
+export function materializeBaselineRevisionsInTx(
+  tx: MemoryWriteTx,
+  input: { runId: string; originRunId: string; refs: Array<{ kind: MemoryArtifactKind; id: string; revision: number }> },
+): Array<{ kind: MemoryArtifactKind; id: string; revision: number; originRunId: string }> {
+  const manifest: Array<{ kind: MemoryArtifactKind; id: string; revision: number; originRunId: string }> = [];
+  for (const ref of input.refs) {
+    const identity = tx
+      .prepare("SELECT created_at AS createdAt FROM memory_artifacts WHERE run_id = ? AND kind = ? AND artifact_id = ?")
+      .get(input.originRunId, ref.kind, ref.id) as { createdAt: string } | undefined;
+    if (identity === undefined) {
+      throw memoryError("MEMORY_ARTIFACT_NOT_FOUND", "baseline origin identity is missing", {
+        originRunId: input.originRunId,
+        kind: ref.kind,
+        artifactId: ref.id,
+      });
+    }
+    tx.prepare(
+      "INSERT INTO memory_artifacts (run_id, kind, artifact_id, created_at) VALUES (?, ?, ?, ?)",
+    ).run(input.runId, ref.kind, ref.id, identity.createdAt);
+    const copied = tx
+      .prepare(
+        "INSERT INTO memory_revisions "
+        + "(run_id, kind, artifact_id, revision, content_json, compact_projection, full_projection, contract_json, created_at) "
+        + "SELECT ?, kind, artifact_id, revision, content_json, compact_projection, full_projection, contract_json, created_at "
+        + "FROM memory_revisions WHERE run_id = ? AND kind = ? AND artifact_id = ? AND revision = ?",
+      )
+      .run(input.runId, input.originRunId, ref.kind, ref.id, ref.revision) as { changes?: number };
+    if ((copied.changes ?? 0) !== 1) {
+      throw memoryError("MEMORY_REVISION_NOT_FOUND", "baseline origin revision is missing", {
+        originRunId: input.originRunId,
+        kind: ref.kind,
+        artifactId: ref.id,
+        revision: ref.revision,
+      });
+    }
+    manifest.push({ kind: ref.kind, id: ref.id, revision: ref.revision, originRunId: input.originRunId });
+  }
+  return manifest;
+}
+
 // ---------------------------------------------------------------------------
 // Read model (never mutates; no writable binding required)
 // ---------------------------------------------------------------------------

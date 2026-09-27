@@ -63,6 +63,17 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
      ExecutionHandoff;
   5. use `get_context(detail=build)` and `read_memory` for exact approved
      design details.
+- During Build: if implementation would require changing approved semantics
+  (a hard constraint, invariant, approved interface, SectionContract,
+  Decision, explicit dependency, architecture choice, critical repository
+  assumption, or a missing design obligation), call `report_execution_issue`
+  with the EXACT approved refs (`id@revision`) and stop semantic mutation —
+  the host will pause repository writes (EXECUTION_REPLAN_REQUIRED). Then
+  tell the user that replanning is required.
+- When the user explicitly invokes `/phase-plan` after an ExecutionIssue:
+  entry creates a successor PlanningRun from the immutable FinalPlan
+  baseline (`started_successor`). Never reactivate the completed run; rework
+  only the reopened (needs_review) scope — inherited sections stay approved.
 - After a resume or compaction, rely on the injected Phase Plan Recovery
   Capsule (planning) or the injected Phase Plan Execution Contract (Build)
   for authoritative state. If exact artifact detail is needed, call

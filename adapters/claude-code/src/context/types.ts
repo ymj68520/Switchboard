@@ -32,11 +32,16 @@ import type { SectionWorkflowState } from "../core/section-workflow.js";
  * Evidence audit, or the approved FinalPlan — the context model formally
  * advances to version 4 and the epoch inputs gain the finalization identity
  * (§63). Older shapes are never silently reinterpreted.
+ *
+ * Phase 15 (§46): the v4 shape cannot express successor baseline lineage —
+ * the context model advances to version 5 with the explicit
+ * `successorBaseline` block (baseline id/hash, predecessor FinalPlan,
+ * ExecutionIssue summaries, affected scope, materialization state).
  */
-export const CONTEXT_MODEL_VERSION = 4 as const;
+export const CONTEXT_MODEL_VERSION = 5 as const;
 
-/** The frozen epoch identity marker (§63): finalization facts joined the inputs. */
-export const CONTEXT_EPOCH_VERSION = "context-epoch:v4" as const;
+/** The frozen epoch identity marker (§63 + Phase 15 §46): successor baseline lineage joined the inputs. */
+export const CONTEXT_EPOCH_VERSION = "context-epoch:v5" as const;
 
 /** L0 — static identity of the planning protocol layer. */
 export interface ContextProtocol {
@@ -191,6 +196,26 @@ export interface ContextWorking {
   awaitingProposal: ContextAwaitingProposal | null;
 }
 
+/**
+ * Phase 15 §46 — the successor baseline lineage block (successor runs only,
+ * null otherwise): the immutable predecessor anchor, the adopted ExecutionIssue
+ * summaries (§63 — reported prose, never committed design), the Core-derived
+ * affected scope, and whether the first authorized PlanCommit has materialized
+ * the baseline into successor-local Plan Memory yet (§44/§51).
+ */
+export interface ContextSuccessorBaseline {
+  baselineId: string;
+  baselineHash: string;
+  issueSetHash: string;
+  predecessorRunId: string;
+  finalPlan: { id: string; hash: string };
+  executionHandoff: { id: string; hash: string };
+  materialized: boolean;
+  issueSummaries: Array<{ issueId: string; kind: string; summary: string }>;
+  needsReviewSections: string[];
+  inheritedCompletedSections: string[];
+}
+
 /** L5 — operations logically available under the current state (§27/§73/§74/§88). */
 export type ContextOperation =
   | "get_state"
@@ -237,6 +262,8 @@ export interface PhasePlanContext {
   semanticValidation: ContextSemanticValidation | null;
   /** §62 — the finalization world (final stage only). */
   finalization: ContextFinalization | null;
+  /** Phase 15 §46 — successor baseline lineage (successor runs only). */
+  successorBaseline: ContextSuccessorBaseline | null;
   working: ContextWorking;
   operations: ContextOperation[];
   sourceTrace: ContextSourceTrace;
@@ -295,4 +322,6 @@ export interface ContextSource {
     finalProposal: { proposalId: string; revision: number; hash: string; status: "awaiting_approval" | "approved" } | null;
     finalPlan: { finalPlanId: string; hash: string } | null;
   } | null;
+  /** Phase 15 §46 — the run's successor baseline lineage, or null. */
+  getSuccessorBaseline(runId: string): ContextSuccessorBaseline | null;
 }

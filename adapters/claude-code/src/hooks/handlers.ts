@@ -85,6 +85,7 @@ import {
   detachExecutionBindingInTx,
 } from "../store/execution.js";
 import { getFinalPlanInTx } from "../store/finalization.js";
+import { countOpenExecutionIssuesInTx } from "../store/execution-issues.js";
 import { parsePlanningRunRow } from "../core/planning-run.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
 import { assembleContext } from "../context/assembler.js";
@@ -117,6 +118,21 @@ function deny(hookEventName: string, code: string, reason: string): HookOutput {
 /** Tools that stay usable under host-state drift (directive §42 allowlist). */
 const DRIFT_ALLOWLIST = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion"]);
 
+/**
+ * Phase 15 §20 — repository-mutating Build tools paused while an ExecutionIssue
+ * is open (replanRequired). Deliberately conservative: the whole mutation
+ * family is denied fail-closed; reads/discovery stay untouched.
+ */
+const EXECUTION_MUTATION_TOOLS = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "Bash",
+  "PowerShell",
+  "Agent",
+]);
+
 function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
   return (
     logical === "start_or_resume" ||
@@ -133,7 +149,8 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "submit_validation" ||
     logical === "request_reopen" ||
     logical === "request_finalization" ||
-    logical === "handoff"
+    logical === "handoff" ||
+    logical === "report_execution_issue"
   );
 }
 
@@ -627,6 +644,27 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
     );
   }
 
+  // Phase 15 §20/§21 — the Build semantic mutation guard (execution state):
+  // once an open ExecutionIssue records that approved semantics cannot be
+  // implemented as-is, repository-mutating execution PAUSES fail-closed until
+  // an explicit /phase-plan successor run. Read-only inspection stays
+  // available (§20); with no open issue Phase 14 behavior is preserved.
+  if (EXECUTION_MUTATION_TOOLS.has(logical)) {
+    const guardBinding = deps.store.withRead((tx) => {
+      const binding = findAttachedExecutionBindingForSessionInTx(tx, input.sessionId);
+      if (binding === null) return null;
+      return { runId: binding.runId, openIssues: countOpenExecutionIssuesInTx(tx, binding.runId) };
+    });
+    if (guardBinding !== null && guardBinding.openIssues > 0) {
+      return deny(
+        eventName,
+        "EXECUTION_REPLAN_REQUIRED",
+        `an open ExecutionIssue records that the approved FinalPlan cannot be implemented as-is; repository mutation is paused. `
+          + `Invoke /phase-plan to start the successor PlanningRun from the immutable baseline (${guardBinding.openIssues} open issue(s)).`,
+      );
+    }
+  }
+
   // §43 — normal Plan Mode stays governed by Claude Code; no duplication.
   return emptyOutput();
 }
@@ -703,7 +741,14 @@ async function handlePhasePlanPreToolUse(
     // with a delivered handoff and this session holds the attached
     // ExecutionBinding, reads are signed with an EXECUTION HostContext
     // (domain-separated; the planning verifier can never accept it).
-    if (logical === "get_state" || logical === "get_context" || logical === "read_memory") {
+    // Phase 15 §12 — report_execution_issue joins this family: reporting a
+    // defect against the delivered contract is a Build read-authority act.
+    if (
+      logical === "get_state" ||
+      logical === "get_context" ||
+      logical === "read_memory" ||
+      logical === "report_execution_issue"
+    ) {
       const executionBinding = deps.store.withRead((tx) => {
         const binding = findAttachedExecutionBindingForSessionInTx(tx, input.sessionId);
         if (binding === null || binding.workspaceId === "") return null;

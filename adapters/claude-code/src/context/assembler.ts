@@ -182,6 +182,9 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
     };
   }
 
+  // Phase 15 §46 — successor baseline lineage (successor runs only).
+  const successorBaseline = source.getSuccessorBaseline(runId);
+
   const epoch = deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -220,11 +223,20 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
             },
       finalPlan: finalization === null ? null : finalization.finalPlan,
     },
+    // Phase 15 §46 — successor baseline lineage joined the epoch inputs.
+    successorBaseline:
+      successorBaseline === null
+        ? null
+        : {
+            baselineId: successorBaseline.baselineId,
+            baselineHash: successorBaseline.baselineHash,
+            materialized: successorBaseline.materialized,
+          },
   });
   return {
-    version: 4,
+    version: 5,
     epoch,
-    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 4 },
+    protocol: { name: "phase-plan", entry: "/phase-plan", contextModelVersion: 5 },
     run,
     head,
     globalMemory,
@@ -235,6 +247,7 @@ export function assembleContext(source: ContextSource, runId: string): PhasePlan
     synthesisManifest,
     semanticValidation,
     finalization,
+    successorBaseline,
     working: { awaitingProposal },
     operations: availableOperations(run, awaitingProposal),
     // §44 — internal provenance (all planning-domain facts, no secrets).

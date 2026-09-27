@@ -37,6 +37,7 @@ import {
   synthesisManifestSegment,
   synthesisSegment,
   finalizationSegment,
+  successorBaselineSegment,
   type CapsuleSegment,
 } from "./render.js";
 
@@ -72,6 +73,7 @@ function capsuleSegments(context: PhasePlanContext): CapsuleSegment[] {
     synthesisManifestSegment(context),
     semanticValidationSegment(context),
     finalizationSegment(context),
+    successorBaselineSegment(context),
     blockingSegment(context),
     awaitingProposalSegment(context),
     sectionsSegment(context),

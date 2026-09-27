@@ -50,6 +50,8 @@ export interface ContextEpochInputs {
     finalProposal: { id: string; revision: number; hash: string } | null;
     finalPlan: { finalPlanId: string; hash: string } | null;
   };
+  /** Phase 15 §46 — successor baseline lineage joined the inputs. */
+  successorBaseline: { baselineId: string; baselineHash: string; materialized: boolean } | null;
 }
 
 /**
@@ -90,6 +92,9 @@ export function deriveContextEpoch(inputs: Omit<ContextEpochInputs, "epochVersio
     // finalization identity pairs; raw Evidence validation event seqs never
     // enter the epoch, and the Final PlanCommit itself moves HEAD.
     finalization: inputs.finalization,
+    // Phase 15 §46 — successor creation / first-commit materialization are
+    // visible through the baseline identity pair + materialization flag.
+    successorBaseline: inputs.successorBaseline,
   };
   const hex = createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
   return `${CONTEXT_EPOCH_VERSION}:${hex}`;
@@ -120,6 +125,8 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
   // §63 — finalization identity, read only at stage final.
   const finalizationWorld =
     run.stage === "final" ? source.getFinalizationForRun(runId) : null;
+  // Phase 15 §46 — successor baseline lineage (cheap identity read only).
+  const successorBaseline = source.getSuccessorBaseline(runId);
   return deriveContextEpoch({
     runId: run.runId,
     runRevision: run.revision,
@@ -152,5 +159,13 @@ export function deriveContextEpochFromSource(source: ContextSource, runId: strin
           : { id: awaiting.proposalId, revision: awaiting.revision, hash: awaiting.hash },
       finalPlan: finalizationWorld === null ? null : finalizationWorld.finalPlan,
     },
+    successorBaseline:
+      successorBaseline === null
+        ? null
+        : {
+            baselineId: successorBaseline.baselineId,
+            baselineHash: successorBaseline.baselineHash,
+            materialized: successorBaseline.materialized,
+          },
   });
 }

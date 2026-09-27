@@ -63,6 +63,7 @@ import {
 } from "../store/plan-commits.js";
 import { runStateError } from "../store/planning-runs.js";
 import { getActiveSectionInTx, getSectionWorkflowStateInTx } from "../store/section-workflow.js";
+import { getBaselineScopeForSectionInTx } from "../store/successor-baselines.js";
 import {
   clearActiveSectionAfterCompletionInTx,
   propagateDependencyReviewInTx,
@@ -80,6 +81,18 @@ import {
   runCommitTimeFinalizationInTx,
   createFinalizationService,
 } from "./finalization-service.js";
+import { parseFinalPlanCanonical } from "./handoff-service.js";
+import {
+  parseProposalCanonical,
+  PROPOSAL_CANONICAL_V4_VERSION,
+} from "../core/proposal-canonical.js";
+import {
+  getBaselineMaterializationInTx,
+  getPlanningRunBaselineForSuccessorInTx,
+  insertBaselineMaterializationInTx,
+  listBaselineScopesInTx,
+} from "../store/successor-baselines.js";
+import { materializeBaselineRevisionsInTx } from "../store/plan-memory.js";
 import { getFinalPlanInTx, insertFinalPlanInTx } from "../store/finalization.js";
 import {
   getProposalRevisionInTx,
@@ -345,6 +358,17 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
             detail: { proposalId: proposal.proposalId, revision: proposal.revision },
           });
         }
+        // Phase 15 §49 — canonical parse for successor-baseline detection
+        // (V1/V2/V3 goldens flow through unchanged; only V4 has the binding).
+        let canonicalParsed: ReturnType<typeof parseProposalCanonical>;
+        try {
+          canonicalParsed = parseProposalCanonical(JSON.parse(proposal.canonicalJson));
+        } catch (err) {
+          throw new RuntimeError("STORE_SCHEMA_INVALID", "stored proposal canonical is not a parseable canonical", {
+            detail: { proposalId: proposal.proposalId, revision: proposal.revision },
+            cause: err instanceof Error ? err.message : String(err),
+          });
+        }
 
         // 11. HEAD revalidation (§19/§42): a legacy snapshot-only HEAD fails
         // closed; otherwise the current pair must equal the frozen base.
@@ -374,8 +398,95 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           );
         }
 
-        // 12. Dependencies revalidated against the CURRENT head world (§20).
-        const baseRefs: MemoryRef[] = headSnapshotId === null ? [] : (getSnapshotRefsInTx(tx, headSnapshotId) ?? []);
+        // 11.F Phase 15 §49/§51 — the successor-baseline authorization: a V4
+        // proposal carries the exact immutable baseline binding, verified here
+        // against the Store BEFORE anything is written, then the baseline
+        // design is MATERIALIZED into the successor run (byte-identical
+        // carry-forward, §52) inside THIS authorization transaction — never
+        // earlier (§43), never outside a user-authorized PlanCommit (§45).
+        let successorMaterialization: {
+          baselineId: string;
+          manifest: Array<{ kind: MemoryArtifactKind; id: string; revision: number; originRunId: string }>;
+        } | null = null;
+        if (canonicalParsed.version === PROPOSAL_CANONICAL_V4_VERSION) {
+          const binding = canonicalParsed.successorBaseline;
+          const baselineRow = getPlanningRunBaselineForSuccessorInTx(tx, input.runId);
+          if (
+            baselineRow === null ||
+            baselineRow.baselineId !== binding.baselineId ||
+            baselineRow.baselineHash !== binding.baselineHash ||
+            baselineRow.finalPlanId !== binding.finalPlanId ||
+            baselineRow.finalPlanHash !== binding.finalPlanHash ||
+            baselineRow.issueSetHash !== binding.issueSetHash
+          ) {
+            throw new RuntimeError(
+              "SUCCESSOR_BASELINE_STALE",
+              "the proposal's successor-baseline binding does not match the run's immutable baseline",
+              { detail: { runId: input.runId, binding } },
+            );
+          }
+          if (getBaselineMaterializationInTx(tx, baselineRow.baselineId) !== null) {
+            throw new RuntimeError(
+              "SUCCESSOR_BASELINE_MATERIALIZATION_FAILED",
+              "the successor baseline is already materialized; the first PlanCommit happened",
+              { detail: { runId: input.runId, baselineId: baselineRow.baselineId } },
+            );
+          }
+          const predecessorPlanRow = getFinalPlanInTx(tx, baselineRow.predecessorRunId);
+          if (
+            predecessorPlanRow === null ||
+            predecessorPlanRow.finalPlanId !== baselineRow.finalPlanId ||
+            predecessorPlanRow.finalPlanHash !== baselineRow.finalPlanHash
+          ) {
+            throw new RuntimeError(
+              "SUCCESSOR_BASELINE_STALE",
+              "the baseline's predecessor FinalPlan no longer matches its recorded hash",
+              { detail: { runId: input.runId, baselineId: baselineRow.baselineId } },
+            );
+          }
+          const baselinePlan = parseFinalPlanCanonical(predecessorPlanRow.canonicalJson, baselineRow.predecessorRunId);
+          const carryRefs = baselineClosureRefs(baselinePlan);
+          const manifest = materializeBaselineRevisionsInTx(tx, {
+            runId: input.runId,
+            originRunId: baselineRow.predecessorRunId,
+            refs: carryRefs,
+          });
+          // §57 — needs_review baseline sections BEGIN the successor's own
+          // workflow here, as OPEN with honest provenance (no fabricated
+          // completion); inherited_completed sections stay row-less and are
+          // resolved through the effective-state merge (§55/§56/§58).
+          const scopes = listBaselineScopesInTx(tx, baselineRow.baselineId);
+          for (const scope of scopes) {
+            if (scope.scopeState === "needs_review") {
+              registerSectionWorkflowInTx(
+                tx,
+                {
+                  runId: input.runId,
+                  sectionId: scope.sectionId,
+                  reasonCode: "successor_baseline_needs_review",
+                  detail: { baselineId: baselineRow.baselineId, originRevision: scope.originRevision },
+                },
+                clock,
+              );
+            }
+          }
+          successorMaterialization = { baselineId: baselineRow.baselineId, manifest };
+        }
+
+        // 12. Dependencies revalidated against the CURRENT base world (§20) —
+        // the carried baseline closure for an unmaterialized successor's first
+        // commit, the committed HEAD world otherwise.
+        const baseRefs: MemoryRef[] =
+          successorMaterialization !== null
+            ? successorMaterialization.manifest.map((entry) => ({
+                runId: input.runId,
+                kind: entry.kind,
+                id: entry.id,
+                revision: entry.revision,
+              }))
+            : headSnapshotId === null
+              ? []
+              : (getSnapshotRefsInTx(tx, headSnapshotId) ?? []);
         const baseKeys = new Set(baseRefs.map((ref) => `${ref.kind}:${ref.id}:${ref.revision}`));
         for (const dependency of proposal.dependencies) {
           if (!baseKeys.has(`${dependency.kind}:${dependency.id}:${dependency.revision}`)) {
@@ -477,6 +588,29 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
           createdRefs.push(ref);
         }
 
+        // 16.F Phase 15 §58 — an amended baseline section ends its inherited
+        // state: it becomes an ordinary LOCAL workflow section from this
+        // commit on (registered open with honest provenance, same as a fresh
+        // section; completion then follows the normal workflow).
+        if (successorMaterialization !== null) {
+          for (const change of proposal.changes) {
+            if (change.op === "COMPLETE_SECTION" || change.op === "REOPEN_SECTION") continue;
+            if (change.result.kind !== "section") continue;
+            if (changeTarget(change) === null) continue; // brand-new: registered below
+            if (getSectionWorkflowStateInTx(tx, input.runId, change.artifactId) !== null) continue;
+            registerSectionWorkflowInTx(
+              tx,
+              {
+                runId: input.runId,
+                sectionId: change.artifactId,
+                reasonCode: "successor_baseline_section_amended",
+                detail: { proposalId: proposal.proposalId, proposalRevision: proposal.revision },
+              },
+              clock,
+            );
+          }
+        }
+
         // 17. The new immutable Snapshot (exactly one per commit, §48).
         const snapshot: MemorySnapshot = insertSnapshotInTx(tx, { runId: input.runId, refs: simulation.candidateRefs }, clock);
 
@@ -532,6 +666,22 @@ export function createPlanCommitEngine(store: PlanStore, clock: StoreClock): Pla
         // 20. HEAD moves atomically to the new pair (pair triggers enforce
         // resulting-snapshot consistency).
         setHeadPairInTx(tx, { runId: input.runId, headSnapshotId: snapshot.snapshotId, headCommitId: commitId }, clock);
+
+        // 20.F Phase 15 §53 — the unique materialization record, written only
+        // now that the successor's first authorized commit + snapshot exist.
+        // materialized ⟺ such a row exists, forever.
+        if (successorMaterialization !== null) {
+          insertBaselineMaterializationInTx(
+            tx,
+            {
+              baselineId: successorMaterialization.baselineId,
+              materializedCommitId: commitId,
+              materializedSnapshotId: snapshot.snapshotId,
+              originManifestJson: canonicalJsonOfManifest(successorMaterialization.manifest),
+            },
+            clock.nowIso(),
+          );
+        }
 
         // 21. Proposal state → approved.
         const approved = transitionProposalStateInTx(
@@ -1032,6 +1182,10 @@ function gateSectionCompletionInTx(
     }
     // Direct dependencies: exist and completed at exactly their candidate
     // revisions (§32 — DAG legality itself was re-validated by simulation).
+    // Phase 15 §58 — a dependency with NO local workflow row may satisfy the
+    // gate through its inherited_completed baseline scope, but ONLY at the
+    // exact candidate revision (the unchanged imported design); any local row
+    // (open / needs_review / amended completed) decides instead.
     const dependencies = Array.isArray(content.dependencies) ? (content.dependencies as string[]) : [];
     for (const dependencyId of dependencies) {
       const dependencyRevision = candidateSections.get(dependencyId);
@@ -1043,23 +1197,27 @@ function gateSectionCompletionInTx(
         );
       }
       const dependencyState = getSectionWorkflowStateInTx(tx, input.runId, dependencyId);
-      if (
-        dependencyState === null ||
-        dependencyState.status !== "completed" ||
-        dependencyState.completedRevision !== dependencyRevision
-      ) {
-        throw sectionWorkflowError(
-          "SECTION_DEPENDENCY_INCOMPLETE",
-          `dependency '${dependencyId}' of section '${op.artifactId}' is ${dependencyState?.status ?? "unregistered"} at ${String(dependencyState?.completedRevision)}, but the candidate snapshot contains @${dependencyRevision}`,
-          {
-            runId: input.runId,
-            sectionId: op.artifactId,
-            dependencyId,
-            dependencyRevision,
-            dependencyStatus: dependencyState?.status ?? null,
-          },
-        );
+      if (dependencyState !== null) {
+        if (dependencyState.status === "completed" && dependencyState.completedRevision === dependencyRevision) {
+          continue;
+        }
+      } else {
+        const scope = getBaselineScopeForSectionInTx(tx, input.runId, dependencyId);
+        if (scope !== null && scope.scopeState === "inherited_completed" && scope.originRevision === dependencyRevision) {
+          continue;
+        }
       }
+      throw sectionWorkflowError(
+        "SECTION_DEPENDENCY_INCOMPLETE",
+        `dependency '${dependencyId}' of section '${op.artifactId}' is ${dependencyState?.status ?? "unregistered"} at ${String(dependencyState?.completedRevision)}, but the candidate snapshot contains @${dependencyRevision}`,
+        {
+          runId: input.runId,
+          sectionId: op.artifactId,
+          dependencyId,
+          dependencyRevision,
+          dependencyStatus: dependencyState?.status ?? null,
+        },
+      );
     }
     // Target-scoped blocking conditions (§32) — typed scope fields only.
     for (const ref of input.candidateRefs) {
@@ -1093,4 +1251,33 @@ function gateSectionCompletionInTx(
 /** Re-derive the sha256 hash over stored canonical text (§23). */
 function sha256OfCanonical(canonicalJsonText: string): string {
   return `sha256:${createHash("sha256").update(canonicalJsonText, "utf8").digest("hex")}`;
+}
+
+/** The exact FinalPlan closure refs of a predecessor design (§51 carry set). */
+function baselineClosureRefs(plan: FinalPlanV1): Array<{ kind: MemoryArtifactKind; id: string; revision: number }> {
+  const refs: Array<{ kind: MemoryArtifactKind; id: string; revision: number }> = [];
+  if (plan.architecture !== null) {
+    refs.push({ kind: "architecture", id: plan.architecture.id, revision: plan.architecture.revision });
+  }
+  for (const section of plan.sections) {
+    refs.push({ kind: "section", id: section.sectionId, revision: section.revision });
+  }
+  for (const decision of plan.decisions) {
+    refs.push({ kind: "decision", id: decision.id, revision: decision.revision });
+  }
+  for (const constraint of plan.constraints) {
+    refs.push({ kind: "constraint", id: constraint.id, revision: constraint.revision });
+  }
+  return refs;
+}
+
+/** Deterministic origin manifest JSON for the materialization record (§52). */
+function canonicalJsonOfManifest(
+  manifest: Array<{ kind: MemoryArtifactKind; id: string; revision: number; originRunId: string }>,
+): string {
+  return JSON.stringify(
+    [...manifest].sort(
+      (a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id) || a.revision - b.revision,
+    ),
+  );
 }

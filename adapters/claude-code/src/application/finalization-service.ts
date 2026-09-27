@@ -51,6 +51,7 @@ import { getHeadPairInTx } from "../store/plan-commits.js";
 import { getSnapshotRefsInTx } from "../store/plan-memory.js";
 import { runStateError } from "../store/planning-runs.js";
 import { getActiveSectionInTx, listSectionWorkflowStatesInTx } from "../store/section-workflow.js";
+import { getBaselineScopeForSectionInTx } from "../store/successor-baselines.js";
 import {
   appendValidationEventInTx,
   getCurrentStateInTx,
@@ -558,6 +559,10 @@ export function buildFinalizationFactsInTx(
       : null;
 
   // §21 — current Sections joined to workflow state.
+  // Phase 15 §56/§58 — sections with no local workflow row resolve through
+  // the successor baseline scope: inherited_completed at the exact HEAD
+  // revision satisfies the completion gate; needs_review blocks. A local row
+  // always wins (once amended, inheritance ceases).
   const workflowStates = new Map(
     listSectionWorkflowStatesInTx(tx, input.runId).map((state) => [state.sectionId, state]),
   );
@@ -565,11 +570,28 @@ export function buildFinalizationFactsInTx(
     .filter((ref) => ref.kind === "section")
     .map((ref) => {
       const state = workflowStates.get(ref.id);
+      if (state !== undefined) {
+        return {
+          sectionId: ref.id,
+          revision: ref.revision,
+          status: state.status,
+          completedRevision: state.completedRevision ?? null,
+        };
+      }
+      const scope = getBaselineScopeForSectionInTx(tx, input.runId, ref.id);
+      if (scope !== null && scope.scopeState === "inherited_completed" && scope.originRevision === ref.revision) {
+        return {
+          sectionId: ref.id,
+          revision: ref.revision,
+          status: "completed" as const,
+          completedRevision: scope.originRevision,
+        };
+      }
       return {
         sectionId: ref.id,
         revision: ref.revision,
-        status: state?.status ?? ("open" as const),
-        completedRevision: state?.completedRevision ?? null,
+        status: scope?.scopeState === "needs_review" ? ("needs_review" as const) : ("open" as const),
+        completedRevision: null,
       };
     })
     .sort((a, b) => a.sectionId.localeCompare(b.sectionId));

@@ -26,6 +26,7 @@ import { RuntimeError } from "../runtime/errors.js";
 import { runStateError } from "../store/planning-runs.js";
 import { getHeadPairInTx } from "../store/plan-commits.js";
 import { getSnapshotRefsInTx } from "../store/plan-memory.js";
+import { getBaselineScopeForSectionInTx } from "../store/successor-baselines.js";
 import { assertWritableBindingInTx } from "../store/session-bindings.js";
 import {
   appendSectionWorkflowEventInTx,
@@ -129,9 +130,25 @@ export function createSectionWorkflowService(store: PlanStore, clock: StoreClock
         }
         // §11 — the exact Section identity must exist in the CURRENT HEAD
         // snapshot; the active-work row stores the id only, never content.
+        // Phase 15 §35/§65 — an UNMATERIALIZED successor run has no HEAD yet;
+        // selection is then bounded to the baseline's needs_review scope (the
+        // reopened sections the successor must actually rework). An
+        // inherited_completed section becomes selectable only after the first
+        // commit materializes it (or amends it into local workflow).
         const head = getHeadPairInTx(tx, input.runId);
         const headRefs: MemoryRef[] = head === null ? [] : (getSnapshotRefsInTx(tx, head.headSnapshotId) ?? []);
-        const sectionRef = headRefs.find((ref) => ref.kind === "section" && ref.id === input.sectionId);
+        let sectionRef = headRefs.find((ref) => ref.kind === "section" && ref.id === input.sectionId);
+        if (sectionRef === undefined && head === null) {
+          const scope = getBaselineScopeForSectionInTx(tx, input.runId, input.sectionId);
+          if (scope !== null && scope.scopeState === "needs_review") {
+            sectionRef = {
+              runId: input.runId,
+              kind: "section",
+              id: input.sectionId,
+              revision: scope.originRevision,
+            };
+          }
+        }
         if (sectionRef === undefined) {
           throw sectionWorkflowError(
             "SECTION_NOT_FOUND",
@@ -407,7 +424,19 @@ export function evaluateDetailCompletionInTx(tx: StoreTx, runId: string, headSec
   for (const ref of headSections) {
     const state = byId.get(ref.id);
     if (state === undefined) {
-      blockers.push(`section '${ref.id}' has no workflow state`);
+      // Phase 15 §56/§58 — no local workflow row: the effective state falls
+      // back to the baseline scope. inherited_completed satisfies the gate
+      // ONLY at the exact origin revision (the unchanged imported design);
+      // any other scope state (or a revision drift) blocks.
+      const scope = getBaselineScopeForSectionInTx(tx, runId, ref.id);
+      if (scope !== null && scope.scopeState === "inherited_completed" && scope.originRevision === ref.revision) {
+        continue;
+      }
+      blockers.push(
+        scope !== null
+          ? `section '${ref.id}' is ${scope.scopeState} in the baseline (reopened scope)`
+          : `section '${ref.id}' has no workflow state`,
+      );
       continue;
     }
     if (state.status === "needs_review") {

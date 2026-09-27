@@ -257,6 +257,41 @@ export function blockingSegment(context: PhasePlanContext): CapsuleSegment {
   return { name: "blocking conditions", required: true, text: lines.join("\n") };
 }
 
+/**
+ * Phase 15 §47 — the successor recovery lines (§102): the Recovery Capsule
+ * and the structured context alone must reconstruct WHERE the successor
+ * stands — new run id, the immutable predecessor FinalPlan anchor, the adopted
+ * ExecutionIssues, the reopened scope, and whether the baseline is materialized
+ * yet. The capsule can never rely on the Build conversation to remember why
+ * this run exists.
+ */
+export function successorBaselineSegment(context: PhasePlanContext): CapsuleSegment {
+  const successor = context.successorBaseline;
+  if (successor === null) {
+    return { name: "successor baseline", required: false, text: "Successor baseline: (not a successor run)" };
+  }
+  const issues = successor.issueSummaries.length
+    ? successor.issueSummaries.map((issue) => `- ${issue.issueId} (${issue.kind}): ${issue.summary}`)
+    : ["- (none recorded)"];
+  return {
+    name: "successor baseline",
+    required: true,
+    text: [
+      "Successor baseline:",
+      indent([
+        `Successor PlanningRun: ${context.run.runId} (${context.run.stage}, revision ${context.run.revision})`,
+        `Baseline FinalPlan: ${successor.finalPlan.id} (${successor.finalPlan.hash})`,
+        `Predecessor run: ${successor.predecessorRunId} (completed, immutable)`,
+        `Execution issues adopted: ${successor.issueSummaries.length} (issue set ${successor.issueSetHash})`,
+        indent(issues),
+        `Reopened scope: needs_review=[${successor.needsReviewSections.join(", ") || "none"}]`,
+        `Inherited completed: [${successor.inheritedCompletedSections.join(", ") || "none"}]`,
+        `Baseline materialized: ${successor.materialized ? "yes" : "no"}`,
+      ]),
+    ].join("\n"),
+  };
+}
+
 export function awaitingProposalSegment(context: PhasePlanContext): CapsuleSegment {
   const proposal = context.working.awaitingProposal;
   if (proposal === null) {

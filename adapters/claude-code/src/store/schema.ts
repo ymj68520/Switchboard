@@ -11,6 +11,8 @@ import type { StoreConnection } from "./connection.js";
 import { storeError } from "./errors.js";
 import type { StoreTx } from "./transaction.js";
 import { executionHandoffHash, type ExecutionHandoffV1 } from "../core/execution-handoff.js";
+import { executionIssueHash, type ExecutionIssueV1 } from "../core/execution-issue.js";
+import { planningRunBaselineHash, type PlanningRunBaselineV1 } from "../core/successor-baseline.js";
 
 /** Read the authoritative schema version (live read, never cached). */
 export function readSchemaVersion(db: StoreConnection | StoreTx): number {
@@ -284,6 +286,44 @@ const SCHEMA_V11_INDEXES = [
   "idx_execution_handoff_events_handoff",
   "idx_execution_bindings_active_session",
   "idx_execution_bindings_session",
+] as const;
+
+/** ExecutionIssue + successor baseline tables required at schema v12 (Phase 15 §5). */
+const SCHEMA_V12_TABLES = [
+  "execution_issues",
+  "execution_issue_refs",
+  "execution_issue_adoptions",
+  "planning_run_baselines",
+  "planning_run_baseline_issues",
+  "planning_run_baseline_scopes",
+  "planning_run_baseline_materializations",
+] as const;
+
+/** Immutability triggers required at schema v12: the ENTIRE v12 domain is
+ * append-only history (§4/§7/§17/§26/§31/§53) — no mutable table exists. */
+const SCHEMA_V12_TRIGGERS = [
+  "execution_issues_no_update",
+  "execution_issues_no_delete",
+  "execution_issue_refs_no_update",
+  "execution_issue_refs_no_delete",
+  "execution_issue_adoptions_no_update",
+  "execution_issue_adoptions_no_delete",
+  "planning_run_baselines_no_update",
+  "planning_run_baselines_no_delete",
+  "planning_run_baseline_issues_no_update",
+  "planning_run_baseline_issues_no_delete",
+  "planning_run_baseline_scopes_no_update",
+  "planning_run_baseline_scopes_no_delete",
+  "planning_run_baseline_materializations_no_update",
+  "planning_run_baseline_materializations_no_delete",
+] as const;
+
+/** Constraint indexes backing the v12 issue/baseline lookups. */
+const SCHEMA_V12_INDEXES = [
+  "idx_execution_issue_refs_issue",
+  "idx_execution_issue_adoptions_successor",
+  "idx_planning_run_baseline_issues_baseline",
+  "idx_planning_run_baseline_scopes_state",
 ] as const;
 
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
@@ -1142,6 +1182,148 @@ function validateSchemaV11(db: StoreConnection | StoreTx, problems: string[]): v
 }
 
 /**
+ * Structural + data checks for schema v12 (Phase 15 §5/§83/§E67): the
+ * execution-issue / successor-baseline tables and immutability triggers
+ * exist; an issue binds its run's exact approved FinalPlan and delivered
+ * handoff and its stored hash matches the canonical payload; an adoption
+ * points at a real baseline of the same successor; a baseline binds the
+ * predecessor's exact FinalPlan hash, delivered handoff hash, and issue-set
+ * hash, and its scope rows name exact predecessor FinalPlan sections; a
+ * materialization row belongs to its successor's own commit chain. Legacy
+ * runs are verified UNTOUCHED: no v12 row may exist without its Phase-14
+ * execution world. Store open never re-derives scopes (§83) — only these
+ * bounded identity facts.
+ */
+function validateSchemaV12(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V12_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 12`);
+    }
+  }
+  for (const trigger of SCHEMA_V12_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 12`);
+    }
+  }
+  for (const index of SCHEMA_V12_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 12`);
+    }
+  }
+  if (SCHEMA_V12_TABLES.some((table) => !objectNames.has(table))) {
+    return;
+  }
+  const baseWorldPresent = objectNames.has("final_plans") && objectNames.has("execution_handoffs") && objectNames.has("plan_commits");
+  if (!baseWorldPresent) {
+    return;
+  }
+  // An issue must bind its run's exact approved FinalPlan and its delivered
+  // handoff (§E3), and the stored hash must match the canonical payload (§8).
+  const issueBindingDrift = db
+    .prepare(
+      "SELECT i.run_id AS runId, i.issue_id AS issueId FROM execution_issues i "
+      + "LEFT JOIN final_plans f ON f.run_id = i.run_id AND f.final_plan_id = i.final_plan_id AND f.final_plan_hash = i.final_plan_hash "
+      + "LEFT JOIN execution_handoffs h ON h.run_id = i.run_id AND h.handoff_id = i.handoff_id AND h.handoff_hash = i.handoff_hash "
+      + "WHERE f.final_plan_id IS NULL OR h.handoff_id IS NULL LIMIT 1",
+    )
+    .get() as { runId?: string; issueId?: string } | undefined;
+  if (issueBindingDrift !== undefined) {
+    problems.push(
+      `execution issue '${issueBindingDrift.issueId}' in run '${issueBindingDrift.runId}' does not bind its run's approved FinalPlan and delivered handoff`,
+    );
+  }
+  const issueRows = db
+    .prepare("SELECT run_id AS runId, issue_id AS issueId, canonical_json AS canonicalJson, issue_hash AS issueHash FROM execution_issues")
+    .all() as Array<{ runId: string; issueId: string; canonicalJson: string; issueHash: string }>;
+  for (const row of issueRows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.canonicalJson);
+    } catch {
+      problems.push(`execution issue '${row.issueId}' in run '${row.runId}' has unparsable canonical payload`);
+      continue;
+    }
+    if (parsed === null || typeof parsed !== "object" || executionIssueHash(parsed as ExecutionIssueV1) !== row.issueHash) {
+      problems.push(`execution issue '${row.issueId}' in run '${row.runId}' hash does not match its canonical payload`);
+    }
+  }
+  // An adoption must point at the baseline that adopted the issue, in the
+  // same successor run (§17/§74).
+  const adoptionDrift = db
+    .prepare(
+      "SELECT a.issue_id AS issueId FROM execution_issue_adoptions a "
+      + "LEFT JOIN planning_run_baselines b ON b.baseline_id = a.baseline_id AND b.successor_run_id = a.successor_run_id "
+      + "WHERE b.baseline_id IS NULL LIMIT 1",
+    )
+    .get() as { issueId?: string } | undefined;
+  if (adoptionDrift !== undefined) {
+    problems.push(`execution issue adoption '${adoptionDrift.issueId}' does not point at its successor's baseline`);
+  }
+  // A baseline must bind its predecessor's exact FinalPlan hash and delivered
+  // handoff hash (§E21/§E19).
+  const baselineBindingDrift = db
+    .prepare(
+      "SELECT b.baseline_id AS baselineId FROM planning_run_baselines b "
+      + "LEFT JOIN final_plans f ON f.run_id = b.predecessor_run_id AND f.final_plan_id = b.final_plan_id AND f.final_plan_hash = b.final_plan_hash "
+      + "LEFT JOIN execution_handoffs h ON h.run_id = b.predecessor_run_id AND h.handoff_id = b.execution_handoff_id AND h.handoff_hash = b.execution_handoff_hash "
+      + "WHERE f.final_plan_id IS NULL OR h.handoff_id IS NULL LIMIT 1",
+    )
+    .get() as { baselineId?: string } | undefined;
+  if (baselineBindingDrift !== undefined) {
+    problems.push(`planning run baseline '${baselineBindingDrift.baselineId}' does not bind its predecessor's FinalPlan and handoff`);
+  }
+  // The stored baseline hash must match the canonical payload (§E20).
+  const baselineRows = db
+    .prepare(
+      "SELECT baseline_id AS baselineId, canonical_json AS canonicalJson, baseline_hash AS baselineHash, successor_run_id AS successorRunId FROM planning_run_baselines",
+    )
+    .all() as Array<{ baselineId: string; canonicalJson: string; baselineHash: string; successorRunId: string }>;
+  for (const row of baselineRows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.canonicalJson);
+    } catch {
+      problems.push(`planning run baseline '${row.baselineId}' has unparsable canonical payload`);
+      continue;
+    }
+    if (
+      parsed === null
+      || typeof parsed !== "object"
+      || planningRunBaselineHash(parsed as PlanningRunBaselineV1) !== row.baselineHash
+    ) {
+      problems.push(`planning run baseline '${row.baselineId}' hash does not match its canonical payload`);
+    }
+    // The successor run must exist and the baseline must be its only one
+    // (UNIQUE(successor_run_id) enforces cardinality; probe run existence).
+    const run = db
+      .prepare("SELECT 1 AS one FROM planning_runs WHERE run_id = ?")
+      .get(row.successorRunId) as { one?: number } | undefined;
+    if (run === undefined) {
+      problems.push(`planning run baseline '${row.baselineId}' names a missing successor run`);
+    }
+  }
+  // A materialization must belong to its successor's own commit chain (§53).
+  const materializationDrift = db
+    .prepare(
+      "SELECT m.baseline_id AS baselineId FROM planning_run_baseline_materializations m "
+      + "JOIN planning_run_baselines b ON b.baseline_id = m.baseline_id "
+      + "LEFT JOIN plan_commits c ON c.commit_id = m.materialized_commit_id AND c.run_id = b.successor_run_id "
+      + "WHERE c.commit_id IS NULL LIMIT 1",
+    )
+    .get() as { baselineId?: string } | undefined;
+  if (materializationDrift !== undefined) {
+    problems.push(`baseline materialization '${materializationDrift.baselineId}' does not point at its successor's commit`);
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -1204,6 +1386,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 11) {
     validateSchemaV11(db, problems);
+  }
+  if (version >= 12) {
+    validateSchemaV12(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

@@ -43,7 +43,7 @@
 
 import { getWorkspaceById } from "../store/repositories.js";
 import { getAwaitingProposalRecord } from "../store/proposals.js";
-import { getHeadCommitRecord } from "../store/plan-commits.js";
+import { getHeadCommitRecord, getHeadPairInTx } from "../store/plan-commits.js";
 import { getPlanningRunRecord, listPlanningRunsForWorkspaceRecord } from "../store/planning-runs.js";
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import { createSectionWorkflowService } from "../application/section-workflow-service.js";
@@ -53,6 +53,22 @@ import { getFinalPlanInTx } from "../store/finalization.js";
 import { renderFinalPlanCandidateMarkdown } from "../core/finalization.js";
 import { renderExecutionContract, type ExecutionHandoffV1 } from "../core/execution-handoff.js";
 import { createHandoffService, parseFinalPlanCanonical } from "../application/handoff-service.js";
+import { createExecutionIssueService } from "../application/execution-issue-service.js";
+import { createSuccessorRunService } from "../application/successor-run-service.js";
+import { listOpenExecutionIssuesInTx } from "../store/execution-issues.js";
+import {
+  getPlanningRunBaselineForSuccessorInTx,
+  listBaselineScopesInTx,
+  getBaselineMaterializationInTx,
+} from "../store/successor-baselines.js";
+import {
+  EXECUTION_ISSUE_KINDS,
+  EXECUTION_ISSUE_REF_TYPES,
+  isExecutionIssueKind,
+  isExecutionIssueRefType,
+  type ExecutionIssueAffectedRef,
+  type ExecutionIssueKind,
+} from "../core/execution-issue.js";
 import { getExecutionHandoffInTx, getExecutionHandoffStateInTx, findAttachedExecutionBindingForSessionInTx } from "../store/execution.js";
 import { assertExecutionHostContextForTool, parseSignedHostContext, type ExecutionHostContextV1 } from "../host/execution-context.js";
 import { assertWritableBindingInTx } from "../store/session-bindings.js";
@@ -493,6 +509,54 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "report_execution_issue",
+    description:
+      "During Build only: record that continuing implementation would require changing APPROVED planning semantics "
+      + "(hard constraint, invariant, approved interface, SectionContract, Decision, explicit dependency, architecture "
+      + "choice, critical repository assumption, missing design obligation). The issue is immutable and binds exact "
+      + "FinalPlan refs (id@revision). Reporting pauses repository mutation until the user explicitly re-enters "
+      + "planning via /phase-plan. Not a bug report and not design authorization.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          enum: [
+            "hard_constraint",
+            "invariant",
+            "approved_interface",
+            "section_contract",
+            "approved_decision",
+            "explicit_dependency",
+            "architecture_choice",
+            "critical_repository_assumption",
+            "missing_design_obligation",
+          ],
+        },
+        summary: { type: "string", description: "One-line statement of the semantic conflict." },
+        detail: { type: "string", description: "What was discovered, why implementation-as-approved cannot continue." },
+        affected_refs: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["architecture", "section", "section_contract", "decision", "constraint"] },
+              id: { type: "string" },
+              revision: { type: "integer", minimum: 1 },
+            },
+            required: ["type", "id", "revision"],
+            additionalProperties: false,
+          },
+          description: "EXACT approved FinalPlan closure refs (SEC-A@4, never SEC-A or SEC-A@3).",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["kind", "summary", "detail", "affected_refs", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function inputInvalid(message: string, cause?: string): RuntimeError {
@@ -569,16 +633,71 @@ export function handleStartOrResume(ctx: PhasePlanToolContext, rawArgs: Record<s
     throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
   }
 
-  // §83 — a Build-bound session cannot silently start an unbaselined new
-  // PlanningRun (ExecutionIssue/subsequent-run baseline is Phase 15). Other
-  // sessions in this workspace are unaffected (§84 — never a workspace lock).
+  // §22/§23 — a Build-bound session with at least one open ExecutionIssue and
+  // a fresh /phase-plan EntryIntent creates the SUCCESSOR PlanningRun from the
+  // immutable FinalPlan baseline. Without an open issue the Phase 14 wall
+  // stands: no silently "baselined on nothing" successor. Other sessions in
+  // this workspace are unaffected (§84 — never a workspace lock).
   const execBound = ctx.store.withRead((tx) => findAttachedExecutionBindingForSessionInTx(tx, envelope.sessionId));
   if (execBound !== null) {
-    throw new RuntimeError(
-      "EXECUTION_REPLAN_NOT_AVAILABLE",
-      "this session is bound to a delivered execution contract; replanning from a completed FinalPlan is not available",
-      { detail: { finalPlanId: execBound.finalPlanId } },
-    );
+    // §24 — explicit user intent first: even the successor path requires the
+    // fresh signed EntryIntent from this session's /phase-plan expansion.
+    verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });
+    const successors = createSuccessorRunService(ctx.store, ctx.clock);
+    const classified = successors.classifySuccessorEntry(envelope.workspaceId, envelope.sessionId);
+    if (classified.successorRunId !== null) {
+      throw new RuntimeError(
+        "SUCCESSOR_RUN_ALREADY_STARTED",
+        "the successor PlanningRun for this delivered contract already exists; resume it with the successor session binding",
+        { detail: { successorRunId: classified.successorRunId } },
+      );
+    }
+    if (classified.openIssues === 0) {
+      throw new RuntimeError(
+        "EXECUTION_ISSUE_REQUIRED",
+        "this session is bound to a delivered execution contract; report an ExecutionIssue "
+          + "(phase_plan.report_execution_issue) before /phase-plan can create a successor run",
+        { detail: { finalPlanId: execBound.finalPlanId } },
+      );
+    }
+    const created = successors.createSuccessor({
+      workspaceId: envelope.workspaceId,
+      sessionId: envelope.sessionId,
+    });
+    return {
+      status: "started_successor",
+      started: true,
+      run: runView(created.successorRun),
+      binding: created.planningBinding,
+      initialStage: created.initialStage,
+      baseline: {
+        baseline_id: created.baseline.baselineId,
+        baseline_hash: created.baseline.baselineHash,
+        issue_set_hash: created.baseline.issueSetHash,
+        predecessor_run_id: created.baseline.predecessorRunId,
+        final_plan: {
+          id: created.baseline.finalPlanId,
+          hash: created.baseline.finalPlanHash,
+        },
+        repository_at_replan_start: created.baseline.repositoryAtReplanStart,
+      },
+      executionIssues: created.adoptedIssues.map((issue) => ({
+        issue_id: issue.issueId,
+        issue_hash: issue.issueHash,
+        kind: issue.kind,
+        affected_refs: issue.affectedRefs,
+      })),
+      affectedScope: {
+        stage: created.affectedScope.initialStage,
+        needsReviewSections: created.affectedScope.needsReviewSections,
+        inheritedCompletedSections: created.affectedScope.inheritedCompletedSections,
+      },
+      predecessorExecutionBinding: created.predecessorExecutionBinding,
+      // §25/§70 — the old run is NOT resumed: it stays completed forever.
+      next:
+        "successor PlanningRun started from the immutable baseline; the predecessor run remains completed. "
+        + "Re-opened scope is needs_review — select an affected section or prepare the first baseline-bound proposal.",
+    };
   }
 
   verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });
@@ -786,6 +905,44 @@ export function handleGetState(ctx: PhasePlanToolContext, rawArgs: Record<string
           })(),
         }
       : {}),
+    // Phase 15 §78 — the successor projection: baseline lineage, adopted
+    // issue count, materialization state, and the Core-derived scope.
+    ...(() => {
+      const currentRunId = preferred.run.runId;
+      const currentStage = preferred.run.stage;
+      const successorView = ctx.store.withRead((tx) => {
+        const baseline = getPlanningRunBaselineForSuccessorInTx(tx, currentRunId);
+        if (baseline === null) return null;
+        const materialization = getBaselineMaterializationInTx(tx, baseline.baselineId);
+        const scopes = listBaselineScopesInTx(tx, baseline.baselineId);
+        return {
+          predecessorFinalPlan: { id: baseline.finalPlanId, hash: baseline.finalPlanHash },
+          predecessorRunId: baseline.predecessorRunId,
+          baselineHash: baseline.baselineHash,
+          issueCount: tx
+            .prepare("SELECT COUNT(*) AS n FROM planning_run_baseline_issues WHERE baseline_id = ?")
+            .get(baseline.baselineId) as { n: number },
+          materialized: materialization !== null,
+          initialStage: currentStage === "architecture" || currentStage === "detail" ? currentStage : currentStage,
+          affectedScope: {
+            needsReviewSections: scopes.filter((scope) => scope.scopeState === "needs_review").map((scope) => scope.sectionId),
+            inheritedCompletedSections: scopes.filter((scope) => scope.scopeState === "inherited_completed").map((scope) => scope.sectionId),
+          },
+        };
+      });
+      if (successorView === null) return {};
+      return {
+        successor: {
+          predecessorFinalPlan: successorView.predecessorFinalPlan,
+          predecessorRunId: successorView.predecessorRunId,
+          baselineHash: successorView.baselineHash,
+          issueCount: successorView.issueCount.n,
+          materialized: successorView.materialized,
+          initialStage: successorView.initialStage,
+          affectedScope: successorView.affectedScope,
+        },
+      };
+    })(),
   };
 }
 
@@ -980,6 +1137,49 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
     status: "ok",
     context_epoch: context.epoch,
     context,
+    // Phase 15 §79 — the successor view: baseline FinalPlan, issue summaries,
+    // the Core-derived affected scope, the repository at replan start, and the
+    // local HEAD once materialized. Never a dump of predecessor history.
+    ...(() => {
+      const successorRunId = preferred.run.runId;
+      const successorView = ctx.store.withRead((tx) => {
+        const baseline = getPlanningRunBaselineForSuccessorInTx(tx, successorRunId);
+        if (baseline === null) return null;
+        const scopes = listBaselineScopesInTx(tx, baseline.baselineId);
+        const issueRows = tx
+          .prepare(
+            "SELECT i.issue_id AS issueId, i.kind AS kind, i.summary AS summary FROM planning_run_baseline_issues bi "
+            + "JOIN execution_issues i ON i.issue_id = bi.issue_id "
+            + "WHERE bi.baseline_id = ? ORDER BY bi.position",
+          )
+          .all(baseline.baselineId) as Array<{ issueId: string; kind: string; summary: string }>;
+        const materialization = getBaselineMaterializationInTx(tx, baseline.baselineId);
+        const head = getHeadPairInTx(tx, successorRunId);
+        return {
+          baseline: {
+            baseline_id: baseline.baselineId,
+            baseline_hash: baseline.baselineHash,
+            issue_set_hash: baseline.issueSetHash,
+            finalPlan: { id: baseline.finalPlanId, hash: baseline.finalPlanHash },
+            predecessorRunId: baseline.predecessorRunId,
+            executionHandoff: { id: baseline.executionHandoffId, hash: baseline.executionHandoffHash },
+            repositoryAtReplanStart:
+              baseline.repositoryKind === "git"
+                ? ({ kind: "git", revision: baseline.repositoryRevision } as const)
+                : ({ kind: "directory", revision: null } as const),
+          },
+          executionIssues: issueRows.map((issue) => ({ issue_id: issue.issueId, kind: issue.kind, summary: issue.summary })),
+          affectedScope: {
+            needsReviewSections: scopes.filter((scope) => scope.scopeState === "needs_review").map((scope) => scope.sectionId),
+            inheritedCompletedSections: scopes.filter((scope) => scope.scopeState === "inherited_completed").map((scope) => scope.sectionId),
+          },
+          materialized: materialization !== null,
+          localHead: head === null ? null : { snapshotId: head.headSnapshotId, commitId: head.headCommitId },
+        };
+      });
+      if (successorView === null) return {};
+      return { successor: successorView };
+    })(),
     ...(detail === "recovery" ? { recoveryCapsule: buildRecoveryCapsule(context).text } : {}),
   };
 }
@@ -1030,6 +1230,80 @@ export function handleReadMemory(ctx: PhasePlanToolContext, rawArgs: Record<stri
   const ref: MemoryRef = { runId: preferred.run.runId, kind: rawArgs.kind, id: rawArgs.id, revision: rawArgs.revision };
   const view = createStoreContextSource(ctx.store).readRevision(ref);
   if (view === null) {
+    // Phase 15 §44/§45 — before the first successor PlanCommit the baseline
+    // FinalPlan design is readable READ-ONLY from the predecessor world under
+    // authority="successor_baseline": exact FinalPlan-closure refs only, and
+    // historical superseded revisions never resolve (§45).
+    const baselineView = ctx.store.withRead((tx) => {
+      const baseline = getPlanningRunBaselineForSuccessorInTx(tx, ref.runId);
+      if (baseline === null) return { outcome: "none" as const };
+      if (getBaselineMaterializationInTx(tx, baseline.baselineId) !== null) {
+        // Materialized: local HEAD is the authority; a miss is a plain miss.
+        return { outcome: "none" as const };
+      }
+      const plan = parseFinalPlanCanonical(
+        (tx
+          .prepare(
+            "SELECT canonical_json AS canonicalJson FROM final_plans WHERE run_id = ? AND final_plan_id = ?",
+          )
+          .get(baseline.predecessorRunId, baseline.finalPlanId) as { canonicalJson: string } | undefined)
+          ?.canonicalJson ?? "null",
+        baseline.predecessorRunId,
+      );
+      try {
+        createHandoffService(ctx.store, ctx.clock).assertExecutionMemoryRefInTx(plan, {
+          kind: ref.kind,
+          id: ref.id,
+          revision: ref.revision,
+        });
+      } catch {
+        return { outcome: "unauthorized" as const };
+      }
+      return {
+        outcome: "ok" as const,
+        predecessorRunId: baseline.predecessorRunId,
+        baselineHash: baseline.baselineHash,
+        baselineId: baseline.baselineId,
+      };
+    });
+    if (baselineView.outcome === "ok") {
+      const predecessorView = createStoreContextSource(ctx.store).readRevision({
+        runId: baselineView.predecessorRunId,
+        kind: ref.kind,
+        id: ref.id,
+        revision: ref.revision,
+      });
+      if (predecessorView !== null) {
+        const refView = { runId: baselineView.predecessorRunId, kind: ref.kind, id: ref.id, revision: ref.revision };
+        switch (detail) {
+          case "identity":
+            return { status: "ok", authority: "successor_baseline", baseline: { baseline_id: baselineView.baselineId, baseline_hash: baselineView.baselineHash }, ref: refView };
+          case "summary":
+            return { status: "ok", authority: "successor_baseline", baseline: { baseline_id: baselineView.baselineId, baseline_hash: baselineView.baselineHash }, ref: refView, compactProjection: predecessorView.compactProjection };
+          case "contract":
+            if (ref.kind !== "section") {
+              throw domainError("CAPABILITY_NOT_AVAILABLE", `detail="contract" is only available for section artifacts (requested ${ref.kind})`);
+            }
+            return { status: "ok", authority: "successor_baseline", baseline: { baseline_id: baselineView.baselineId, baseline_hash: baselineView.baselineHash }, ref: refView, contract: predecessorView.contractJson === null ? null : JSON.parse(predecessorView.contractJson) };
+          default:
+            return {
+              status: "ok",
+              authority: "successor_baseline",
+              baseline: { baseline_id: baselineView.baselineId, baseline_hash: baselineView.baselineHash },
+              ref: refView,
+              content: predecessorView.content,
+              compactProjection: predecessorView.compactProjection,
+              ...(predecessorView.contractJson === null ? {} : { contract: JSON.parse(predecessorView.contractJson) }),
+            };
+        }
+      }
+    }
+    if (baselineView.outcome === "unauthorized") {
+      throw domainError(
+        "BASELINE_MEMORY_REF_NOT_AUTHORIZED",
+        `${ref.kind} '${ref.id}'@${ref.revision} is not an exact ref of the baseline FinalPlan closure`,
+      );
+    }
     // The ref's run component comes from the signed session scope, so a miss
     // is a plain exact-revision miss — cross-run reads cannot reach here.
     throw domainError(
@@ -1781,6 +2055,8 @@ function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostConte
       generation: exec.executionBindingGeneration,
     });
     const handoff = JSON.parse(authority.handoff.canonicalJson) as ExecutionHandoffV1;
+    // Phase 15 §19 — the open-issue projection over the delivered contract.
+    const openIssues = listOpenExecutionIssuesInTx(tx, exec.runId);
     return {
       authority: "execution",
       run: { id: authority.run.runId, lifecycle: authority.run.lifecycle, stage: authority.run.stage },
@@ -1796,6 +2072,10 @@ function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostConte
       },
       executionBinding: { generation: authority.binding.generation, state: authority.binding.state },
       repositoryBaseline: handoff.repositoryBaseline,
+      executionIssues: {
+        openCount: openIssues.length,
+        replanRequired: openIssues.length > 0,
+      },
     };
   });
 }
@@ -1812,6 +2092,16 @@ function executionBuildContext(ctx: PhasePlanToolContext, exec: ExecutionHostCon
     throw domainError("EXECUTION_CONTEXT_NOT_AVAILABLE", "the execution handoff row is missing");
   }
   const canonical = state as Record<string, unknown>;
+  // Phase 15 §19 — the compact open-issue list; full detail stays opt-in via
+  // read tools, never a default injection.
+  const compactIssues = ctx.store.withRead((tx) => listOpenExecutionIssuesInTx(tx, exec.runId)).map((issue) => {
+    const parsed = JSON.parse(issue.canonicalJson) as { kind: string };
+    return {
+      issue_id: issue.issueId,
+      kind: parsed.kind,
+      summary: issue.summary,
+    };
+  });
   return {
     ...canonical,
     handoff: {
@@ -1819,6 +2109,7 @@ function executionBuildContext(ctx: PhasePlanToolContext, exec: ExecutionHostCon
       hash: canonical.executionHandoff ? (canonical.executionHandoff as Record<string, unknown>).hash : undefined,
       canonical: handoff,
     },
+    openExecutionIssues: compactIssues,
     executionContract: renderExecutionContract(handoff, {
       handoffId: ((canonical.executionHandoff as Record<string, unknown>).id) as string,
       handoffHash: ((canonical.executionHandoff as Record<string, unknown>).hash) as string,
@@ -1987,6 +2278,94 @@ export function handleHandoff(ctx: PhasePlanToolContext, rawArgs: Record<string,
 }
 
 // ---------------------------------------------------------------------------
+// report_execution_issue (Phase 15 §12–§15) — the 16th tool: Build's sole
+// defect report against the delivered contract
+// ---------------------------------------------------------------------------
+
+export function handleReportExecutionIssue(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  // §12 — the model supplies ONLY kind/summary/detail/affected_refs. No
+  // run_id/final_plan_id/handoff_id/workspace_id/session_id/generation/
+  // repository revision/successor field exists to accept (§12 forbidden list).
+  assertExactBusinessFields(rawArgs, ["kind", "summary", "detail", "affected_refs"]);
+  const token = requireHostContext(rawArgs);
+  // §13 — EXECUTION authority ONLY: a signed Planning HostContext fails the
+  // domain-separated verification before any store access.
+  const signed = parseSignedHostContext(ctx.secret, token);
+  if (signed.authority !== "execution") {
+    throw domainError(
+      "HOST_CONTEXT_INVALID",
+      "report_execution_issue requires the execution authority of a delivered handoff; planning authority is never accepted",
+    );
+  }
+  const exec = assertExecutionHostContextForTool(ctx.secret, token, { tool: "report_execution_issue", businessInput: rawArgs });
+
+  if (typeof rawArgs.kind !== "string" || !isExecutionIssueKind(rawArgs.kind)) {
+    throw inputInvalid(`kind must be one of: ${EXECUTION_ISSUE_KINDS.join(", ")}`);
+  }
+  for (const field of ["summary", "detail"] as const) {
+    if (typeof rawArgs[field] !== "string" || (rawArgs[field] as string).trim() === "") {
+      throw inputInvalid(`${field} must be a non-empty string`);
+    }
+  }
+  if (!Array.isArray(rawArgs.affected_refs) || rawArgs.affected_refs.length === 0) {
+    throw inputInvalid("affected_refs must be a non-empty array of exact FinalPlan refs");
+  }
+  const affectedRefs: ExecutionIssueAffectedRef[] = (rawArgs.affected_refs as unknown[]).map((entry) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw inputInvalid("affected_refs entries must be {type, id, revision} objects");
+    }
+    const record = entry as Record<string, unknown>;
+    if (typeof record.type !== "string" || !isExecutionIssueRefType(record.type)) {
+      throw inputInvalid(`affected_refs type must be one of: ${EXECUTION_ISSUE_REF_TYPES.join(", ")}`);
+    }
+    if (typeof record.id !== "string" || record.id.trim() === "") {
+      throw inputInvalid("affected_refs id must be a non-empty string");
+    }
+    if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 1) {
+      throw inputInvalid("affected_refs revision must be a positive integer");
+    }
+    return { type: record.type as ExecutionIssueAffectedRef["type"], id: record.id, revision: record.revision };
+  });
+
+  const workspace = getWorkspaceById(ctx.store, exec.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${exec.workspaceId}' is not in the catalog`);
+  }
+  const service = createExecutionIssueService(ctx.store, ctx.clock);
+  const result = service.reportIssue({
+    runId: exec.runId,
+    workspaceId: exec.workspaceId,
+    workspaceRoot: workspace.canonicalRoot,
+    sessionId: exec.sessionId,
+    toolUseId: exec.toolUseId,
+    finalPlanId: exec.finalPlanId,
+    executionBindingGeneration: exec.executionBindingGeneration,
+    kind: rawArgs.kind as ExecutionIssueKind,
+    summary: rawArgs.summary as string,
+    detail: rawArgs.detail as string,
+    affectedRefs,
+  });
+  return {
+    status: "ok",
+    idempotent: result.idempotent,
+    issue: {
+      issue_id: result.issueId,
+      issue_hash: result.issueHash,
+      kind: result.kind,
+      summary: result.summary,
+      affected_refs: result.affectedRefs,
+      repository_context: result.repositoryContext,
+    },
+    executionIssues: { openCount: result.openIssues, replanRequired: result.replanRequired },
+    // §20/§21/§88 — the semantic mutation boundary is explicit.
+    next:
+      "ExecutionIssue recorded; the approved FinalPlan is unchanged and repository mutation is now paused "
+      + "(EXECUTION_REPLAN_REQUIRED). Tell the user that replanning is required; when they explicitly invoke "
+      + "/phase-plan, a successor PlanningRun is created from the immutable baseline.",
+  };
+}
+
+// ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
   switch (name) {
@@ -2020,6 +2399,8 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleRequestFinalization(ctx, rawArgs);
     case "handoff":
       return handleHandoff(ctx, rawArgs);
+    case "report_execution_issue":
+      return handleReportExecutionIssue(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

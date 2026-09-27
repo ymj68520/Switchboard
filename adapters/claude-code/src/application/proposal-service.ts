@@ -32,8 +32,16 @@ import {
   type ProposalType,
   type RawProposalChange,
 } from "../core/proposal.js";
-import { buildProposalCanonical, canonicalProposalHash, requiredEvidenceOf, type ProposalEvidenceRef } from "../core/proposal-canonical.js";
+import {
+  buildProposalCanonical,
+  buildSuccessorProposalCanonical,
+  canonicalProposalHash,
+  requiredEvidenceOf,
+  type ProposalEvidenceRef,
+} from "../core/proposal-canonical.js";
 import { parsePlanningRunRow, type PlanningRun } from "../core/planning-run.js";
+import { getBaselineScopeForSectionInTx, getBaselineMaterializationInTx, getPlanningRunBaselineForSuccessorInTx } from "../store/successor-baselines.js";
+import { parseFinalPlanCanonical } from "./handoff-service.js";
 import { RuntimeError } from "../runtime/errors.js";
 import { evidenceNeedsValidationError } from "./evidence-gate.js";
 import { evaluateCriticalEvidenceGateInTx } from "./evidence-freshness-service.js";
@@ -65,6 +73,18 @@ import {
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import type { StoreTx } from "../store/transaction.js";
+
+/** Phase 15 §48 — the unmaterialized baseline world of a successor run. */
+interface SuccessorBaselineWorld {
+  baselineId: string;
+  baselineHash: string;
+  finalPlanId: string;
+  finalPlanHash: string;
+  issueSetHash: string;
+  predecessorRunId: string;
+  /** The exact predecessor FinalPlan closure refs (the prepare-time base). */
+  carryRefs: MemoryRef[];
+}
 
 export interface PrepareProposalInput {
   runId: string;
@@ -310,11 +330,19 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
     const scopedSectionId = input.scope.sectionId;
     const scopedState = getSectionWorkflowStateInTx(tx, input.runId, scopedSectionId);
     if (scopedState === null) {
-      throw sectionWorkflowError(
-        "SECTION_NOT_FOUND",
-        `section-scope proposal names section '${scopedSectionId}' which does not exist in this run; new sections are created through detail-scope DAG proposals`,
-        { runId: input.runId, sectionId: scopedSectionId },
-      );
+      // Phase 15 §57/§65 — an UNMATERIALIZED successor run has no local
+      // workflow rows yet; a needs_review BASELINE scope section is exactly
+      // the reopened work the successor must amend/complete first. An
+      // inherited_completed section has no successor workflow to act on until
+      // the first commit materializes it (§58).
+      const scope = getBaselineScopeForSectionInTx(tx, input.runId, scopedSectionId);
+      if (scope === null || scope.scopeState !== "needs_review") {
+        throw sectionWorkflowError(
+          "SECTION_NOT_FOUND",
+          `section-scope proposal names section '${scopedSectionId}' which does not exist in this run; new sections are created through detail-scope DAG proposals`,
+          { runId: input.runId, sectionId: scopedSectionId },
+        );
+      }
     }
     for (const change of input.changes) {
       if (change.op === "SET_SECTION_REVISION" && change.artifactId !== scopedSectionId) {
@@ -380,11 +408,94 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
   }
 
   /**
-   * The base world for a new frozen revision: the current HEAD pair plus its
-   * refs. A legacy snapshot-only HEAD (schema-4 internal shape) fails closed
-   * — it is never a legitimate commit base (§19).
+   * Phase 15 §48 — the unmaterialized-baseline world of a successor run:
+   * the exact baseline binding plus the carry-forward closure refs (the
+   * predecessor FinalPlan design at its exact approved revisions, READ-ONLY
+   * from the predecessor's Plan Memory — never copied at prepare time, §43).
    */
-  function baseWorldInTx(tx: StoreTx, runId: string): { head: HeadPair | null; baseRefs: MemoryRef[] } {
+  function successorBaselineWorldInTx(tx: StoreTx, runId: string): SuccessorBaselineWorld | null {
+    const baselineRow = getPlanningRunBaselineForSuccessorInTx(tx, runId);
+    if (baselineRow === null) return null;
+    if (getBaselineMaterializationInTx(tx, baselineRow.baselineId) !== null) return null;
+    let canonical: unknown;
+    try {
+      canonical = JSON.parse(baselineRow.canonicalJson);
+    } catch {
+      throw new RuntimeError("STORE_SCHEMA_INVALID", "successor baseline canonical payload is unparsable", {
+        detail: { baselineId: baselineRow.baselineId },
+      });
+    }
+    const recomputed = `sha256:${sha256Hex(baselineRow.canonicalJson)}`;
+    if (
+      canonical === null ||
+      typeof canonical !== "object" ||
+      recomputed !== baselineRow.baselineHash
+    ) {
+      throw new RuntimeError("SUCCESSOR_BASELINE_STALE", "successor baseline hash does not match its canonical payload", {
+        detail: { baselineId: baselineRow.baselineId },
+      });
+    }
+    const planRow = tx
+      .prepare("SELECT canonical_json AS canonicalJson FROM final_plans WHERE run_id = ? AND final_plan_id = ?")
+      .get(baselineRow.predecessorRunId, baselineRow.finalPlanId) as { canonicalJson: string } | undefined;
+    if (planRow === undefined) {
+      throw new RuntimeError("SUCCESSOR_BASELINE_REQUIRED", "the baseline FinalPlan row is missing", {
+        detail: { baselineId: baselineRow.baselineId },
+      });
+    }
+    const plan = parseFinalPlanCanonical(planRow.canonicalJson, baselineRow.predecessorRunId);
+    const closureRefs: MemoryRef[] = [];
+    if (plan.architecture !== null) {
+      closureRefs.push({ runId: baselineRow.predecessorRunId, kind: "architecture", id: plan.architecture.id, revision: plan.architecture.revision });
+    }
+    for (const section of plan.sections) {
+      closureRefs.push({ runId: baselineRow.predecessorRunId, kind: "section", id: section.sectionId, revision: section.revision });
+    }
+    for (const item of plan.decisions) {
+      closureRefs.push({ runId: baselineRow.predecessorRunId, kind: "decision", id: item.id, revision: item.revision });
+    }
+    for (const item of plan.constraints) {
+      closureRefs.push({ runId: baselineRow.predecessorRunId, kind: "constraint", id: item.id, revision: item.revision });
+    }
+    // Every closure ref must exist in the predecessor's committed memory —
+    // the FinalPlan is a projection of real revisions, never a wish list.
+    for (const ref of closureRefs) {
+      const row = tx
+        .prepare(
+          "SELECT 1 AS one FROM memory_revisions WHERE run_id = ? AND kind = ? AND artifact_id = ? AND revision = ?",
+        )
+        .get(ref.runId, ref.kind, ref.id, ref.revision);
+      if (row === undefined) {
+        throw new RuntimeError(
+          "SUCCESSOR_BASELINE_REQUIRED",
+          `baseline closure revision ${ref.kind} '${ref.id}'@${ref.revision} is missing from the predecessor Plan Memory`,
+          { detail: { baselineId: baselineRow.baselineId, ref } },
+        );
+      }
+    }
+    return {
+      baselineId: baselineRow.baselineId,
+      baselineHash: baselineRow.baselineHash,
+      finalPlanId: baselineRow.finalPlanId,
+      finalPlanHash: baselineRow.finalPlanHash,
+      issueSetHash: baselineRow.issueSetHash,
+      predecessorRunId: baselineRow.predecessorRunId,
+      carryRefs: closureRefs,
+    };
+  }
+
+  /**
+   * The base world for a new frozen revision: the current HEAD pair plus its
+   * refs — OR, for an UNMATERIALIZED successor run (Phase 15 §48), the
+   * immutable baseline FinalPlan closure read from the predecessor's Plan
+   * Memory. A legacy snapshot-only HEAD (schema-4 internal shape) fails
+   * closed — it is never a legitimate commit base (§19).
+   */
+  function baseWorldInTx(tx: StoreTx, runId: string): {
+    head: HeadPair | null;
+    baseRefs: MemoryRef[];
+    successor: SuccessorBaselineWorld | null;
+  } {
     const head = getHeadPairInTx(tx, runId);
     if (head !== null && head.headCommitId === null) {
       throw new RuntimeError(
@@ -393,12 +504,17 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
         { detail: { runId, headSnapshotId: head.headSnapshotId } },
       );
     }
+    if (head === null) {
+      const successor = successorBaselineWorldInTx(tx, runId);
+      if (successor !== null) {
+        return { head, baseRefs: successor.carryRefs, successor };
+      }
+    }
     const baseRefs = head === null ? [] : (getSnapshotRefsInTx(tx, head.headSnapshotId) ?? []);
-    return { head, baseRefs };
+    return { head, baseRefs, successor: null };
   }
 
-  function normalizeAndValidate(input: {
-    runId: string;
+  function normalizeAndValidate(input: {    runId: string;
     baseRefs: MemoryRef[];
     changes: RawProposalChange[];
     dependencies?: ArtifactRef[];
@@ -486,6 +602,8 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       dependencies: ArtifactRef[];
       requiredEvidence: ProposalEvidenceRef[];
       impact: { affected: ArtifactIdentityRef[]; notes: string[] };
+      /** Phase 15 §49 — present only for the FIRST proposal of an unmaterialized successor. */
+      successor?: SuccessorBaselineWorld | null;
     },
   ): ProposalRevisionStatusView {
     const now = clock.nowIso();
@@ -495,22 +613,50 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
     // an empty requiredEvidence set. Refs are deterministically sorted by the
     // builder and mirrored into proposal_evidence_refs (§34: the relational
     // index must equal the canonical content — one authority).
-    const canonical = buildProposalCanonical({
-      runId: input.runId,
-      proposalId: input.proposalId,
-      proposalRevision: input.revision,
-      type: input.type,
-      scope: input.scope,
-      baseRunRevision: input.run.revision,
-      baseHeadSnapshotId,
-      baseHeadCommitId,
-      title: input.title,
-      summary: input.summary,
-      changes: input.changes,
-      dependencies: input.dependencies,
-      impact: input.impact,
-      requiredEvidence: input.requiredEvidence,
-    });
+    // Phase 15 §49: the first proposal of an unmaterialized successor run is
+    // canonical V4 — the exact immutable baseline binding rides in the
+    // canonical payload, so Formal Approval authorizes which predecessor
+    // FinalPlan + which ExecutionIssue set + which change, inseparably.
+    const canonical = input.successor
+      ? buildSuccessorProposalCanonical({
+          runId: input.runId,
+          proposalId: input.proposalId,
+          proposalRevision: input.revision,
+          type: input.type,
+          scope: input.scope,
+          baseRunRevision: input.run.revision,
+          baseHeadSnapshotId,
+          baseHeadCommitId,
+          title: input.title,
+          summary: input.summary,
+          changes: input.changes,
+          dependencies: input.dependencies,
+          impact: input.impact,
+          requiredEvidence: input.requiredEvidence,
+          successorBaseline: {
+            baselineId: input.successor.baselineId,
+            baselineHash: input.successor.baselineHash,
+            finalPlanId: input.successor.finalPlanId,
+            finalPlanHash: input.successor.finalPlanHash,
+            issueSetHash: input.successor.issueSetHash,
+          },
+        })
+      : buildProposalCanonical({
+          runId: input.runId,
+          proposalId: input.proposalId,
+          proposalRevision: input.revision,
+          type: input.type,
+          scope: input.scope,
+          baseRunRevision: input.run.revision,
+          baseHeadSnapshotId,
+          baseHeadCommitId,
+          title: input.title,
+          summary: input.summary,
+          changes: input.changes,
+          dependencies: input.dependencies,
+          impact: input.impact,
+          requiredEvidence: input.requiredEvidence,
+        });
     const canonicalJsonText = canonicalJson(canonical);
     const hash = canonicalProposalHash(canonical);
 
@@ -622,7 +768,7 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
 
         const runPre = gateProposalMutationInTx(tx, input);
         gateTypeAndStage(runPre, input.type, input.scope);
-        const { head, baseRefs } = baseWorldInTx(tx, input.runId);
+        const { head, baseRefs, successor } = baseWorldInTx(tx, input.runId);
         const normalized = normalizeAndValidate({
           runId: input.runId,
           baseRefs,
@@ -693,6 +839,7 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           revision: 1,
           run,
           head,
+          successor,
           type: input.type,
           scope: input.scope,
           title: input.title,
@@ -727,7 +874,7 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
       return store.withWrite((tx) => {
         const run = gateProposalMutationInTx(tx, input);
         gateTypeAndStage(run, input.type, input.scope);
-        const { head, baseRefs } = baseWorldInTx(tx, input.runId);
+        const { head, baseRefs, successor } = baseWorldInTx(tx, input.runId);
 
         const identity = tx
           .prepare("SELECT run_id AS runId FROM proposals WHERE run_id = ? AND proposal_id = ?")
@@ -785,6 +932,7 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           revision: awaiting.revision + 1,
           run,
           head,
+          successor,
           type: input.type,
           scope: input.scope,
           title: input.title,

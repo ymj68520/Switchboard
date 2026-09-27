@@ -34,6 +34,7 @@ export const PROPOSAL_CANONICAL_SCHEMA = "phase-plan.proposal";
 export const PROPOSAL_CANONICAL_V1_VERSION = 1;
 export const PROPOSAL_CANONICAL_VERSION = 2;
 export const PROPOSAL_CANONICAL_V3_VERSION = 3;
+export const PROPOSAL_CANONICAL_V4_VERSION = 4;
 
 /** Exact upstream Evidence reference ({evidenceId, revision}). */
 export type ProposalEvidenceRef = DerivedFromRef;
@@ -80,6 +81,31 @@ export interface FinalPlanCandidateBinding {
 export interface ProposalCanonicalV3 extends Omit<ProposalCanonicalV2, "version"> {
   version: typeof PROPOSAL_CANONICAL_V3_VERSION;
   finalPlanCandidate: FinalPlanCandidateBinding;
+}
+
+/**
+ * The exact immutable baseline binding inside a successor's FIRST proposal
+ * (Phase 15 §49): Formal Approval therefore authorizes precisely which
+ * predecessor FinalPlan, which ExecutionIssue set, and which proposed change.
+ */
+export interface SuccessorBaselineBinding {
+  baselineId: string;
+  baselineHash: string;
+  finalPlanId: string;
+  finalPlanHash: string;
+  issueSetHash: string;
+}
+
+/**
+ * ProposalCanonicalV4 (Phase 15 §49) — exclusively for the FIRST proposal of
+ * an UNMATERIALIZED successor run (server-derived: the binding exists only
+ * while the run has an immutable PlanningRunBaseline and no local HEAD).
+ * Ordinary design proposals remain V1/V2 forever (§50) and historical hashes
+ * never change.
+ */
+export interface ProposalCanonicalV4 extends Omit<ProposalCanonicalV2, "version"> {
+  version: typeof PROPOSAL_CANONICAL_V4_VERSION;
+  successorBaseline: SuccessorBaselineBinding;
 }
 
 /** The shared non-version fields of a proposal canonical. */
@@ -165,8 +191,28 @@ export function buildFinalPlanProposalCanonical(
   };
 }
 
+/**
+ * The Phase-15 builder — the ONLY legal construction path of a successor
+ * baseline-bound proposal canonical. Server-generated while the run's
+ * baseline is unmaterialized; the model can never opt into or fake one (§49).
+ */
+export function buildSuccessorProposalCanonical(
+  input: CanonicalBase & {
+    requiredEvidence?: ProposalEvidenceRef[];
+    successorBaseline: SuccessorBaselineBinding;
+  },
+): ProposalCanonicalV4 {
+  return {
+    ...buildProposalCanonical(input),
+    version: PROPOSAL_CANONICAL_V4_VERSION,
+    successorBaseline: { ...input.successorBaseline },
+  };
+}
+
 /** `sha256:<lowercase hex>` over the canonical serialization (§23). */
-export function canonicalProposalHash(canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3): string {
+export function canonicalProposalHash(
+  canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3 | ProposalCanonicalV4,
+): string {
   const digest = createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex");
   return `sha256:${digest}`;
 }
@@ -177,7 +223,9 @@ export function canonicalProposalHash(canonical: ProposalCanonicalV1 | ProposalC
  * V1 parses with requiredEvidence = [] — historical proposals NEVER gain
  * inferred evidence refs (§32); the refs table is the only V2 index.
  */
-export function parseProposalCanonical(value: unknown): ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3 {
+export function parseProposalCanonical(
+  value: unknown,
+): ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3 | ProposalCanonicalV4 {
   if (typeof value !== "object" || value === null) {
     throw new TypeError("proposal canonical must be a JSON object");
   }
@@ -211,12 +259,37 @@ export function parseProposalCanonical(value: unknown): ProposalCanonicalV1 | Pr
     }
     return raw as unknown as ProposalCanonicalV3;
   }
+  if (raw.version === PROPOSAL_CANONICAL_V4_VERSION) {
+    if (!Array.isArray(raw.requiredEvidence)) {
+      throw new TypeError("proposal canonical V4 requires a requiredEvidence array");
+    }
+    const baseline = raw.successorBaseline as Record<string, unknown> | undefined;
+    if (
+      typeof baseline !== "object" ||
+      baseline === null ||
+      typeof baseline.baselineId !== "string" ||
+      baseline.baselineId === "" ||
+      typeof baseline.baselineHash !== "string" ||
+      !baseline.baselineHash.startsWith("sha256:") ||
+      typeof baseline.finalPlanId !== "string" ||
+      baseline.finalPlanId === "" ||
+      typeof baseline.finalPlanHash !== "string" ||
+      !baseline.finalPlanHash.startsWith("sha256:") ||
+      typeof baseline.issueSetHash !== "string" ||
+      !baseline.issueSetHash.startsWith("sha256:")
+    ) {
+      throw new TypeError(
+        "proposal canonical V4 requires a successorBaseline {baselineId, baselineHash, finalPlanId, finalPlanHash, issueSetHash} binding",
+      );
+    }
+    return raw as unknown as ProposalCanonicalV4;
+  }
   throw new TypeError("proposal canonical version marker mismatch");
 }
 
 /** The exact requiredEvidence set of a parsed canonical (V1 → [], §32). */
 export function requiredEvidenceOf(
-  canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3,
+  canonical: ProposalCanonicalV1 | ProposalCanonicalV2 | ProposalCanonicalV3 | ProposalCanonicalV4,
 ): ProposalEvidenceRef[] {
   return canonical.version === PROPOSAL_CANONICAL_V1_VERSION ? [] : canonical.requiredEvidence;
 }

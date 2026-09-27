@@ -29,6 +29,11 @@ import {
 } from "../store/finalization.js";
 import { getActiveSection, listSectionWorkflowStates } from "../store/section-workflow.js";
 import {
+  getBaselineMaterializationInTx,
+  getPlanningRunBaselineForSuccessorInTx,
+  listBaselineScopesInTx,
+} from "../store/successor-baselines.js";
+import {
   getLatestValidationReportInTx,
   getLatestSynthesisInputInTx,
   getSynthesisManifestByInputInTx,
@@ -43,6 +48,7 @@ import type {
   ContextHead,
   ContextRunState,
   ContextSource,
+  ContextSuccessorBaseline,
 } from "../context/types.js";
 
 export function createStoreContextSource(store: PlanStore): ContextSource {
@@ -206,6 +212,34 @@ export function createStoreContextSource(store: PlanStore): ContextSource {
                 },
           finalProposal,
           finalPlan: planRow === null ? null : { finalPlanId: planRow.finalPlanId, hash: planRow.finalPlanHash },
+        };
+      });
+    },
+
+    // Phase 15 §46 — the successor baseline lineage read (successor runs only).
+    getSuccessorBaseline(runId): ContextSuccessorBaseline | null {
+      return store.withRead((tx) => {
+        const baseline = getPlanningRunBaselineForSuccessorInTx(tx, runId);
+        if (baseline === null) return null;
+        const scopes = listBaselineScopesInTx(tx, baseline.baselineId);
+        const issueRows = tx
+          .prepare(
+            "SELECT i.issue_id AS issueId, i.kind AS kind, i.summary AS summary FROM planning_run_baseline_issues bi "
+            + "JOIN execution_issues i ON i.issue_id = bi.issue_id "
+            + "WHERE bi.baseline_id = ? ORDER BY bi.position",
+          )
+          .all(baseline.baselineId) as Array<{ issueId: string; kind: string; summary: string }>;
+        return {
+          baselineId: baseline.baselineId,
+          baselineHash: baseline.baselineHash,
+          issueSetHash: baseline.issueSetHash,
+          predecessorRunId: baseline.predecessorRunId,
+          finalPlan: { id: baseline.finalPlanId, hash: baseline.finalPlanHash },
+          executionHandoff: { id: baseline.executionHandoffId, hash: baseline.executionHandoffHash },
+          materialized: getBaselineMaterializationInTx(tx, baseline.baselineId) !== null,
+          issueSummaries: issueRows.map((issue) => ({ issueId: issue.issueId, kind: issue.kind, summary: issue.summary })),
+          needsReviewSections: scopes.filter((scope) => scope.scopeState === "needs_review").map((scope) => scope.sectionId),
+          inheritedCompletedSections: scopes.filter((scope) => scope.scopeState === "inherited_completed").map((scope) => scope.sectionId),
         };
       });
     },
