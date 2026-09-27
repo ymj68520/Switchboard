@@ -638,8 +638,17 @@ export function handleStartOrResume(ctx: PhasePlanToolContext, rawArgs: Record<s
   // immutable FinalPlan baseline. Without an open issue the Phase 14 wall
   // stands: no silently "baselined on nothing" successor. Other sessions in
   // this workspace are unaffected (§84 — never a workspace lock).
+  // A host restart cycles the session's planning life: SessionEnd detaches the
+  // successor planning binding and SessionStart recovery re-attaches the
+  // delivered execution binding. Either planning-binding state (attached or
+  // detached) means the session already moved on to the successor — that
+  // resume (Case A/B below) must win over the successor fence here, otherwise
+  // /phase-plan could never re-enter after a restart.
+  const ownsPlanningLife =
+    findAttachedActiveRun(ctx.store, envelope.sessionId) !== null
+    || findDetachedActiveRun(ctx.store, envelope.sessionId, envelope.workspaceId) !== null;
   const execBound = ctx.store.withRead((tx) => findAttachedExecutionBindingForSessionInTx(tx, envelope.sessionId));
-  if (execBound !== null) {
+  if (execBound !== null && !ownsPlanningLife) {
     // §24 — explicit user intent first: even the successor path requires the
     // fresh signed EntryIntent from this session's /phase-plan expansion.
     verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });

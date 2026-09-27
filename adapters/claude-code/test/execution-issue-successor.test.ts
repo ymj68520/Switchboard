@@ -28,7 +28,8 @@ import {
   getPlanningRunBaselineForSuccessorInTx,
   listBaselineScopesInTx,
 } from "../src/store/successor-baselines.js";
-import { getExecutionBindingInTx, getExecutionHandoffInTx } from "../src/store/execution.js";
+import { getExecutionBindingInTx, getExecutionHandoffInTx, reattachExecutionBindingInTx } from "../src/store/execution.js";
+import { detachBindingInTx } from "../src/store/session-bindings.js";
 import { getFinalPlanInTx } from "../src/store/finalization.js";
 import { getHeadCommitRecord } from "../src/store/plan-commits.js";
 import { listSectionWorkflowStates } from "../src/store/section-workflow.js";
@@ -156,6 +157,7 @@ function callStartOrResume(
   return executePhasePlanTool(ctx, "start_or_resume", { _entryIntent: entry, _hostContext: token }) as {
     status: string;
     started: boolean;
+    reattached?: boolean;
     run: { id: string; stage: string; revision: number };
     binding: { state: string; generation: number };
     initialStage: string;
@@ -587,6 +589,62 @@ describe("successor creation from the immutable baseline (§22–§43)", () => {
     const second = callStartOrResume(ctx, f.sessionId, f.workspaceId, { toolUseId: "TU-SUCC-ENTRY-2" });
     expect(second.status).toBe("resumed");
     expect(second.run.id).toBe(successorRunId);
+  });
+
+  it("a host restart that re-attaches the old execution binding does not shadow the successor resume (§73, live-host restart)", async () => {
+    const { f, ctx } = await deliveredWorld();
+    callReportIssue(ctx, f, {
+      kind: "section_contract",
+      summary: "contract cannot be satisfied",
+      detail: "the approved contract requires replanning.",
+      affected_refs: [firstSectionRef(ctx, f.runId)],
+    }, { toolUseId: "TU-RESTART-ISSUE" });
+    const created = callStartOrResume(ctx, f.sessionId, f.workspaceId, { toolUseId: "TU-RESTART-ENTRY" });
+    expect(created.status).toBe("started_successor");
+    const successorRunId = created.run.id as string;
+
+    // SessionStart:resume recovery (phase-14 E87): the delivered contract's
+    // execution binding re-attaches for the exact same session.
+    const reattached = ctx.store.withWrite((tx) =>
+      reattachExecutionBindingInTx(tx, { runId: f.runId, sessionId: f.sessionId, workspaceId: f.workspaceId }, ctx.clock.nowIso()));
+    expect(reattached.state).toBe("attached");
+
+    // The next /phase-plan must still resume the successor (Case A) instead
+    // of failing the successor fence with SUCCESSOR_RUN_ALREADY_STARTED.
+    const resumed = callStartOrResume(ctx, f.sessionId, f.workspaceId, { toolUseId: "TU-RESTART-ENTRY-2" });
+    expect(resumed.status).toBe("resumed");
+    expect(resumed.run.id).toBe(successorRunId);
+    expect(ctx.store.withRead((tx) => countOpenExecutionIssuesInTx(tx, f.runId))).toBe(0);
+  });
+
+  it("a restart cycle (SessionEnd detaches successor binding + SessionStart re-attaches execution binding) still resumes the successor (§73, live-host restart)", async () => {
+    const { f, ctx } = await deliveredWorld();
+    callReportIssue(ctx, f, {
+      kind: "section_contract",
+      summary: "contract cannot be satisfied",
+      detail: "the approved contract requires replanning.",
+      affected_refs: [firstSectionRef(ctx, f.runId)],
+    }, { toolUseId: "TU-CYCLE-ISSUE" });
+    const created = callStartOrResume(ctx, f.sessionId, f.workspaceId, { toolUseId: "TU-CYCLE-ENTRY" });
+    expect(created.status).toBe("started_successor");
+    const successorRunId = created.run.id as string;
+
+    // SessionEnd: the successor planning binding detaches…
+    ctx.store.withWrite((tx) => {
+      detachBindingInTx(tx, { runId: successorRunId, sessionId: f.sessionId }, ctx.clock.nowIso());
+      return null;
+    });
+    // …and SessionStart recovery re-attaches the delivered execution binding.
+    const reattached = ctx.store.withWrite((tx) =>
+      reattachExecutionBindingInTx(tx, { runId: f.runId, sessionId: f.sessionId, workspaceId: f.workspaceId }, ctx.clock.nowIso()));
+    expect(reattached.state).toBe("attached");
+
+    // /phase-plan must take Case B: re-attach the successor binding and resume.
+    const resumed = callStartOrResume(ctx, f.sessionId, f.workspaceId, { toolUseId: "TU-CYCLE-ENTRY-2" });
+    expect(resumed.status).toBe("resumed");
+    expect(resumed.reattached).toBe(true);
+    expect(resumed.run.id).toBe(successorRunId);
+    expect(ctx.store.withRead((tx) => getExecutionBindingInTx(tx, f.runId))!.state).toBe("attached");
   });
 
   it("architecture-level issue → successor at stage architecture with ALL sections needs_review (§33, E26/E27)", async () => {
