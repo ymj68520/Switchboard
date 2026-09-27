@@ -16,6 +16,7 @@
     "lint": "npm run lint --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "smoke:opencode": "node scripts/opencode-live-smoke.mjs",
-    "smoke:opencode-handoff": "node scripts/opencode-handoff-smoke.mjs"
+    "smoke:opencode-handoff": "node scripts/opencode-handoff-smoke.mjs",
+    "smoke:opencode-context": "node scripts/opencode-context-smoke.mjs"
   }
 }

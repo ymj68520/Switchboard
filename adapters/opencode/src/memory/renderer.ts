@@ -112,7 +112,12 @@ export function renderStatus(run: PlanningRun, details?: StatusDetails): string 
       : approvedSections === totalSections
         ? "all approved"
         : `${totalSections} (${approvedSections} approved)`;
-  const activeWork = run.activeWork?.type === "section" ? String(run.activeWork.id) : "none";
+  // R1b §21: the architecture-remediation focus renders as the exact ARCH ref.
+  const activeWork = run.activeWork?.type === "section"
+    ? String(run.activeWork.id)
+    : run.activeWork?.type === "architecture"
+      ? `ARCH@${run.architecture?.revision ?? "?"} (architecture remediation)`
+      : "none";
 
   // Phase 2E1 §33: the focused Section's workflow state in detail — root
   // status, exact revision pointer, validation. "Revision: none" before the

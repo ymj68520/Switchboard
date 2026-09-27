@@ -11,14 +11,19 @@ import { SectionIDs } from "../src/core/ids.js";
 import { isUltraPlanError } from "../src/core/errors.js";
 import type { PlanningLifecycle, PlanningRun, PlanningStage } from "../src/core/types.js";
 
-type DetailVariant = "decomposition-needed" | "section-ready-revisionless" | "section-ready-checkpointed";
+type DetailVariant =
+  | "decomposition-needed"
+  | "section-ready-revisionless"
+  | "section-ready-checkpointed"
+  | "architecture-remediation";
 
 function syntheticRun(
   lifecycle: PlanningLifecycle,
   stage: PlanningStage,
   detailVariant: DetailVariant = "decomposition-needed",
 ): PlanningRun {
-  const ready = stage === "detail" && detailVariant !== "decomposition-needed";
+  const remediation = stage === "detail" && detailVariant === "architecture-remediation";
+  const ready = stage === "detail" && detailVariant !== "decomposition-needed" && !remediation;
   return {
     id: "PLAN-000" as PlanningRun["id"],
     sessionID: "ses_synthetic",
@@ -31,7 +36,11 @@ function syntheticRun(
     decisions: [],
     openQuestions: [],
     conflicts: [],
-    ...(ready ? { activeWork: { type: "section" as const, id: SectionIDs.from(1) } } : {}),
+    ...(ready
+      ? { activeWork: { type: "section" as const, id: SectionIDs.from(1) } }
+      : remediation
+        ? { activeWork: { type: "architecture" as const } }
+        : {}),
     createdAt: "",
     updatedAt: "",
   };
@@ -40,6 +49,7 @@ function syntheticRun(
 /** Active-section capability context per detail variant (Phase 2E1 §20). */
 const VARIANT_CONTEXT: Readonly<Record<DetailVariant, CapabilityContext>> = {
   "decomposition-needed": {},
+  "architecture-remediation": {},
   "section-ready-revisionless": { activeSection: { currentRevision: undefined, approvedRevision: undefined } },
   "section-ready-checkpointed": { activeSection: { currentRevision: 1, approvedRevision: 1 } },
 };
@@ -59,8 +69,11 @@ const MUTATING: readonly UltraPlanCapability[] = [
   "begin_synthesis",
   "submit_synthesis_manifest",
   "run_semantic_validation",
+  "prepare_architecture_amendment",
 ];
 
+// R1a §16: the explicit user-confirmed abort is granted in every ACTIVE stage.
+const REQUEST_ABORT: UltraPlanCapability[] = ["request_abort"];
 const DISCOVERY: UltraPlanCapability[] = [
   "start_or_resume",
   "read_status",
@@ -69,6 +82,7 @@ const DISCOVERY: UltraPlanCapability[] = [
   "propose_question_resolution",
   "promote_evidence",
   "request_architecture",
+  ...REQUEST_ABORT,
 ];
 const ARCHITECTURE: UltraPlanCapability[] = [
   ...DISCOVERY.filter((capability) => capability !== "request_architecture"),
@@ -85,6 +99,21 @@ const ARCHITECTURE: UltraPlanCapability[] = [
 const DETAIL_DECOMPOSITION_NEEDED: UltraPlanCapability[] = [
   ...ARCHITECTURE.filter((capability) => capability !== "request_completion"),
   "prepare_decomposition",
+  // R1a §18/§41: the blocker-driven architecture reopen (blockers raised here
+  // must have a sanctioned cure route).
+  "request_reopen",
+];
+// R1b §21: the dedicated architecture-remediation substate — the minimal
+// surface (no raise_conflict, no section completion/focus/decomposition).
+const DETAIL_ARCHITECTURE_REMEDIATION: UltraPlanCapability[] = [
+  "start_or_resume",
+  "read_status",
+  "read_memory",
+  "record_question",
+  "propose_question_resolution",
+  "promote_evidence",
+  "prepare_architecture_amendment",
+  ...REQUEST_ABORT,
 ];
 const DETAIL_SECTION_REVISIONLESS: UltraPlanCapability[] = [
   ...ARCHITECTURE.filter((capability) => capability !== "request_completion"),
@@ -114,6 +143,9 @@ const SYNTHESIS_NO_INPUT: UltraPlanCapability[] = [
   "propose_question_resolution",
   "raise_conflict",
   "begin_synthesis",
+  // R1a §10-§14: the blocker-cure route exists wherever blockers can be raised.
+  "request_reopen",
+  ...REQUEST_ABORT,
 ];
 const SYNTHESIS_INPUT_READY: UltraPlanCapability[] = [
   ...SYNTHESIS_NO_INPUT,
@@ -125,11 +157,11 @@ const SYNTHESIS_MANIFEST_READY: UltraPlanCapability[] = [
 ];
 const SYNTHESIS_VALIDATION_FINDINGS: UltraPlanCapability[] = [
   ...SYNTHESIS_MANIFEST_READY,
-  "request_reopen",
 ];
 const SYNTHESIS_VALIDATION_CLEAN: UltraPlanCapability[] = [
-  ...SYNTHESIS_MANIFEST_READY.filter((capability) => capability !== "request_reopen"),
-  // Phase 2H §52: request deterministic finalization in the clean substate.
+  ...SYNTHESIS_MANIFEST_READY,
+  // Phase 2H §52: request deterministic finalization in the clean substate
+  // (R1a: request_reopen stays granted — the blocker-cure route).
   "request_finalization",
 ];
 const SYNTHESIS_CANDIDATE_READY: UltraPlanCapability[] = [
@@ -145,6 +177,10 @@ const SYNTHESIS_CANDIDATE_READY: UltraPlanCapability[] = [
   // surface, no Final approval, no handoff.
   "request_finalization",
   "prepare_final_plan",
+  // R1a §10-§14: the blocker-cure route (a blocking question/conflict raised
+  // in this substate must be curable).
+  "request_reopen",
+  ...REQUEST_ABORT,
 ];
 // Phase 2I §50/§51: a CURRENT exact final_plan Proposal (ready/awaiting)
 // narrowly grants request_user_approval (§22) on top of the candidate-ready
@@ -175,6 +211,7 @@ const DETAIL_VARIANTS: readonly DetailVariant[] = [
   "decomposition-needed",
   "section-ready-revisionless",
   "section-ready-checkpointed",
+  "architecture-remediation",
 ];
 
 /** Synthesis substate variants (2F §43 + 2G §34 + 2H §53 + 2I §49/§50). */
@@ -244,6 +281,10 @@ describe("capability matrix", () => {
           [...getCapabilities(syntheticRun("active", "detail", "section-ready-checkpointed"), VARIANT_CONTEXT["section-ready-checkpointed"])].sort(),
           "detail/section-ready (checkpointed active section)",
         ).toEqual(DETAIL_SECTION_CHECKPOINTED.slice().sort());
+        expect(
+          [...getCapabilities(syntheticRun("active", "detail", "architecture-remediation"))].sort(),
+          "detail/architecture-remediation",
+        ).toEqual(DETAIL_ARCHITECTURE_REMEDIATION.slice().sort());
         continue;
       }
       if (stage === "synthesis") {
@@ -285,9 +326,11 @@ describe("capability matrix", () => {
     expect(checkpointed.has("request_section_focus")).toBe(true);
     expect(checkpointed.has("request_completion")).toBe(true);
     // Phase 2G §49: dependency-review reopen is granted in the section-ready
-    // substates (the controller rejects non-qualifying targets precisely);
-    // decomposition-needed still withholds it — no Section exists there.
-    expect(noDag.has("request_reopen")).toBe(false);
+    // substates (the controller rejects non-qualifying targets precisely).
+    // R1a §18/§41: decomposition-needed grants it too — the blocker-driven
+    // ARCHITECTURE reopen must be reachable before any Section exists
+    // (section targets are still refused precisely — none exist there).
+    expect(noDag.has("request_reopen")).toBe(true);
     expect(revisionless.has("request_reopen")).toBe(true);
     expect(checkpointed.has("request_reopen")).toBe(true);
   });
@@ -300,9 +343,13 @@ describe("capability matrix", () => {
     // The real synthesis surface: begin + (with input) submit.
     expect(synthesis.has("begin_synthesis")).toBe(true);
     expect(synthesis.has("submit_synthesis_manifest")).toBe(false);
-    // Phase 2G: the no-input substate grants neither validation nor reopen.
+    // Phase 2G: the no-input substate grants no validation surface.
+    // (R1a §10-§14: request_reopen IS granted in every synthesis substate —
+    // the blocker-cure route — but it never bypasses the pipeline: a
+    // synthesis reopen still freezes an amendment Proposal requiring USER
+    // approval, and validation re-runs on the new identity afterwards.)
     expect(synthesis.has("run_semantic_validation")).toBe(false);
-    expect(synthesis.has("request_reopen")).toBe(false);
+    expect(synthesis.has("request_reopen")).toBe(true);
     // Harmless blocker-raising remains available over committed memory.
     expect(synthesis.has("record_question")).toBe(true);
     expect(synthesis.has("raise_conflict")).toBe(true);

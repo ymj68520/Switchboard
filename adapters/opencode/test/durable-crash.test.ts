@@ -942,6 +942,144 @@ describe("process-level crash recovery: semantic validation & reopen (Phase 2G �
     reopened.close();
   });
 
+  // R1 §47 — the architecture-remediation crash windows (real child probes).
+  it("R1 §47: architecture reopen before persist leaves zero partial state with a durable Approval; retry commits once", async () => {
+    const dbFile = path.join(dir, "plan-store.json");
+    const probeResult = runProbe(dbFile, "before-persist", "architecture-reopen");
+    expect(probeResult.status).toBe(134);
+    expect(probeResult.output).not.toContain("PROBE-ARCH-REOPEN");
+
+    const reopened = new DurablePlanStore(dbFile, {
+      now: () => FIXED,
+      staleLockMs: 200,
+      lockTimeoutMs: 2_000,
+    });
+    await reopened.open();
+    const run = await reopened.getRun(planID());
+    // Pre-persist: zero partial state — still synthesis, ARCH@1, sections current.
+    expect(run?.stage).toBe("synthesis");
+    expect(run?.activeWork).toBeUndefined();
+    expect(run?.architecture?.revision).toBe(1);
+    expect(run?.sections).toHaveLength(3);
+    expect(run?.headCommit).toBe("COMMIT-008");
+    // The user approval IS durable; retry commits once.
+    const approval = await reopened.findApprovalForProposal(planID(), "PROP-009" as never);
+    expect(approval).toBeDefined();
+    const controller = new UltraPlanController({ store: reopened, now: () => FIXED });
+    const result = await controller.commitApprovedProposal("ses_crash", "PROP-009" as never);
+    expect(result.run?.stage).toBe("detail");
+    expect(result.run?.activeWork).toEqual({ type: "architecture" });
+    expect(result.run?.architecture?.revision).toBe(1);
+    expect((await reopened.listCommits(planID())).length).toBe(9); // exactly one reopen commit
+    reopened.close();
+  });
+
+  it("R1 §47: architecture reopen after persist recovers the exact remediation substate; retry is idempotent", async () => {
+    const dbFile = path.join(dir, "plan-store.json");
+    const probeResult = runProbe(dbFile, "after-persist", "architecture-reopen");
+    expect(probeResult.status).toBe(134);
+    expect(probeResult.output).not.toContain("PROBE-ARCH-REOPEN");
+
+    const reopened = new DurablePlanStore(dbFile, {
+      now: () => FIXED,
+      staleLockMs: 200,
+      lockTimeoutMs: 2_000,
+    });
+    await reopened.open();
+    const run = await reopened.getRun(planID());
+    expect(run?.stage).toBe("detail");
+    expect(run?.activeWork).toEqual({ type: "architecture" });
+    expect(run?.architecture?.revision).toBe(1);
+    expect(run?.sections).toHaveLength(3); // unchanged by the reopen itself
+    expect(run?.headCommit).toBe("COMMIT-009");
+    expect((await reopened.listCommits(planID())).length).toBe(9);
+    const controller = new UltraPlanController({ store: reopened, now: () => FIXED });
+    const retry = await controller.commitApprovedProposal("ses_crash", "PROP-009" as never);
+    expect(retry.commit.id).toBe("COMMIT-009");
+    expect((await reopened.listCommits(planID())).length).toBe(9);
+    reopened.close();
+  });
+
+  it("R1 §47: architecture amendment before persist leaves the remediation substate intact with a durable Approval; retry commits ARCH@2 once", async () => {
+    const dbFile = path.join(dir, "plan-store.json");
+    const probeResult = runProbe(dbFile, "before-persist", "architecture-amendment");
+    expect(probeResult.status).toBe(134);
+    expect(probeResult.output).not.toContain("PROBE-ARCH-AMEND");
+
+    const reopened = new DurablePlanStore(dbFile, {
+      now: () => FIXED,
+      staleLockMs: 200,
+      lockTimeoutMs: 2_000,
+    });
+    await reopened.open();
+    const run = await reopened.getRun(planID());
+    // The reopen IS durable; the amendment is not.
+    expect(run?.stage).toBe("detail");
+    expect(run?.activeWork).toEqual({ type: "architecture" });
+    expect(run?.architecture?.revision).toBe(1);
+    expect(run?.sections).toHaveLength(3);
+    expect(run?.headCommit).toBe("COMMIT-009");
+    const approval = await reopened.findApprovalForProposal(planID(), "PROP-010" as never);
+    expect(approval).toBeDefined();
+    const controller = new UltraPlanController({ store: reopened, now: () => FIXED });
+    const result = await controller.commitApprovedProposal("ses_crash", "PROP-010" as never);
+    expect(result.run?.architecture?.revision).toBe(2);
+    expect(result.run?.sections).toEqual([]);
+    expect(result.run?.activeWork).toBeUndefined();
+    expect((await reopened.listCommits(planID())).length).toBe(10); // exactly one amendment commit
+    reopened.close();
+  });
+
+  it("R1 §47: architecture amendment after persist recovers ARCH@2 + invalidated DAG; retry is idempotent", async () => {
+    const dbFile = path.join(dir, "plan-store.json");
+    const probeResult = runProbe(dbFile, "after-persist", "architecture-amendment");
+    expect(probeResult.status).toBe(134);
+    expect(probeResult.output).not.toContain("PROBE-ARCH-AMEND");
+
+    const reopened = new DurablePlanStore(dbFile, {
+      now: () => FIXED,
+      staleLockMs: 200,
+      lockTimeoutMs: 2_000,
+    });
+    await reopened.open();
+    const run = await reopened.getRun(planID());
+    expect(run?.architecture?.revision).toBe(2);
+    expect(run?.sections).toEqual([]);
+    expect(run?.activeWork).toBeUndefined();
+    expect(run?.stage).toBe("detail");
+    expect(run?.headCommit).toBe("COMMIT-010");
+    // §26: old roots remain durable history, marked needs_review.
+    const sec001 = await reopened.getSection(planID(), "SEC-001" as never);
+    expect(sec001).toBeDefined();
+    expect(sec001?.validation).toBe("needs_review");
+    expect((await reopened.listCommits(planID())).length).toBe(10);
+    // The head snapshot distinguishes ARCH@2 + no current decomposition (§51).
+    const head = await reopened.getHeadSnapshot(planID());
+    expect(head?.state.architectureRevision).toBe(2);
+    expect(head?.state.sectionRoots).toBeUndefined();
+    expect(head?.state.sectionDecompositionArchitectureRevision).toBeUndefined();
+    // Retry is idempotent.
+    const controller = new UltraPlanController({ store: reopened, now: () => FIXED });
+    const retry = await controller.commitApprovedProposal("ses_crash", "PROP-010" as never);
+    expect(retry.commit.id).toBe("COMMIT-010");
+    expect((await reopened.listCommits(planID())).length).toBe(10);
+    reopened.close();
+  });
+
+  it("clean architecture-reopen + architecture-amendment probes (controls) publish the exact R1 workspaces", async () => {
+    // Separate stores — each probe drives its own full workflow.
+    const reopenControl = runProbe(path.join(dir, "ctrl-reopen.json"), "none", "architecture-reopen");
+    expect(reopenControl.status).toBe(0);
+    expect(reopenControl.output).toContain(
+      "PROBE-ARCH-REOPEN STAGE=detail ACTIVE=architecture ARCH=1 SECTIONS=3 HEAD=COMMIT-009",
+    );
+    const amendControl = runProbe(path.join(dir, "ctrl-amend.json"), "none", "architecture-amendment");
+    expect(amendControl.status).toBe(0);
+    expect(amendControl.output).toContain(
+      "PROBE-ARCH-AMEND ARCH=2 SECTIONS=0 ACTIVE=none STAGE=detail SEC001=approved/needs_review HEAD=COMMIT-010",
+    );
+  });
+
   it("clean semantic-validation + reopen probes (controls) publish the exact 2G workspaces", async () => {
     const dbFile = path.join(dir, "plan-store.json");
     const validation = runProbe(dbFile, "none", "semantic-validation");

@@ -652,35 +652,187 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
 
     ultraplan_request_reopen: tool({
       description:
-        "Request reopening an APPROVED section (the sanctioned way back to design). In SYNTHESIS: only after " +
-        "semantic validation produced a FINDINGS report — name the target section and the report's finding ids " +
-        "affecting it; the Harness resolves the exact revision and binds the report hash. In DETAIL: a " +
-        "dependency_review of an approved but needs_review section — supply only the section id. This freezes an " +
-        "amendment Proposal; the USER must approve it, and only then does a reopen_section PlanCommit set " +
-        "status approved -> reopened, validation -> needs_review, active work -> the target (and stage synthesis " +
-        "-> detail). You can never set Section status, stage, activeWork, validation, or revision directly, and " +
-        "the approved revision stays immutable — reopen means the design must earn a NEW approved checkpoint.",
+        "Request reopening APPROVED design (the sanctioned way back to design). Reasons: " +
+        "(1) reason=\"semantic_validation\" — a findings report; supply sectionID (or, for an " +
+        "Architecture-scoped finding, nothing — the Harness resolves ARCH) + the finding ids affecting it. " +
+        "(2) reason=\"dependency_review\" — detail stage; supply only the needs_review section id. " +
+        "(3) reason=\"blocking_question\" — supply the blocking question's id; the Harness reopens exactly " +
+        "the Section (or Architecture) the question is scoped to. (4) reason=\"blocking_conflict\" — supply " +
+        "the blocking conflict's id; the Harness resolves the exact target from the conflict's refs. " +
+        "Blocker-driven reopens never require or fabricate a ValidationReport, and the blocker itself stays " +
+        "open — the reopen only opens the remediation workflow; the cure is a later user-approved corrective " +
+        "Proposal (resolve_conflict / resolve_question). This freezes an amendment Proposal; the USER must " +
+        "approve it. You can never set Section/Architecture status, stage, activeWork, validation, or " +
+        "revisions directly, and approved revisions stay immutable.",
       args: {
-        sectionID: tool.schema.string().describe("Target section id (e.g. SEC-002); must be approved with agreeing revision pointers"),
+        reason: tool.schema
+          .enum(["semantic_validation", "dependency_review", "blocking_question", "blocking_conflict"])
+          .optional()
+          .describe("Why the design is being reopened; omit for the legacy sectionID-driven flow (semantic_validation in synthesis, dependency_review in detail)"),
+        sectionID: tool.schema.string().optional().describe("Target section id (semantic_validation / dependency_review reopens)"),
         findingIDs: tool.schema
           .array(tool.schema.string())
           .optional()
-          .describe("Semantic-validation finding ids (e.g. VF-001) from the CURRENT findings report — synthesis-stage reopens only; omit for detail-stage dependency review"),
+          .describe("Semantic-validation finding ids (e.g. VF-001) from the CURRENT findings report — semantic_validation reopens only"),
+        questionID: tool.schema.string().optional().describe("Blocking question id (e.g. Q-003) — reason=blocking_question"),
+        conflictID: tool.schema.string().optional().describe("Blocking conflict id (e.g. CONFLICT-002) — reason=blocking_conflict"),
       },
       async execute(args, context: ToolContext) {
         try {
-          const prepared = await controller.requestReopen(context.sessionID, {
-            sectionID: args.sectionID,
-            ...(args.findingIDs && args.findingIDs.length > 0 ? { findingIDs: args.findingIDs } : {}),
-          });
+          const request: import("../core/controller.js").RequestReopenInput =
+            args.reason === "blocking_question"
+              ? { reason: "blocking_question", questionID: args.questionID ?? "" }
+              : args.reason === "blocking_conflict"
+                ? { reason: "blocking_conflict", conflictID: args.conflictID ?? "" }
+                : {
+                    ...(args.reason ? { reason: args.reason } : {}),
+                    sectionID: args.sectionID ?? "",
+                    ...(args.findingIDs && args.findingIDs.length > 0 ? { findingIDs: args.findingIDs } : {}),
+                  };
+          const prepared = await controller.requestReopen(context.sessionID, request);
+          const firstChange = prepared.proposal.changes[0];
+          const target =
+            firstChange && firstChange.kind === "reopen_architecture"
+              ? `ARCH@${firstChange.target.revision}`
+              : ("sectionID" in request && request.sectionID) || prepared.proposal.scope.id;
           return {
-            title: `Reopen requested for ${args.sectionID}`,
+            title: `Reopen requested for ${target}`,
             output: [
-              `amendment proposal ${prepared.proposal.id} prepared to reopen ${args.sectionID} (hash ${prepared.hash}).`,
+              `amendment proposal ${prepared.proposal.id} prepared to reopen ${target} (hash ${prepared.hash}).`,
               renderProposalForApproval(prepared.proposal),
               "Awaiting USER approval via the approval boundary — you cannot approve or commit it.",
             ].join("\n"),
-            metadata: { proposalID: prepared.proposal.id, target: args.sectionID, hash: prepared.hash },
+            metadata: { proposalID: prepared.proposal.id, target, hash: prepared.hash },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_request_abort: tool({
+      description:
+        "Request an EXPLICIT TERMINAL ABORT of the active planning run (R1 escape hatch — a user escape, " +
+        "NEVER a blocker-resolution shortcut). You supply NOTHING. A real one-shot user confirmation is " +
+        "required; on explicit Allow the run becomes lifecycle=aborted (terminal), activeWork is cleared, " +
+        "and committed Plan Memory, approvals, commits, evidence, and HEAD are untouched. On deny the run " +
+        "stays active. A subsequent /ultra-plan starts a NEW run. Note: blockers (blocking questions/" +
+        "conflicts) have sanctioned remediation paths — prefer those; abort terminates the whole run.",
+      args: {},
+      async execute(_args, context: ToolContext) {
+        try {
+          // Zero authority-bearing arguments: the Harness resolves the run and
+          // validates abortability; the USER decides via the one-shot ask.
+          const gate = await controller.beginAbort(context.sessionID);
+          try {
+            await context.ask({
+              permission: gate.permission,
+              patterns: [],
+              always: [],
+              metadata: {
+                kind: "ultraplan.run-abort",
+                oneShot: true,
+                planID: gate.planID,
+                stage: gate.stage,
+              },
+            });
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            return {
+              title: "Run abort denied by user",
+              output: `The user DENIED the abort; run ${gate.planID} remains active (stage ${gate.stage}). Nothing changed.`,
+              metadata: { planID: gate.planID, aborted: false, denialReason: reason },
+            };
+          }
+          const result = await controller.confirmAbort(gate.planID);
+          return {
+            title: `Run ${result.run.id} aborted`,
+            output: result.statusText,
+            metadata: { planID: result.run.id, lifecycle: result.run.lifecycle, aborted: true },
+          };
+        } catch (error) {
+          const structured = asToolResult(error);
+          if (structured) return structured;
+          throw error;
+        }
+      },
+    }),
+
+    ultraplan_prepare_architecture_amendment: tool({
+      description:
+        "AMEND the approved Architecture (R1 — the ONLY sanctioned way to revise ARCH; available only in the " +
+        "architecture-remediation detail substate, entered by an approved reopen). You supply the NEW design " +
+        "content in the closed architecture schema (summary, components, boundaries, dataFlows, principles, " +
+        "unresolvedQuestionIDs, basedOn) plus optional blocker resolutions (resolveQuestionIDs, " +
+        "resolveConflictIDs). The Harness supplies everything authoritative: the exact superseded ARCH@n, the " +
+        "resulting ARCH@n+1, status, and every resolution ref. Committing this proposal atomically publishes " +
+        "ARCH@n+1 and INVALIDATES the current Section DAG (old sections remain durable history; a NEW " +
+        "decomposition against ARCH@n+1 is mandatory). The Proposal is NOT approval — the USER must approve " +
+        "it; you can never set Architecture revisions, statuses, or sections directly.",
+      args: {
+        summary: tool.schema.string().describe("New top-level design summary"),
+        components: tool.schema
+          .array(tool.schema.object({ name: tool.schema.string(), summary: tool.schema.string() }))
+          .describe("New architecture components"),
+        boundaries: tool.schema
+          .array(tool.schema.object({ name: tool.schema.string(), description: tool.schema.string() }))
+          .describe("New architecture boundaries"),
+        dataFlows: tool.schema
+          .array(
+            tool.schema.object({
+              from: tool.schema.string(),
+              to: tool.schema.string(),
+              description: tool.schema.string(),
+            }),
+          )
+          .describe("New architecture data flows"),
+        principles: tool.schema
+          .array(tool.schema.object({ statement: tool.schema.string() }))
+          .describe("New architecture principles"),
+        unresolvedQuestionIDs: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Existing open question ids carried into Architecture.unresolved"),
+        basedOn: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Committed decision ids (e.g. DEC-001) the amended design stands on"),
+        resolveQuestionIDs: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Open questions resolved BY this amendment (resolution text is deterministic; the question stays open until the commit succeeds)"),
+        resolveConflictIDs: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Open conflicts resolved BY this amendment (action=amend_architecture; the resolution binds the exact resulting ARCH@n+1)"),
+      },
+      async execute(args, context: ToolContext) {
+        try {
+          const prepared = await controller.prepareArchitectureAmendment(context.sessionID, {
+            architecture: {
+              summary: args.summary,
+              components: args.components ?? [],
+              boundaries: args.boundaries ?? [],
+              dataFlows: args.dataFlows ?? [],
+              principles: args.principles ?? [],
+              ...(args.unresolvedQuestionIDs
+                ? { unresolvedQuestionIDs: args.unresolvedQuestionIDs as import("../core/ids.js").QuestionID[] }
+                : {}),
+              ...(args.basedOn ? { basedOn: args.basedOn as import("../core/ids.js").DecisionID[] } : {}),
+            },
+            ...(args.resolveQuestionIDs ? { resolveQuestionIDs: args.resolveQuestionIDs } : {}),
+            ...(args.resolveConflictIDs ? { resolveConflictIDs: args.resolveConflictIDs } : {}),
+          });
+          return {
+            title: `Architecture amendment ${prepared.proposal.id} prepared`,
+            output: [
+              `Proposal ${prepared.proposal.id} prepared (hash ${prepared.hash}).`,
+              renderProposalForApproval(prepared.proposal),
+              "Awaiting USER approval via the approval boundary — you cannot approve or commit it.",
+            ].join("\n"),
+            metadata: { proposalID: prepared.proposal.id, hash: prepared.hash },
           };
         } catch (error) {
           const structured = asToolResult(error);

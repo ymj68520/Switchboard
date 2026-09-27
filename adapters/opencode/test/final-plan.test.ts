@@ -573,11 +573,22 @@ describe("mandatory post-approval FinalizationGate (§25-§31)", () => {
     const world = await evidenceCandidateWorld();
     const { prepared, begun } = await prepareAndAwait(world, world.sessionID);
     const { approval } = await world.controller.recordApproval(world.sessionID, prepared.proposal.id, begun.request);
-    await world.controller.raiseConflict(world.sessionID, {
-      type: "decision",
-      refs: [],
-      description: "Blocking conflict after approval",
-      severity: "blocking",
+    // R1a §8: the raise boundary refuses unremediable blocking conflicts, so
+    // the post-approval blocker for this second-gate test is seeded directly.
+    const conflictRun = (await world.store.getRun(world.runID)) as PlanningRun;
+    await world.store.saveRun({
+      ...conflictRun,
+      conflicts: [
+        ...conflictRun.conflicts,
+        {
+          id: "CONF-001" as never,
+          type: "decision" as const,
+          refs: [],
+          description: "Blocking conflict after approval",
+          severity: "blocking" as const,
+          status: "open" as const,
+        },
+      ],
     });
     await expectErrorCode(
       world.store.commitTransaction({ planID: world.runID, proposalID: prepared.proposal.id, approvalID: approval.id }),

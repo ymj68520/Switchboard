@@ -71,6 +71,16 @@ export interface PlanningRun {
   sections: SectionRef[];
   decisions: DecisionRef[];
 
+  /**
+   * R1b §50 — ARCHITECTURE↔SECTION-SET PROVENANCE: the exact Architecture
+   * revision the CURRENT Section DAG was decomposed from. Set by the
+   * decomposition PlanCommit, CLEARED by the amend_architecture PlanCommit
+   * (the DAG it proved is no longer current), and absent on runs that predate
+   * R1 (legacy tolerance). Makes "current DAG was decomposed from the current
+   * ARCH revision" provable from data — never inferred from timestamps.
+   */
+  sectionDecompositionArchitecture?: ArchitectureRef;
+
   openQuestions: OpenQuestion[];
   conflicts: Conflict[];
 

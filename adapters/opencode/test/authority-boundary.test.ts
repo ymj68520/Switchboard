@@ -464,13 +464,13 @@ describe("completion / reopen authority audit (tests 19/20)", () => {
     }
 
     // Reopen targets approved artifacts, which only exist after commits. With
-    // no committed sections the detail substate withholds the reopen surface
-    // entirely (Phase 2D §23; Phase 2G grants request_reopen only in the
-    // section-ready substates) — the request fails deterministically and
-    // mutates nothing.
+    // no committed sections, R1 still exposes request_reopen in the
+    // decomposition-needed substate (the blocker-driven ARCHITECTURE reopen
+    // must stay reachable), but the section-targeted request fails
+    // deterministically at the exact-target check and mutates nothing.
     await expectErrorCode(
       controller.requestReopen("ses_rr", { sectionID: "SEC-001" }),
-      "capability_not_available",
+      "unknown_reference",
     );
     expect(await store.listSections(run.id)).toHaveLength(0);
     await expectErrorCode(store.commitTransaction(COMMIT_INPUT), "unknown_reference");

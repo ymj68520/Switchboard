@@ -812,11 +812,14 @@ describe("sanctioned section reopen (§69 admission matrix)", () => {
     const { validator } = fakeValidator([CLEAN_OUTPUT]);
     const world = await manifestWorld(validator);
     await world.controller.runSemanticValidation("ses_val");
-    // The clean substate does not grant request_reopen at all (§35) — a clean
-    // report cannot authorize a reopen, and nothing needs to be reopened.
+    // R1a: the clean substate GRANTS request_reopen (the blocker-cure route),
+    // but a semantic_validation reopen still cannot ride a CLEAN report — the
+    // freeze refuses with the exact reason and nothing is prepared (§35: a
+    // clean report cannot authorize a reopen; only blocker-driven reasons
+    // bypass the report requirement, and they name their own blocker).
     await expectErrorCode(
       world.controller.requestReopen("ses_val", { sectionID: "SEC-002", findingIDs: ["VF-001"] }),
-      "capability_not_available",
+      "reopen_reason_invalid",
     );
   });
 
@@ -913,10 +916,13 @@ describe("sanctioned section reopen (§69 admission matrix)", () => {
 
   it("reopen without a current findings report is refused (§41)", async () => {
     const world = await manifestWorld();
-    // With no report at all, the synthesis substate withholds request_reopen.
+    // With no report at all, the semantic_validation reopen is refused at the
+    // report lookup (R1a: the capability itself stays granted in every
+    // synthesis substate — the blocker-driven reasons are the report-free
+    // routes, and they never fabricate a ValidationReport).
     await expectErrorCode(
       world.controller.requestReopen("ses_val", { sectionID: "SEC-002", findingIDs: ["VF-001"] }),
-      "capability_not_available",
+      "validation_report_missing",
     );
     // With a findings report bound to the current identity, unknown finding
     // ids are refused.

@@ -1178,11 +1178,21 @@ describe("idempotency, live-blocker races, and identity drift (§46/§49/§50/§
   it("§49: blocked finalization creates no candidate, no stage transition, no HEAD movement", async () => {
     const world = await cleanWorld();
     const runBefore = (await world.store.getRun("PLAN-001" as never)) as PlanningRun;
-    await world.controller.raiseConflict("ses_fin", {
-      type: "decision",
-      refs: [],
-      description: "Blocking disagreement",
-      severity: "blocking",
+    // R1a §8: the raise boundary refuses unremediable blocking conflicts, so
+    // the run-global blocker for this gate test is seeded directly.
+    await world.store.saveRun({
+      ...runBefore,
+      conflicts: [
+        ...runBefore.conflicts,
+        {
+          id: "CONF-001" as never,
+          type: "decision" as const,
+          refs: [],
+          description: "Blocking disagreement",
+          severity: "blocking" as const,
+          status: "open" as const,
+        },
+      ],
     });
     const result = await world.controller.requestFinalization("ses_fin");
     expect(result.gate.result).toBe("blocked");

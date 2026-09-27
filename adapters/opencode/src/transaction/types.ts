@@ -9,6 +9,7 @@
  * approval).
  */
 import type {
+  ConflictID,
   DecisionID,
   PlanID,
   ProposalID,
@@ -79,6 +80,39 @@ export type ProposalChangeKind =
    */
   | "reopen_section"
   /**
+   * Phase R1a (blocker cure, brief §4-§7): the ONLY path that performs
+   * `open → resolved` on a Conflict. NOT part of the generic vocabulary
+   * tail that tools may improvise — it IS prepared through the generic
+   * proposal-intent boundary, but the Harness resolves the exact conflict and
+   * the exact remediation binding, and the authoritative transition happens
+   * only inside a user-approved PlanCommit. The change names the open Conflict
+   * and the deterministic remediation proof (the action + the exact ref whose
+   * creation/identity the same Proposal or run state witnesses).
+   */
+  | "resolve_conflict"
+  /**
+   * Phase R1b (brief §18-§20) — sanctioned ARCHITECTURE reopen. NOT part of
+   * the generic proposal vocabulary: only the narrow `ultraplan_request_reopen`
+   * operation freezes it, bound to an exact Architecture-scoped blocker reason
+   * (semantic-validation finding / blocking question / blocking conflict). The
+   * change carries NO design content: the commit only moves the run into the
+   * architecture-remediation workflow (stage → detail, activeWork → the
+   * Architecture); ARCH@n stays approved and immutable and NO new revision is
+   * created by reopening.
+   */
+  | "reopen_architecture"
+  /**
+   * Phase R1b (brief §22-§26) — the ARCHITECTURE amendment. NOT part of the
+   * generic proposal vocabulary: the only entry path is the dedicated
+   * `ultraplan_prepare_architecture_amendment` operation in the
+   * architecture-remediation detail substate. The change carries the complete
+   * exact resulting ARCH@n+1 (Harness-assigned revision, frozen "approved"),
+   * invalidates the Section DAG decomposed from ARCH@n (run.sections → [],
+   * provenance cleared), and is written VERBATIM at commit. ARCH@n stays
+   * byte-identical immutable history.
+   */
+  | "amend_architecture"
+  /**
    * Phase 2I — the Final PlanCommit mutation (brief §5). Legal ONLY inside
    * `Proposal.type = "final_plan"` (and a final_plan Proposal carries exactly
    * one), and NOT part of the generic model-facing proposal vocabulary: the
@@ -89,10 +123,17 @@ export type ProposalChangeKind =
   | "add_final_plan";
 
 /**
- * Why a Section is being reopened (Phase 2G brief §40). `semantic_validation`
- * binds the EXACT ValidationReport (id + hash) and the exact finding ids the
- * user authorizes; `dependency_review` binds the invalidated Section state for
- * the detail-stage review loop (brief §49/§50).
+ * Why a Section is being reopened. `semantic_validation` binds the EXACT
+ * ValidationReport (id + hash) and the exact finding ids the user authorizes;
+ * `dependency_review` binds the invalidated Section state for the detail-stage
+ * review loop (brief §49/§50). R1a adds the BLOCKER-DRIVEN reasons (brief
+ * §10-§14): a blocking Question or blocking Conflict whose exact refs identify
+ * this Section authorizes reopening it WITHOUT any ValidationReport — a
+ * blocker-driven reopen is a distinct deterministic reason, and a
+ * ValidationReport is never fabricated to manufacture one (brief §14). The
+ * bound blocker ids are part of the Proposal hash; the blocker stays open
+ * until a subsequent corrective Proposal commits its own sanctioned cure
+ * (`resolve_conflict` / `resolve_question`).
  */
 export type ReopenSectionReason =
   | {
@@ -101,7 +142,27 @@ export type ReopenSectionReason =
       reportHash: string;
       findingIDs: import("../core/ids.js").ValidationFindingID[];
     }
-  | { type: "dependency_review"; validation: Section["validation"] };
+  | { type: "dependency_review"; validation: Section["validation"] }
+  | { type: "blocking_question"; questionID: QuestionID }
+  | { type: "blocking_conflict"; conflictIDs: ConflictID[] };
+
+/**
+ * Why an Architecture is being reopened (Phase R1b, brief §18-§20): an
+ * Architecture-scoped validation finding, a blocking Architecture-scoped
+ * Question, or a blocking Conflict whose exact refs identify the Architecture.
+ * The reopen carries NO design content — it only moves the run into the
+ * architecture-remediation workflow; the design change itself is a separate
+ * user-approved `amend_architecture` Proposal.
+ */
+export type ReopenArchitectureReason =
+  | {
+      type: "semantic_validation";
+      reportID: import("../core/ids.js").ValidationReportID;
+      reportHash: string;
+      findingIDs: import("../core/ids.js").ValidationFindingID[];
+    }
+  | { type: "blocking_question"; questionID: QuestionID }
+  | { type: "blocking_conflict"; conflictIDs: ConflictID[] };
 
 /**
  * Content of a NEW decision as approved. The Harness assigned id/revision at
@@ -255,6 +316,54 @@ export type ProposalChange =
         /** Freeze-captured summary of each cited finding (semantic_validation only). */
         findings?: { id: string; category: string; statement: string }[];
       };
+    }
+  | {
+      kind: "resolve_conflict";
+      /**
+       * Phase R1a §4-§7: the open Conflict this change resolves. The Harness
+       * resolves the exact Conflict object; the model may only name it.
+       */
+      conflictID: ConflictID;
+      /**
+       * The deterministic remediation proof (brief §6 — never "resolved
+       * because the model says so"). `ref` is bound BY THE HARNESS at freeze:
+       * `amend_decision` → the exact resulting DecisionRef of the paired
+       * `amend_decision` change EARLIER in this same Proposal;
+       * `amend_architecture` → the exact resulting ArchitectureRef of the
+       * paired amendment change (Phase R1b); `revise_proposal` → the exact
+       * carrying Proposal's own ref (the only Proposal identity whose
+       * relationship to the conflict this change can prove — the conflict
+       * names a ref this same Proposal addresses).
+       */
+      resolution: {
+        action: "revise_proposal" | "amend_decision" | "amend_architecture";
+        ref: MemoryRef;
+      };
+    }
+  | {
+      kind: "reopen_architecture";
+      /**
+       * Phase R1b §19: the exact committed ArchitectureRef being reopened
+       * (Harness-resolved). No new revision is created; ARCH@n remains
+       * approved and immutable; the commit only moves the run into the
+       * architecture-remediation workflow.
+       */
+      target: ArchitectureRef;
+      reason: ReopenArchitectureReason;
+    }
+  | {
+      kind: "amend_architecture";
+      /**
+       * Phase R1b §23/§24: the COMPLETE exact resulting ARCH@n+1 as approved —
+       * id/revision/status Harness-assigned at freeze (superseding the exact
+       * ARCH@n the proposal scope binds), written VERBATIM at commit. The
+       * commit also invalidates the Section DAG decomposed from ARCH@n
+       * (brief §26: run.sections → [], decomposition provenance cleared,
+       * activeWork cleared) — conservative re-decomposition, never DAG
+       * patching.
+       */
+      supersedes: ArchitectureRef;
+      architecture: ApprovedArchitecture;
     }
   | {
       kind: "add_final_plan";

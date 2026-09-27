@@ -623,6 +623,13 @@ export class DurablePlanStore extends InMemoryPlanStore {
     return this.withLock(() => super.completeHandoffRun(planID));
   }
 
+  /** R1a §16: durable abort — under the write lock like every mutation. */
+  override async abortRun(
+    planID: Parameters<InMemoryPlanStore["abortRun"]>[0],
+  ): ReturnType<InMemoryPlanStore["abortRun"]> {
+    return this.withLock(() => super.abortRun(planID));
+  }
+
   /** TEST/FIXTURE ONLY (see base class). Wrapped so seeding is durable. */
   override seedCommittedState(
     planID: Parameters<InMemoryPlanStore["seedCommittedState"]>[0],
@@ -969,6 +976,19 @@ export class DurablePlanStore extends InMemoryPlanStore {
     await this.ensureOpen();
     this.refreshFromDisk();
     return super.getHandoffDelivery(planID, handoffID);
+  }
+
+  /**
+   * R2 brief §5 — the snapshot-consistent context read boundary: ONE refresh
+   * of the atomically-published document, then every family read comes from
+   * that single hydrated state (the per-read refreshes of the ordinary read
+   * API are deliberately NOT used here, so a concurrent PlanCommit can never
+   * split one assembly across two HEADs). No writer lock is held.
+   */
+  override async capturePlanningContextState(planID: Parameters<InMemoryPlanStore["capturePlanningContextState"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.capturePlanningContextState(planID);
   }
 }
 

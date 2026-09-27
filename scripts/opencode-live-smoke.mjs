@@ -182,6 +182,13 @@ async function main() {
       ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_section_decomposition"),
       ultraplanTools.includes("ultraplan_prepare_section_decomposition") ? "registered" : "missing from tool ids",
     );
+    // -- R1 §54: the new blocker-remediation operations are registered --------
+    report(
+      "R1 blocker-remediation tools registered (ultraplan_request_abort + ultraplan_prepare_architecture_amendment)",
+      ultraplanTools.map((id) => String(id)).includes("ultraplan_request_abort") &&
+        ultraplanTools.map((id) => String(id)).includes("ultraplan_prepare_architecture_amendment"),
+      "registered",
+    );
 
     // -- real session + /ultra-plan ------------------------------------------
     const sessionRes = await fetch(`${base}/session`, {
@@ -251,6 +258,20 @@ async function main() {
     // -- Phase 2D §48 live vertical: the decomposition capability is live and
     // deterministically OUT of reach outside the detail decomposition-needed
     // substate (this run is in architecture, so preparation must refuse).
+    // R1 §54: the architecture amendment is live-registered and
+    // deterministically OUT of reach outside the architecture-remediation
+    // detail substate (this run is in architecture).
+    const amendProbe = await promptAndWait(
+      base,
+      sessionID,
+      "Call the ultraplan_prepare_architecture_amendment tool now with a one-component architecture and report its result verbatim.",
+      /capability_not_available/,
+    );
+    report(
+      "ultraplan_prepare_architecture_amendment refuses outside architecture-remediation (live model invocation)",
+      /capability_not_available/.test(JSON.stringify(amendProbe.text ?? "")),
+      "refused with structured capability_not_available",
+    );
     const decompProbe = await promptAndWait(
       base,
       sessionID,

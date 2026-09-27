@@ -129,10 +129,34 @@ const fakeSemanticValidator = {
   },
 };
 
+// R1 §47: an ARCHITECTURE-scoped finding drives the architecture-reopen and
+// architecture-amendment crash windows.
+const archFindingValidator = {
+  async validate() {
+    return {
+      text: JSON.stringify({
+        result: "findings",
+        findings: [
+          {
+            category: "missing_design",
+            statement: "The architecture omits the recovery boundary required by the approved sections.",
+            scope: { architecture: { id: "ARCH", revision: 1 } },
+            sources: [{ kind: "architecture" }],
+          },
+        ],
+      }),
+    };
+  },
+};
+
 const controller = new UltraPlanController({
   store,
   ledger: new InMemoryObservationLedger(),
-  ...(mode === "semantic-validation" || mode === "reopen" ? { semanticValidator: fakeSemanticValidator } : {}),
+  ...(mode === "semantic-validation" || mode === "reopen"
+    ? { semanticValidator: fakeSemanticValidator }
+    : mode === "architecture-reopen" || mode === "architecture-amendment"
+      ? { semanticValidator: archFindingValidator }
+      : {}),
   now: () => FIXED,
 });
 
@@ -530,6 +554,96 @@ if (mode === "section-decomposition") {
   console.log(
     `PROBE-REOPEN SEC-002 STATUS=${sec002?.status} VALIDATION=${sec002?.validation}` +
       ` STAGE=${finalRun?.stage} ACTIVE=${finalRun?.activeWork?.type === "section" ? finalRun.activeWork.id : "none"}` +
+      ` HEAD=${finalRun?.headCommit ?? "none"}`,
+  );
+  process.exit(0);
+} else if (mode === "architecture-reopen" || mode === "architecture-amendment") {
+  // R1 §47 crash scenarios. Both drive to synthesis with an ARCHITECTURE-scoped
+  // findings report, then:
+  //   architecture-reopen    → the blocker-driven ARCHITECTURE reopen (no
+  //                            design content), durable Approval, crash on the
+  //                            atomic reopen_architecture PlanCommit (stage →
+  //                            detail, activeWork → architecture). before:
+  //                            zero partial state, Approval retriable; after:
+  //                            exact remediation substate, retry idempotent.
+  //   architecture-amendment → the reopen commits CLEANLY first, then the
+  //                            amend_architecture Proposal (ARCH@2 + Section
+  //                            DAG invalidation) carries the crash seam.
+  //                            before: zero partial state; after: exactly one
+  //                            ARCH@2, sections reset, retry idempotent.
+  await driveToSynthesis();
+  await controller.beginSynthesis("ses_crash");
+  await controller.submitSynthesisManifest("ses_crash", PROBE_MANIFEST_DRAFT);
+  const { report } = await controller.runSemanticValidation("ses_crash");
+  if (report.result !== "findings") {
+    console.error(`PROBE-DRIVE-FAILED expected a findings report, got ${report.result}`);
+    process.exit(1);
+  }
+  const archReopen = await controller.requestReopen("ses_crash", {
+    reason: "semantic_validation",
+    findingIDs: report.findings.map((finding) => finding.id),
+  });
+  if (archReopen.proposal.changes[0]?.kind !== "reopen_architecture") {
+    console.error("PROBE-DRIVE-FAILED expected a reopen_architecture change");
+    process.exit(1);
+  }
+  const reopenBegun = await controller.beginProposalApproval("ses_crash", archReopen.proposal.id);
+  await controller.recordApproval("ses_crash", archReopen.proposal.id, reopenBegun.request);
+  if (mode === "architecture-reopen") {
+    // The crash seam sits on the ONE reopen publication.
+    if (crashPoint === "before-persist") store.armCrashSeam("before-persist");
+    await store.commitTransaction({
+      planID: run.id,
+      proposalID: archReopen.proposal.id,
+      approvalID: (await store.findApprovalForProposal(run.id, archReopen.proposal.id)).id,
+    });
+    if (crashPoint === "after-persist") {
+      store.armCrashSeam("after-persist");
+      process.abort();
+    }
+    const finalRun = await store.getRun(run.id);
+    console.log(
+      `PROBE-ARCH-REOPEN STAGE=${finalRun?.stage} ACTIVE=${finalRun?.activeWork?.type ?? "none"}` +
+        ` ARCH=${finalRun?.architecture?.revision} SECTIONS=${finalRun?.sections.length}` +
+        ` HEAD=${finalRun?.headCommit ?? "none"}`,
+    );
+    process.exit(0);
+  }
+  // architecture-amendment: the reopen commits CLEANLY (no seam) so the
+  // remediation substate is durable; then the amendment carries the seam.
+  await store.commitTransaction({
+    planID: run.id,
+    proposalID: archReopen.proposal.id,
+    approvalID: (await store.findApprovalForProposal(run.id, archReopen.proposal.id)).id,
+  });
+  run = await store.getRun(run.id);
+  const amendment = await controller.prepareArchitectureAmendment("ses_crash", {
+    architecture: {
+      summary: "Probe architecture, amended with the recovery boundary",
+      components: [{ name: "Core", summary: "kernel" }, { name: "Recovery", summary: "crash-safe recovery" }],
+      boundaries: [],
+      dataFlows: [],
+      principles: [],
+    },
+  });
+  const amendBegun = await controller.beginProposalApproval("ses_crash", amendment.proposal.id);
+  await controller.recordApproval("ses_crash", amendment.proposal.id, amendBegun.request);
+  if (crashPoint === "before-persist") store.armCrashSeam("before-persist");
+  await store.commitTransaction({
+    planID: run.id,
+    proposalID: amendment.proposal.id,
+    approvalID: (await store.findApprovalForProposal(run.id, amendment.proposal.id)).id,
+  });
+  if (crashPoint === "after-persist") {
+    store.armCrashSeam("after-persist");
+    process.abort();
+  }
+  const finalRun = await store.getRun(run.id);
+  const sec001 = await store.getSection(run.id, "SEC-001");
+  console.log(
+    `PROBE-ARCH-AMEND ARCH=${finalRun?.architecture?.revision} SECTIONS=${finalRun?.sections.length}` +
+      ` ACTIVE=${finalRun?.activeWork?.type ?? "none"} STAGE=${finalRun?.stage}` +
+      ` SEC001=${sec001 ? `${sec001.status}/${sec001.validation}` : "missing"}` +
       ` HEAD=${finalRun?.headCommit ?? "none"}`,
   );
   process.exit(0);

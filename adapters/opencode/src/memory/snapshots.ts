@@ -35,8 +35,19 @@ export interface SnapshotState {
    * initial focus of the decomposition commit. Absent means no active focus
    * (pre-decomposition snapshots, or the final completion that cleared the
    * focus and entered synthesis) — absence is meaningful, never backfilled.
+   * R1b: `{type: "architecture"}` records the architecture-remediation focus
+   * of a reopen_architecture commit.
    */
   activeWork?: WorkRef;
+  /**
+   * R1b §50/§51 (additive, optional): the exact Architecture revision the
+   * Section DAG recorded in `sectionRoots` was decomposed from — distinguishing
+   * ARCH@1+old DAG / ARCH@n+1+no current decomposition / ARCH@n+1+new DAG from
+   * the snapshot alone. Present on decomposition commits, absent on the
+   * amend_architecture commit (the DAG it proved is invalidated) and on
+   * pre-R1 snapshots.
+   */
+  sectionDecompositionArchitectureRevision?: number;
 }
 
 /**

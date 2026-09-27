@@ -306,6 +306,25 @@ const SEEDS: Record<string, ContractSeed> = {
     capability: "prepare_final_plan",
     requiresActiveRun: true,
   },
+  // R1a §16: explicit terminal abort. Zero authority-bearing arguments and a
+  // real one-shot user confirmation; a narrow Harness workflow transition —
+  // never a Proposal/PlanCommit, never a blocker-resolution substitute.
+  ultraplan_request_abort: {
+    authority: "working_state",
+    capability: "request_abort",
+    requiresActiveRun: true,
+  },
+  // R1b §22-§25: the dedicated Architecture amendment (the ONLY sanctioned way
+  // to revise an approved Architecture). Granted only in the
+  // architecture-remediation detail substate; the model supplies the new
+  // design content in the closed Architecture schema plus optional blocker
+  // resolutions — id/revision/status/base/result refs are Harness-assigned,
+  // and the Section DAG invalidation happens inside the approved PlanCommit.
+  ultraplan_prepare_architecture_amendment: {
+    authority: "proposal_intent",
+    capability: "prepare_architecture_amendment",
+    requiresActiveRun: true,
+  },
 };
 
 function buildContract(name: string, seed: ContractSeed): ToolContract {
@@ -342,4 +361,14 @@ export const FORBIDDEN_TOOL_NAMES = [
   "mark_approved",
   "commit_anything",
   "set_stage",
+  // R1a §5: no standalone authoritative conflict-resolution tool — the
+  // resolution rides an approved resolve_conflict change inside a Proposal.
+  "ultraplan_resolve_conflict",
+  // R1b §38: no direct architecture mutation surface.
+  "set_architecture",
+  "set_architecture_revision",
+  "mark_architecture_reopened",
+  "clear_sections",
+  "reset_dag",
+  "force_redecomposition",
 ] as const;

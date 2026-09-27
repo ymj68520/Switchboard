@@ -173,8 +173,12 @@ function renderChange(change: ProposalChange): string[] {
         for (const finding of change.reopen.findings ?? change.reason.findingIDs.map((id) => ({ id, category: "", statement: "" }))) {
           lines.push(`    ${finding.id}${finding.category ? ` ${finding.category}` : ""}${finding.statement ? ` — ${finding.statement}` : ""}`);
         }
-      } else {
+      } else if (change.reason.type === "dependency_review") {
         lines.push(`  Reason: dependency_review (validation ${change.reason.validation})`);
+      } else if (change.reason.type === "blocking_question") {
+        lines.push(`  Reason: blocker-driven reopen — blocking question ${change.reason.questionID} (stays OPEN until a later corrective Proposal resolves it)`);
+      } else {
+        lines.push(`  Reason: blocker-driven reopen — blocking conflict(s) ${change.reason.conflictIDs.join(", ")} (stay OPEN until a later corrective Proposal resolves them)`);
       }
       lines.push("  Effect if approved:");
       lines.push("  Section status: approved -> reopened");
@@ -183,6 +187,73 @@ function renderChange(change: ProposalChange): string[] {
         lines.push("  Stage: synthesis -> detail");
       }
       lines.push(`  Active work: ${target.id}`);
+      return lines;
+    }
+    case "resolve_conflict": {
+      // R1a §4-§6: the CONFLICT RESOLUTION view — names the conflict, the
+      // remediation action, and the exact bound ref the same Proposal or run
+      // state witnesses.
+      return [
+        `RESOLVE CONFLICT ${change.conflictID}`,
+        `  Remediation: ${change.resolution.action}`,
+        `  Bound ref: ${change.resolution.ref.kind}${"id" in change.resolution.ref ? ` ${change.resolution.ref.id}` : ""}${"revision" in change.resolution.ref && change.resolution.ref.revision !== undefined ? `@${change.resolution.ref.revision}` : ""}`,
+        "  Effect if approved: conflict status open -> resolved (immutable historical state).",
+      ];
+    }
+    case "reopen_architecture": {
+      // R1b §19-§20: the ARCHITECTURE REOPEN view — NO design content; the
+      // commit only moves the run into the remediation workflow.
+      const lines = [
+        "ARCHITECTURE REOPEN",
+        `  Architecture: ARCH@${change.target.revision} (stays approved and immutable — reopen creates NO new revision)`,
+      ];
+      if (change.reason.type === "semantic_validation") {
+        lines.push(`  Semantic validation report: ${change.reason.reportID} (hash ${change.reason.reportHash.slice(0, 16)}…)`);
+        lines.push(`  Findings: ${change.reason.findingIDs.join(", ")}`);
+      } else if (change.reason.type === "blocking_question") {
+        lines.push(`  Reason: blocker-driven reopen — blocking question ${change.reason.questionID} (stays OPEN until the amendment resolves it)`);
+      } else {
+        lines.push(`  Reason: blocker-driven reopen — blocking conflict(s) ${change.reason.conflictIDs.join(", ")} (stay OPEN until the amendment resolves them)`);
+      }
+      lines.push("  Effect if approved:");
+      lines.push(`  Stage: -> detail (architecture remediation)`);
+      lines.push(`  Active work: ARCH@${change.target.revision}`);
+      lines.push("  Sections: unchanged by this commit (invalidation happens with the amendment)");
+      lines.push("  Design change: a SEPARATE user-approved amend_architecture Proposal");
+      return lines;
+    }
+    case "amend_architecture": {
+      // R1b §23-§26: the ARCHITECTURE AMENDMENT view — full new design +
+      // invalidation effects in ONE payload.
+      const a = change.architecture;
+      const lines = [
+        `AMEND ARCHITECTURE ${a.id}@${a.revision} (supersedes ARCH@${change.supersedes.revision}; status ${a.status})`,
+        `  Summary: ${a.summary}`,
+      ];
+      if (a.components.length > 0) {
+        lines.push(`  Components: ${a.components.map((c) => `${c.name} — ${c.summary}`).join("; ")}`);
+      }
+      if (a.boundaries.length > 0) {
+        lines.push(`  Boundaries: ${a.boundaries.map((b) => `${b.name} — ${b.description}`).join("; ")}`);
+      }
+      if (a.dataFlows.length > 0) {
+        lines.push(`  Data flows: ${a.dataFlows.map((f) => `${f.from} -> ${f.to} (${f.description})`).join("; ")}`);
+      }
+      if (a.principles.length > 0) {
+        lines.push(`  Principles: ${a.principles.map((p) => p.statement).join("; ")}`);
+      }
+      if (a.basedOn.length > 0) {
+        lines.push(`  Based on decisions: ${a.basedOn.join(", ")}`);
+      }
+      if (a.unresolved.length > 0) {
+        lines.push(`  Unresolved questions: ${a.unresolved.map((q) => `${q.id}${q.blocking ? " (blocking)" : ""}`).join(", ")}`);
+      }
+      lines.push("  Effect if approved:");
+      lines.push(`  ARCH@${change.supersedes.revision}: byte-identical immutable history`);
+      lines.push(`  Run architecture: ARCH@${change.supersedes.revision} -> ARCH@${a.revision}`);
+      lines.push("  Section DAG decomposed from the old ARCH: conservatively INVALIDATED");
+      lines.push("    - old Section roots remain durable, readable history (marked needs_review)");
+      lines.push("    - run.sections -> [] and a NEW decomposition against the new ARCH is mandatory");
       return lines;
     }
     case "add_final_plan": {

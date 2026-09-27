@@ -45,6 +45,8 @@ export const ULTRA_PLAN_CAPABILITIES = [
   "run_semantic_validation",
   "request_finalization",
   "prepare_final_plan",
+  "prepare_architecture_amendment",
+  "request_abort",
   "request_synthesis",
 ] as const;
 
@@ -128,6 +130,10 @@ const SYNTHESIS_NO_INPUT: readonly UltraPlanCapability[] = [
   "propose_question_resolution",
   "raise_conflict",
   "begin_synthesis",
+  // R1a §10-§14: blockers raisable here must have a sanctioned route out of
+  // synthesis — request_reopen admits blocker-driven reopens (a blocking
+  // Question or blocking Conflict authored by the Harness surface itself).
+  "request_reopen",
 ];
 
 /** synthesis + frozen input (no manifest yet): submit derived output. */
@@ -137,6 +143,7 @@ const SYNTHESIS_INPUT_READY: readonly UltraPlanCapability[] = [
   "raise_conflict",
   "begin_synthesis",
   "submit_synthesis_manifest",
+  "request_reopen",
 ];
 
 /**
@@ -148,9 +155,7 @@ const SYNTHESIS_INPUT_READY: readonly UltraPlanCapability[] = [
 const SYNTHESIS_MANIFEST_READY: readonly UltraPlanCapability[] = [
   ...SYNTHESIS_INPUT_READY,
   "run_semantic_validation",
-];
-
-/**
+];/**
  * synthesis + a CURRENT findings report (Phase 2G §36): the sanctioned way
  * back to design is `request_reopen` (restored narrowly). Manifest
  * REVISIONS remain available deliberately (§66): a genuinely revised manifest
@@ -183,6 +188,9 @@ const SYNTHESIS_VALIDATION_CLEAN: readonly UltraPlanCapability[] = [
   "submit_synthesis_manifest",
   "run_semantic_validation",
   "request_finalization",
+  // R1a §10-§14: a blocking Question/Conflict raised against a clean report
+  // still has its sanctioned route back to design — the blocker-driven reopen.
+  "request_reopen",
 ];
 
 /**
@@ -198,6 +206,7 @@ const SYNTHESIS_CANDIDATE_READY: readonly UltraPlanCapability[] = [
   "raise_conflict",
   "request_finalization",
   "prepare_final_plan",
+  "request_reopen",
 ];
 
 /**
@@ -216,6 +225,7 @@ const SYNTHESIS_FINAL_PROPOSAL: readonly UltraPlanCapability[] = [
   "request_finalization",
   "prepare_final_plan",
   "request_user_approval",
+  "request_reopen",
 ];
 
 /** detail + sections=[] + no activeWork: establish the initial Section DAG. */
@@ -227,6 +237,29 @@ const DETAIL_DECOMPOSITION_NEEDED: readonly UltraPlanCapability[] = [
   "prepare_proposal",
   "request_user_approval",
   "prepare_decomposition",
+  // R1a §18/§41: a blocking Architecture-scoped blocker raised here must be
+  // able to reach the architecture-remediation workflow (Phase R1b) — the
+  // blocker-driven architecture reopen is admitted from this substate too.
+  "request_reopen",
+];
+
+/**
+ * R1b §21: detail + `activeWork = {type:"architecture"}` — the dedicated
+ * ARCHITECTURE-REMEDIATION substate entered by an approved
+ * `reopen_architecture` PlanCommit. The only design surface is the exact
+ * Architecture amendment (Section completion/focus/decomposition and generic
+ * proposals are withheld — the current Section set is about to be invalidated
+ * and must not be mutated under the old architecture's authority).
+ * `raise_conflict` is deliberately absent: a NEW conflict raised during
+ * remediation could have no remediable target, so the Harness does not offer
+ * the operation here; questions remain raisable and curable through the
+ * amendment Proposal itself (brief §34).
+ */
+const DETAIL_ARCHITECTURE_REMEDIATION: readonly UltraPlanCapability[] = [
+  "record_question",
+  "propose_question_resolution",
+  "promote_evidence",
+  "prepare_architecture_amendment",
 ];
 
 /**
@@ -345,7 +378,10 @@ export function getCapabilities(
 
   let stageCapabilities: readonly UltraPlanCapability[];
   if (run.stage === "detail") {
-    if (run.sections.length === 0) {
+    if (run.activeWork?.type === "architecture") {
+      // R1b §21: the dedicated architecture-remediation substate.
+      stageCapabilities = DETAIL_ARCHITECTURE_REMEDIATION;
+    } else if (run.sections.length === 0) {
       stageCapabilities = DETAIL_DECOMPOSITION_NEEDED;
     } else {
       // Section-ready: the active section's revision state picks the
@@ -382,9 +418,16 @@ export function getCapabilities(
     stageCapabilities = STAGE_CAPABILITIES[run.stage];
   }
 
+  // R1a §16: the explicit terminal escape hatch is granted in every ACTIVE
+  // planning stage (discovery/architecture/detail/synthesis — never `final`,
+  // never handoff_pending). It authorizes a user-confirmed lifecycle abort
+  // only; it is not a blocker-resolution substitute (brief §17).
+  const abortable = run.stage !== "final";
+
   return new Set<UltraPlanCapability>([
     ...LIFECYCLE_BASE,
     ...stageCapabilities,
+    ...(abortable ? (["request_abort"] as const) : []),
   ]);
 }
 

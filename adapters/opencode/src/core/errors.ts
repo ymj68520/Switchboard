@@ -82,6 +82,14 @@ export type UltraPlanErrorCode =
   | "handoff_delivery_ambiguous"
   | "handoff_receipt_invalid"
   | "handoff_session_mismatch"
+  // R1 — blocker cure, deadlock freedom & architecture remediation
+  | "conflict_resolution_invalid"
+  | "abort_not_allowed"
+  | "amendment_base_mismatch"
+  | "amendment_stage_invalid"
+  // R2 — context architecture (brief §17/§93)
+  | "context_state_invalid"
+  | "context_budget_exceeded"
   // Phase 2B2 — durable store
   | "store_version_unsupported"
   | "store_corrupt"

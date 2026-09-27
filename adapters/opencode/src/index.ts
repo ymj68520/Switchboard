@@ -7,19 +7,55 @@
  * - the full Ultra Plan tool surface (plugin `tool` hook),
  * - repository-tool observation recording (`tool.execute.after` hook) feeding
  *   the observation ledger that evidence promotion requires,
- * - the L0 Planning Protocol injected into planning-model system context via
- *   `experimental.chat.system.transform`, gated on an active run.
+ * - the CONTEXT ASSEMBLER output injected into planning-model system context
+ *   via `experimental.chat.system.transform` (R2): the deterministic L0-L5
+ *   block assembled from ONE snapshot-consistent read of the store — the ONLY
+ *   production context path (no duplicate legacy fragment).
+ *
+ * Adapter-level context budget configuration (R2 brief §46): deterministic,
+ * provider-neutral environment settings read once at hook creation —
+ *   ULTRA_PLAN_CONTEXT_BUDGET_TOKENS  (estimated-token ceiling; default 12000)
+ *   ULTRA_PLAN_CONTEXT_OVERFLOW       ("render" (default) | "fail")
+ * Core never hardcodes a provider-specific context window.
  */
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
 
-import { renderPlanningProtocol } from "./context/protocol.js";
-import { resolveSynthesisFinalization, resolveCurrentFinalProposal } from "./core/controller.js";
+import {
+  assemblePlanningContext,
+  renderTraceLog,
+  recordLatestTrace,
+  DEFAULT_CONTEXT_BUDGET,
+} from "./context/assembler.js";
+import { setValidationProtocolForContext } from "./context/state.js";
+import { SEMANTIC_VALIDATION_PROTOCOL } from "./validation/protocol.js";
 import { getProjectInstance } from "./runtime/instance.js";
 import { ObservationIDs, nextSequence } from "./core/ids.js";
 import type { Observation, ObservationLedger, SourceLocator } from "./repository/observations.js";
 import { getUltraPlanInstance } from "./runtime/instance.js";
-import { SEMANTIC_VALIDATION_PROTOCOL } from "./validation/protocol.js";
 import { createUltraPlanTools } from "./tools/registry.js";
+
+// The synthesis-context report lookup binds the frozen validator protocol.
+setValidationProtocolForContext(SEMANTIC_VALIDATION_PROTOCOL);
+
+/**
+ * The deterministic adapter-level context budget (R2 brief §46). Invalid or
+ * non-positive values fall back to the documented default — never an error
+ * surface at plugin load.
+ */
+export function resolveContextBudgetConfig(options: { contextBudgetTokens?: number; contextOverflow?: "render" | "fail" } = {}): {
+  budgetTokens: number;
+  overflow: "render" | "fail";
+} {
+  const fromEnv = process.env.ULTRA_PLAN_CONTEXT_BUDGET_TOKENS;
+  const parsed = fromEnv !== undefined ? Number.parseInt(fromEnv, 10) : Number.NaN;
+  const budgetTokens =
+    options.contextBudgetTokens ??
+    (Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_CONTEXT_BUDGET.budgetTokens);
+  const overflow =
+    options.contextOverflow ??
+    (process.env.ULTRA_PLAN_CONTEXT_OVERFLOW === "fail" ? ("fail" as const) : DEFAULT_CONTEXT_BUDGET.overflow);
+  return { budgetTokens, overflow };
+}
 
 /**
  * Best-effort source locator from repository-tool arguments. Observation
@@ -66,11 +102,17 @@ async function recordObservation(
 export function createUltraPlanHooks(project?: {
   projectID: string;
   client?: import("@opencode-ai/plugin").PluginInput["client"];
+  contextBudgetTokens?: number;
+  contextOverflow?: "render" | "fail";
 }): Hooks {
   const instance = project
     ? getProjectInstance(project.projectID, { ...(project.client ? { client: project.client } : {}) })
     : getUltraPlanInstance();
   const { runtime, controller, ledger, store } = instance;
+  const contextBudget = resolveContextBudgetConfig({
+    ...(project?.contextBudgetTokens !== undefined ? { contextBudgetTokens: project.contextBudgetTokens } : {}),
+    ...(project?.contextOverflow !== undefined ? { contextOverflow: project.contextOverflow } : {}),
+  });
   return {
     config: async (config) => {
       runtime.applyToConfig(config);
@@ -104,113 +146,56 @@ export function createUltraPlanHooks(project?: {
       // Guarded: acts only on a handoff_pending run; never throws.
       await controller.maybeRecoverHandoff(sessionID);
     },
+    /**
+     * R2 §58: the SINGLE production context path. Every planning inference
+     * receives ONE deterministic Ultra Plan context block assembled from ONE
+     * snapshot-consistent store read — no duplicate legacy L0 fragment.
+     *
+     * - Active runs: the full L0-L5 assembly (protocol, run state, committed
+     *   memory, active scope, working context, operations) with budget
+     *   management and a ContextTrace.
+     * - handoff_pending: the minimal non-authoritative handoff-status context
+     *   (L0 boundary + L1 + read-only L5) — Build does not receive planning
+     *   assembly (brief §66/§67).
+     * - completed/aborted runs: NO injection — planning context stops (§65).
+     *
+     * Each assembly emits the structured `ultraplan.context.trace` diagnostic
+     * (brief §73): refs, projection levels, retrieval reasons, budget usage —
+     * never full prompt content. The live smoke parses this log.
+     */
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return;
       const run = await store.findActiveRunBySession(input.sessionID);
-      if (run) {
-        // Phase 2D/2E1/2E2: identify the active Section (id/title/objective/
-        // dependencies/revision state/validation) plus each direct
-        // dependency's contract availability and approval status, and the
-        // first deterministic completion blocker — for the L0 protocol.
-        let activeSection: import("./context/protocol.js").PlanningProtocolInput["activeSection"];
-        if (run.activeWork?.type === "section") {
-          const section = await store.getSection(run.id, run.activeWork.id);
-          if (section) {
-            const dependencyContracts: { id: string; revision?: number; approved?: boolean }[] = [];
-            let completionBlocked: string | undefined;
-            for (const depID of section.dependencies) {
-              const dep = await store.getSection(run.id, depID);
-              dependencyContracts.push({
-                id: depID,
-                ...(dep?.approvedRevision !== undefined ? { revision: dep.approvedRevision } : {}),
-                ...(dep ? { approved: dep.status === "approved" } : {}),
-              });
-              if (dep?.status !== "approved" && completionBlocked === undefined) {
-                completionBlocked = `dependency ${depID} not approved`;
-              }
-            }
-            if (completionBlocked === undefined && section.validation !== "valid") {
-              completionBlocked = `validation ${section.validation}`;
-            }
-            activeSection = {
-              id: section.id,
-              title: section.title,
-              objective: section.objective,
-              dependencies: section.dependencies,
-              ...(section.currentRevision !== undefined ? { currentRevision: section.currentRevision } : {}),
-              validation: section.validation,
-              dependencyContracts,
-              ...(section.currentRevision !== undefined && completionBlocked !== undefined
-                ? { completionBlocked }
-                : {}),
-            };
-          }
+      if (!run) return;
+      const state = await store.capturePlanningContextState(run.id);
+      if (!state) return;
+      const assembled = assemblePlanningContext(state, {
+        budgetTokens: contextBudget.budgetTokens,
+        overflow: contextBudget.overflow,
+        // handoff_pending: minimal non-authoritative status context — never a
+        // planning L2-L4 assembly (§66/§67).
+        ...(run.lifecycle === "handoff_pending" ? { mode: "handoff-status" as const } : {}),
+      });
+      output.system.push(assembled.rendered);
+      recordLatestTrace(assembled.trace);
+      // §89: trace logging is observability — a logging failure must never
+      // change context correctness, so it is best-effort by construction.
+      try {
+        console.log(renderTraceLog(assembled.trace));
+        for (const warning of assembled.warnings) {
+          console.log(
+            JSON.stringify({
+              channel: "ultraplan.context.warning",
+              planID: assembled.trace.planID,
+              overBudget: assembled.trace.overBudget,
+              budget: assembled.trace.budget,
+              totalTokens: assembled.trace.totalTokens,
+              message: warning,
+            }),
+          );
         }
-        // Phase 2F §46 + Phase 2G + Phase 2H: the minimal synthesis projection
-        // for the L0 protocol — current input identity/base/hash, manifest
-        // ref/hash, staleness, the CURRENT validation result, the
-        // deterministic finalization state, and the open blocker count.
-        let synthesis: import("./context/protocol.js").PlanningProtocolInput["synthesis"];
-        if (run.stage === "synthesis") {
-          const [latestInput, manifests] = await Promise.all([
-            store.getLatestSynthesisInput(run.id),
-            store.listSynthesisManifests(run.id),
-          ]);
-          const latestManifest = latestInput
-            ? manifests
-                .filter((manifest) => manifest.input.id === latestInput.id)
-                .reduce<import("./synthesis/types.js").SynthesisManifest | undefined>(
-                  (latest, manifest) => (latest === undefined || manifest.revision > latest.revision ? manifest : latest),
-                  undefined,
-                )
-            : undefined;
-          const report =
-            latestInput && latestManifest
-              ? ((await store.findValidationReportByIdentity(run.id, {
-                  inputHash: latestInput.hash,
-                  manifestHash: latestManifest.hash,
-                  validatorProtocol: SEMANTIC_VALIDATION_PROTOCOL,
-                })) ?? undefined)
-              : undefined;
-          const finalization = await resolveSynthesisFinalization(store, run, latestInput ?? undefined, latestManifest, report ?? undefined);
-          // Phase 2I §86: the current final_plan Proposal selects the
-          // final-boundary L0 guidance.
-          const finalProposal = await resolveCurrentFinalProposal(store, run, {
-            candidateCurrent: finalization.candidate?.current === true,
-          });
-          synthesis = {
-            ...(latestInput
-              ? {
-                  inputID: latestInput.id,
-                  baseSnapshot: latestInput.baseSnapshot.id,
-                  inputHash: latestInput.hash,
-                  stale: run.headSnapshot !== latestInput.baseSnapshot.id,
-                }
-              : {}),
-            ...(latestManifest
-              ? { manifestRef: `${latestManifest.id}@${latestManifest.revision}`, manifestHash: latestManifest.hash }
-              : {}),
-            ...(report ? { validationResult: report.result } : {}),
-            finalization: {
-              state: finalization.state,
-              ...(finalization.candidate ? { candidate: finalization.candidate } : {}),
-            },
-            ...(finalProposal
-              ? {
-                  finalProposal: {
-                    ref: finalProposal.proposal.id,
-                    status: finalProposal.proposal.status as "ready" | "awaiting_approval",
-                  },
-                }
-              : {}),
-            blockerCount:
-              run.openQuestions.filter((q) => q.blocking && q.status === "open").length +
-              run.conflicts.filter((c) => c.severity === "blocking" && c.status === "open").length,
-          };
-        }
-        output.system.push(
-          renderPlanningProtocol({ run, ...(activeSection ? { activeSection } : {}), ...(synthesis ? { synthesis } : {}) }),
-        );
+      } catch {
+        /* the injected context block is unaffected */
       }
     },
     dispose: async () => {
@@ -378,6 +363,10 @@ export type { SectionRootSnapshot } from "./memory/snapshots.js";
 export type { SectionDecompositionInput } from "./core/controller.js";
 export { renderPlanningProtocol } from "./context/protocol.js";
 export * from "./context/trace.js";
+export * from "./context/state.js";
+export * from "./context/projections.js";
+export * from "./context/budget.js";
+export * from "./context/assembler.js";
 export * from "./repository/evidence.js";
 export * from "./repository/observations.js";
 export * from "./runtime/types.js";

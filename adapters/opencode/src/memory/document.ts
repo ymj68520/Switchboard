@@ -212,6 +212,111 @@ export function validateStoreDocument(doc: unknown): asserts doc is StoreDocumen
         });
       }
     }
+
+    // R1a §49 — RESOLVED CONFLICTS must carry a valid, resolvable resolution:
+    // a conflict can only reach `resolved` through an approved
+    // resolve_conflict PlanCommit, whose binding the durable state must still
+    // witness. Never repaired, never normalized into a different meaning.
+    const runConflicts = run["conflicts"];
+    if (runConflicts !== undefined) {
+      if (!Array.isArray(runConflicts)) throw corrupt(`run ${planID} has a malformed conflicts array`);
+      // The committed families are nested PER PLAN: doc.committed[planID].
+      // (R2 regression fix: this validation originally read doc.committed[
+      // "architectures"]/["decisions"] — the wrong nesting level, which made
+      // every store carrying a resolved conflict fail closed on reload.)
+      const planCommitted = (doc.committed as Record<string, Record<string, Record<string, unknown>>>)[planID] ?? {};
+      const architectures = planCommitted["architectures"];
+      const decisions = planCommitted["decisions"];
+      for (const conflict of runConflicts) {
+        if (!isRecord(conflict) || typeof conflict["id"] !== "string") {
+          throw corrupt(`run ${planID} has a malformed conflict entry`);
+        }
+        if (conflict["status"] !== "resolved") continue;
+        const resolution = conflict["resolution"];
+        if (!isRecord(resolution)) {
+          throw corrupt(`run ${planID} conflict ${conflict["id"]} is resolved without a resolution`);
+        }
+        const action = resolution["action"];
+        const ref = resolution["ref"];
+        if (!isRecord(ref)) {
+          throw corrupt(`run ${planID} conflict ${conflict["id"]} has a malformed resolution ref`);
+        }
+        if (action === "amend_decision") {
+          if (ref["kind"] !== "decision" || typeof ref["id"] !== "string" || typeof ref["revision"] !== "number") {
+            throw corrupt(`run ${planID} conflict ${conflict["id"]} must bind an exact DecisionRef`);
+          }
+          if (!isRecord(decisions) || !(`${ref["id"]}@${ref["revision"]}` in decisions)) {
+            throw corrupt(
+              `run ${planID} conflict ${conflict["id"]} resolution binds missing decision ${ref["id"]}@${String(ref["revision"])}`,
+            );
+          }
+        } else if (action === "amend_architecture") {
+          if (ref["kind"] !== "architecture" || typeof ref["revision"] !== "number") {
+            throw corrupt(`run ${planID} conflict ${conflict["id"]} must bind an exact ArchitectureRef`);
+          }
+          if (!isRecord(architectures) || !(`ARCH@${ref["revision"]}` in architectures)) {
+            throw corrupt(
+              `run ${planID} conflict ${conflict["id"]} resolution binds missing ARCH@${String(ref["revision"])}`,
+            );
+          }
+        } else if (action === "revise_proposal") {
+          if (ref["kind"] !== "proposal" || typeof ref["id"] !== "string") {
+            throw corrupt(`run ${planID} conflict ${conflict["id"]} must bind a ProposalRef`);
+          }
+          if (!isRecord(proposals[planID]) || !(ref["id"] in proposals[planID])) {
+            throw corrupt(
+              `run ${planID} conflict ${conflict["id"]} resolution binds missing proposal ${ref["id"]}`,
+            );
+          }
+        } else {
+          throw corrupt(`run ${planID} conflict ${conflict["id"]} has an unknown resolution action ${String(action)}`);
+        }
+      }
+    }
+
+    // R1b §49/§50 — DECOMPOSITION PROVENANCE consistency and architecture-
+    // remediation focus legality. The provenance field records the exact ARCH
+    // revision the current Section DAG was decomposed from; it can never
+    // silently contradict the run's current Architecture, and it never
+    // dangles over an empty Section set (new-format runs; legacy runs without
+    // the field load unchanged).
+    const provenance = run["sectionDecompositionArchitecture"];
+    const runSections = run["sections"];
+    const runArchitecture = run["architecture"];
+    if (provenance !== undefined) {
+      if (!isRecord(provenance) || typeof provenance["revision"] !== "number") {
+        throw corrupt(`run ${planID} has a malformed sectionDecompositionArchitecture`);
+      }
+      if (!Array.isArray(runSections) || runSections.length === 0) {
+        throw corrupt(`run ${planID} records decomposition provenance with no current Section set`);
+      }
+      if (
+        !isRecord(runArchitecture) ||
+        runArchitecture["revision"] !== provenance["revision"]
+      ) {
+        throw corrupt(
+          `run ${planID} current Section DAG was decomposed from ARCH@${String(provenance["revision"])}, but the run binds ARCH@${String(isRecord(runArchitecture) ? runArchitecture["revision"] : "none")}`,
+        );
+      }
+    }
+    const activeWork = run["activeWork"];
+    if (isRecord(activeWork) && activeWork["type"] === "architecture") {
+      // Architecture-remediation focus requires the exact current Architecture.
+      if (!isRecord(runArchitecture) || typeof runArchitecture["revision"] !== "number") {
+        throw corrupt(`run ${planID} focuses architecture remediation with no committed Architecture`);
+      }
+      if (run["stage"] !== "detail") {
+        throw corrupt(`run ${planID} focuses architecture remediation outside stage=detail`);
+      }
+    }
+    if (run["lifecycle"] === "aborted") {
+      if (run["stage"] === "final") {
+        throw corrupt(`run ${planID} is aborted at stage=final (aborted runs never reach final)`);
+      }
+      if (activeWork !== undefined) {
+        throw corrupt(`run ${planID} is aborted but still carries activeWork`);
+      }
+    }
   }
 
   // Snapshot section roots (Phase 2D, additive optional field): when present,
@@ -246,16 +351,19 @@ export function validateStoreDocument(doc: unknown): asserts doc is StoreDocumen
         }
       }
       // Phase 2E2 (additive): the workflow focus, when present, must be a
-      // well-shaped section WorkRef. Absence is legitimate (pre-decomposition
-      // snapshots and the final completion that cleared the focus).
+      // well-shaped WorkRef — a section focus carries the Section id; the R1b
+      // architecture-remediation focus is the bare {type:"architecture"}.
+      // Absence is legitimate (pre-decomposition snapshots and the final
+      // completion that cleared the focus).
       const activeWork = state["activeWork"];
       if (activeWork !== undefined) {
-        if (
-          !isRecord(activeWork) ||
-          activeWork["type"] !== "section" ||
-          typeof activeWork["id"] !== "string" ||
-          activeWork["id"].length === 0
-        ) {
+        const shapeOk =
+          isRecord(activeWork) &&
+          (activeWork["type"] === "architecture" ||
+            (activeWork["type"] === "section" &&
+              typeof activeWork["id"] === "string" &&
+              activeWork["id"].length > 0));
+        if (!shapeOk) {
           throw corrupt(`snapshot ${snapshotID} has a malformed activeWork field`, { planID, snapshotID });
         }
       }

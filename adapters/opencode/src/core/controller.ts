@@ -35,7 +35,7 @@ import {
   ValidationFindingIDs,
   ValidationReportIDs,
 } from "./ids.js";
-import type { DecisionID, PlanID, QuestionID, SectionID } from "./ids.js";
+import type { DecisionID, PlanID, ProposalID, QuestionID, SectionID } from "./ids.js";
 import { assertCapability, requireRun, type CapabilityContext, type UltraPlanCapability } from "./capabilities.js";
 import { InMemoryStartAdmissionLedger, type StartAdmission, type StartAdmissionLedger } from "./admissions.js";
 import {
@@ -81,6 +81,7 @@ import type {
   PlanCommit,
   Proposal,
   ProposalChange,
+  ReopenArchitectureReason,
   ReopenSectionReason,
   SectionDecompositionDraft,
   SectionRevisionDraft,
@@ -244,6 +245,7 @@ export const PREPARED_CHANGE_KINDS = [
   "add_constraint",
   "raise_question",
   "resolve_question",
+  "resolve_conflict",
   "complete_architecture",
   "complete_section",
 ] as const;
@@ -442,15 +444,30 @@ export interface RunSemanticValidationResult {
 }
 
 /**
- * Phase 2G §37/§41: the narrow reopen REQUEST. `sectionID` names the target
- * Section (never its status/revision/validation — the Harness resolves the
- * exact approved revision). In synthesis, `findingIDs` selects findings from
- * the CURRENT findings report; in detail the reason is dependency_review and
- * findingIDs must be absent.
+ * Phase 2G §37/§41: the narrow reopen REQUEST, extended in R1a §10-§14 with
+ * the BLOCKER-DRIVEN reasons. The legacy shape (`sectionID` + optional
+ * `findingIDs`, reason inferred from the stage) is preserved; the blocker
+ * reasons name the blocker only — the Harness resolves the exact target:
+ * a blocking Question's scope selects the Section (or, in R1b, the
+ * Architecture) it is scoped to; a blocking Conflict's refs select the exact
+ * Architecture/Section in a documented first-match order. No model-supplied
+ * revision, status, or validation value exists anywhere in the request.
  */
-export interface RequestReopenInput {
-  sectionID: string;
-  findingIDs?: string[];
+export type RequestReopenInput =
+  | { reason?: "semantic_validation" | "dependency_review"; sectionID?: string; findingIDs?: string[] }
+  | { reason: "blocking_question"; questionID: string }
+  | { reason: "blocking_conflict"; conflictID: string };
+
+/**
+ * Phase R1a §16: the explicit terminal escape hatch. The request carries ZERO
+ * authority-bearing arguments — the Harness resolves the active run, and the
+ * lifecycle transition happens only behind a REAL one-shot user confirmation.
+ */
+export interface RequestAbortResult {
+  /** True when the user explicitly Allowed the abort (deterministic ToolContext.ask). */
+  aborted: boolean;
+  run: PlanningRun;
+  statusText: string;
 }
 
 /**
@@ -1510,6 +1527,24 @@ export class UltraPlanController {
       await this.assertRefResolves(run, ref);
       refs.push(ref);
     }
+    // R1a §8 — new BLOCKING conflicts must be remediable. The Harness may
+    // never create a blocker with no sanctioned cure, so a blocking conflict
+    // must name at least one Architecture / Section / Decision — the exact
+    // artifact kinds that participate in the remediation paths
+    // (amend_architecture / reopen_section / amend_decision). Warning-only
+    // conflicts may stay broader; historical conflicts are never rewritten.
+    if (input.severity === "blocking") {
+      const remediable = refs.some(
+        (ref) => ref.kind === "architecture" || ref.kind === "section" || ref.kind === "decision",
+      );
+      if (!remediable) {
+        throw new UltraPlanError(
+          "invalid_scope",
+          "A blocking conflict must reference at least one Architecture, Section, or Decision — a blocker the Harness cannot remediate through a sanctioned path must never be created (raise it as a warning, or reference a resolvable design artifact)",
+          { severity: input.severity, refKinds: refs.map((ref) => ref.kind) },
+        );
+      }
+    }
 
     const conflict: Conflict = {
       id: ConflictIDs.from(nextSequence(run.conflicts.map((c) => c.id), ConflictIDs.prefix)),
@@ -1620,6 +1655,200 @@ export class UltraPlanController {
         }
         return { kind: "decision", decisionID: DecisionIDs.cast(input.scopeDecisionID) };
     }
+  }
+
+  // -- R1b §22-§25: the dedicated Architecture amendment ----------------------
+
+  /**
+   * Freeze the Architecture amendment Proposal — the ONLY sanctioned way to
+   * revise an approved Architecture (brief §22-§24). Granted only in the
+   * architecture-remediation detail substate. The model supplies the NEW
+   * design content in the existing closed Architecture schema plus optional
+   * blocker resolutions; the Harness supplies everything authoritative: the
+   * exact base ARCH@n, the resulting ARCH@n+1 revision, status, and every
+   * resolution ref. The same proposal may carry `resolve_question` and
+   * `resolve_conflict(action=amend_architecture)` changes whose refs bind the
+   * exact resulting ARCH@n+1 (§25/§34) — the engine independently verifies
+   * every binding at commit.
+   */
+  async prepareArchitectureAmendment(
+    sessionID: string,
+    input: {
+      architecture: ArchitectureDraft;
+      /** Open questions this amendment resolves (resolution text is deterministic). */
+      resolveQuestionIDs?: string[];
+      /** Open conflicts this amendment resolves via the amended Architecture. */
+      resolveConflictIDs?: string[];
+      title?: string;
+      summary?: string;
+    },
+  ): Promise<PreparedProposal> {
+    const run = requireRun(
+      await this.authorizeTool(sessionID, "ultraplan_prepare_architecture_amendment"),
+      "prepare_architecture_amendment",
+    );
+    if (!run.architecture) {
+      throw new UltraPlanError("invalid_scope", `Run ${run.id} has no committed Architecture to amend`, {
+        planID: run.id,
+      });
+    }
+    const current = await this.store.getArchitecture(run.id);
+    if (!current || current.revision !== run.architecture.revision) {
+      throw new UltraPlanError(
+        "invalid_scope",
+        `Run ${run.id} binds ARCH@${run.architecture.revision}, which does not resolve to the committed Architecture`,
+        { architectureRevision: run.architecture.revision },
+      );
+    }
+    const draft = input.architecture;
+    if (!draft || typeof draft.summary !== "string" || draft.summary.trim().length === 0) {
+      throw new UltraPlanError("invalid_scope", "An architecture amendment requires a non-empty summary");
+    }
+    // Resolve the draft's references against real run state (mirrors the
+    // add_architecture freeze: no dangling ids in the committed record).
+    const unresolved: OpenQuestion[] = [];
+    for (const id of draft.unresolvedQuestionIDs ?? []) {
+      const question = run.openQuestions.find((q) => q.id === id);
+      if (!question) {
+        throw new UltraPlanError(
+          "unknown_reference",
+          `Unresolved question ${id} does not exist in run ${run.id}; record it first`,
+        );
+      }
+      unresolved.push(question);
+    }
+    const committedDecisions = await this.store.listDecisions(run.id);
+    const basedOn: DecisionID[] = [];
+    for (const id of draft.basedOn ?? []) {
+      if (!committedDecisions.some((decision) => decision.id === id)) {
+        throw new UltraPlanError(
+          "unknown_reference",
+          `Decision ${id} is not committed; basedOn must reference committed decisions`,
+        );
+      }
+      basedOn.push(id);
+    }
+    const nextRevision = current.revision + 1;
+    const architecture: ApprovedArchitecture = {
+      id: "ARCH",
+      revision: nextRevision,
+      status: "approved",
+      summary: draft.summary,
+      components: draft.components,
+      boundaries: draft.boundaries,
+      dataFlows: draft.dataFlows,
+      principles: draft.principles,
+      unresolved,
+      basedOn,
+    };
+
+    // Blocker resolutions ride the SAME proposal, bound to the exact result.
+    const resolutions: ProposalChange[] = [];
+    for (const raw of input.resolveQuestionIDs ?? []) {
+      const questionID = QuestionIDs.cast(raw);
+      const question = run.openQuestions.find((q) => q.id === questionID);
+      if (!question || question.status !== "open") {
+        throw new UltraPlanError(
+          "unknown_reference",
+          `Question ${questionID} does not exist as an open question in run ${run.id}`,
+          { questionID },
+        );
+      }
+      resolutions.push({
+        kind: "resolve_question",
+        resolution: {
+          questionID,
+          resolution: `Resolved by the approved architecture amendment ARCH@${nextRevision}.`,
+        },
+      });
+    }
+    for (const raw of input.resolveConflictIDs ?? []) {
+      const conflictID = ConflictIDs.cast(raw);
+      const conflict = run.conflicts.find((c) => c.id === conflictID);
+      if (!conflict || conflict.status !== "open") {
+        throw new UltraPlanError(
+          "unknown_reference",
+          `Conflict ${conflictID} does not exist as an open conflict in run ${run.id}`,
+          { conflictID },
+        );
+      }
+      resolutions.push({
+        kind: "resolve_conflict",
+        conflictID,
+        resolution: { action: "amend_architecture", ref: { kind: "architecture", revision: nextRevision } },
+      });
+    }
+
+    if (!run.headSnapshot) {
+      throw new UltraPlanError("invalid_scope", `Run ${run.id} has no HEAD snapshot to bind the proposal to`);
+    }
+    const proposal: Proposal = {
+      id: ProposalIDs.from(
+        nextSequence((await this.store.listProposals(run.id)).map((p) => p.id), ProposalIDs.prefix),
+      ),
+      type: "amendment",
+      scope: { ...run.architecture },
+      revision: 1,
+      status: "ready",
+      title: input.title?.trim() || `Amend architecture ARCH@${current.revision} → ARCH@${nextRevision}`,
+      summary:
+        input.summary?.trim() ||
+        `Architecture amendment (R1 §23-§26): supersedes the exact ARCH@${current.revision} with ARCH@${nextRevision}. ARCH@${current.revision} stays byte-identical immutable history; the Section DAG decomposed from ARCH@${current.revision} is conservatively invalidated (old roots remain durable history, the run re-enters detail/decomposition-needed against ARCH@${nextRevision}) — a NEW decomposition is mandatory. ${resolutions.length > 0 ? `This proposal also resolves ${resolutions.length} blocker(s) bound to the exact ARCH@${nextRevision} result.` : ""}`,
+      changes: [
+        { kind: "amend_architecture", supersedes: { ...run.architecture }, architecture },
+        ...resolutions,
+      ],
+      dependencies: [],
+      impact: { affectedSections: [...run.sections.map((ref) => ref.id)], affectedDecisions: [] },
+      createdFrom: { id: run.headSnapshot },
+    };
+    return this.freezeProposal(run, proposal);
+  }
+
+  // -- R1a §16: explicit terminal abort ---------------------------------------
+
+  /**
+   * R1a §16 — the admission half of the ONLY sanctioned abort path. Zero
+   * authority-bearing arguments: the Harness resolves the active run and
+   * verifies abortability (lifecycle=active, stage in
+   * discovery|architecture|detail|synthesis). The TOOL layer performs the REAL
+   * one-shot user confirmation (`ToolContext.ask`, empty `always` patterns —
+   * a persistent permission can never become abort authority); only after an
+   * explicit Allow does `confirmAbort` apply the transition.
+   */
+  async beginAbort(
+    sessionID: string,
+  ): Promise<{ planID: PlanID; stage: PlanningStage; permission: string }> {
+    const run = requireRun(await this.authorizeTool(sessionID, "ultraplan_request_abort"), "request_abort");
+    if (run.lifecycle !== "active" || run.stage === "final") {
+      throw new UltraPlanError(
+        "abort_not_allowed",
+        `A run can only be aborted while lifecycle=active and stage is discovery/architecture/detail/synthesis (run ${run.id} is ${run.lifecycle}/${run.stage}); handoff_pending/completed/aborted runs are governed by their own terminal rules`,
+        { planID: run.id, lifecycle: run.lifecycle, stage: run.stage },
+      );
+    }
+    return {
+      planID: run.id,
+      stage: run.stage,
+      permission: `ultraplan.abort.${run.id}`,
+    };
+  }
+
+  /**
+   * R1a §16 — the authoritative half. Applies ONLY after the user explicitly
+   * Allowed the one-shot confirmation. Abort is a terminal WORKFLOW transition
+   * (never a PlanCommit): lifecycle active → aborted, activeWork cleared, one
+   * `run.lifecycle_changed` event. Committed Plan Memory, HEAD, Proposals,
+   * Approvals, Commits, Evidence — all untouched. `aborted` is terminal; the
+   * next /ultra-plan requires a fresh admission and creates a NEW run.
+   */
+  async confirmAbort(planID: string): Promise<RequestAbortResult> {
+    const run = await this.store.abortRun(PlanIDs.cast(planID));
+    return {
+      aborted: true,
+      run,
+      statusText: `Run ${run.id} aborted by explicit user confirmation. The run is terminal: committed Plan Memory, approvals, commits, and evidence are preserved unchanged; a subsequent /ultra-plan creates a NEW PlanningRun.`,
+    };
   }
 
   // -- Proposal intent ---------------------------------------------------------
@@ -1877,8 +2106,10 @@ export class UltraPlanController {
    * AND needs_review; no report is required and findingIDs must be absent.
    */
   async requestReopen(sessionID: string, input: RequestReopenInput): Promise<PreparedProposal> {
-    // Contextual authorization: detail section-ready substates and the
-    // synthesis validation-findings substate grant request_reopen.
+    // Contextual authorization: detail section-ready substates, the detail
+    // decomposition-needed substate (architecture blockers), and EVERY
+    // synthesis substate grant request_reopen since R1a (the blocker-cure
+    // route must exist wherever the blocker can be raised).
     const resolved = await this.authorizeTool(sessionID, "ultraplan_request_reopen");
     if (!resolved) {
       throw new UltraPlanError(
@@ -1888,6 +2119,70 @@ export class UltraPlanController {
       );
     }
     const run = resolved;
+    // R1a §10-§14: blocker-driven reopens — the sanctioned route out of
+    // synthesis for a blocking Question or blocking Conflict the Harness
+    // surface itself allowed to be created. No ValidationReport is required
+    // or consulted (brief §14 — one is never fabricated for this purpose).
+    if (input?.reason === "blocking_question") {
+      return this.requestBlockerDrivenReopen(run, { type: "blocking_question", questionID: input.questionID });
+    }
+    if (input?.reason === "blocking_conflict") {
+      return this.requestBlockerDrivenReopen(run, { type: "blocking_conflict", conflictID: input.conflictID });
+    }
+    // R1b §18: a semantic_validation reopen with NO sectionID is the
+    // ARCHITECTURE-finding path — the selected findings must be scoped to the
+    // current ARCH revision, and the reopen targets the Architecture itself.
+    if (typeof input?.sectionID !== "string" || input.sectionID.trim().length === 0) {
+      if (run.stage !== "synthesis") {
+        throw new UltraPlanError("invalid_scope", "A reopen request requires a sectionID outside synthesis");
+      }
+      const findingIDs = (input as { findingIDs?: string[] }).findingIDs ?? [];
+      if (findingIDs.length === 0) {
+        throw new UltraPlanError("invalid_scope", "A reopen request requires a sectionID or findingIDs");
+      }
+      const pair = await this.resolveCurrentSynthesisPair(run);
+      const report = await this.store.findValidationReportByIdentity(run.id, {
+        inputHash: pair.input.hash,
+        manifestHash: pair.manifest.hash,
+        validatorProtocol: SEMANTIC_VALIDATION_PROTOCOL,
+      });
+      if (!report) {
+        throw new UltraPlanError(
+          "validation_report_missing",
+          `Run ${run.id} has no current semantic-validation report`,
+          { planID: run.id },
+        );
+      }
+      if (report.result !== "findings") {
+        throw new UltraPlanError("reopen_reason_invalid", `${report.id} is clean; a clean report cannot authorize a reopen`, {
+          reportID: report.id,
+        });
+      }
+      const unknownFindings = findingIDs.filter((raw) => !report.findings.some((finding) => finding.id === raw));
+      if (unknownFindings.length > 0) {
+        throw new UltraPlanError("unknown_reference", `Finding(s) ${unknownFindings.join(", ")} do not exist in ${report.id}`, {
+          reportID: report.id,
+        });
+      }
+      if (!run.architecture) {
+        throw new UltraPlanError("invalid_scope", `Run ${run.id} has no committed Architecture to reopen`);
+      }
+      const archRevision = run.architecture.revision;
+      const selected = report.findings.filter((finding) => findingIDs.includes(finding.id));
+      if (!selected.some((finding) => finding.scope.architecture?.revision === archRevision)) {
+        throw new UltraPlanError(
+          "reopen_target_unsupported",
+          `No selected finding of ${report.id} is scoped to ARCH@${archRevision}; name a section instead (sectionID) for section-scoped findings`,
+          { reportID: report.id, revision: archRevision },
+        );
+      }
+      return this.freezeArchitectureReopen(run, {
+        type: "semantic_validation",
+        reportID: report.id,
+        reportHash: report.hash,
+        findingIDs: findingIDs.map((raw) => ValidationFindingIDs.cast(raw)),
+      });
+    }
     if (typeof input?.sectionID !== "string" || input.sectionID.trim().length === 0) {
       throw new UltraPlanError("invalid_scope", "A reopen request requires a sectionID");
     }
@@ -2037,6 +2332,250 @@ export class UltraPlanController {
       changes: [change],
       dependencies: [],
       impact: { affectedSections: [sectionID], affectedDecisions: [] },
+      createdFrom: { id: run.headSnapshot },
+    };
+    return this.freezeProposal(run, proposal);
+  }
+
+  /**
+   * R1a §10-§14 — BLOCKER-DRIVEN reopen admission. The model names the
+   * blocker only; the Harness resolves the exact remediation target:
+   *
+   * - a blocking Question reopens the Section (or Architecture) its own scope
+   *   names — never an arbitrary section (brief §11/§12);
+   * - a blocking Conflict reopens the exact Architecture/Section its refs
+   *   identify, in a documented first-match order: ArchitectureRef → the
+   *   Architecture; else SectionRef → that Section; else DecisionRef → the
+   *   decision's own scope (architecture → the Architecture; else the first
+   *   of the decision's scope sections in canonical run order). A conflict
+   *   naming no such artifact is refused — and since R1a §8 the Harness
+   *   refuses to CREATE such a blocking conflict in the first place.
+   *
+   * The reopened Section/Architecture carries the exact blocker binding inside
+   * the Proposal hash. The blocker itself stays OPEN — the reopen only opens
+   * the sanctioned remediation workflow; the cure is the later user-approved
+   * corrective Proposal (`resolve_conflict` / `resolve_question`).
+   */
+  private async requestBlockerDrivenReopen(
+    run: PlanningRun,
+    blocker: { type: "blocking_question"; questionID: string } | { type: "blocking_conflict"; conflictID: string },
+  ): Promise<PreparedProposal> {
+    if (run.stage !== "synthesis" && run.stage !== "detail") {
+      throw new UltraPlanError(
+        "capability_not_available",
+        `A blocker-driven reopen runs in synthesis or detail; run ${run.id} is in ${run.stage}`,
+        { stage: run.stage },
+      );
+    }
+    let question: OpenQuestion | undefined;
+    let conflict: Conflict | undefined;
+    if (blocker.type === "blocking_question") {
+      if (typeof blocker.questionID !== "string" || blocker.questionID.trim().length === 0) {
+        throw new UltraPlanError("invalid_scope", "A blocking-question reopen requires a questionID");
+      }
+      const questionID = QuestionIDs.cast(blocker.questionID.trim());
+      question = run.openQuestions.find((q) => q.id === questionID);
+      if (!question) {
+        throw new UltraPlanError("unknown_reference", `Question ${questionID} does not exist in run ${run.id}`, {
+          questionID,
+        });
+      }
+      if (question.status !== "open" || !question.blocking) {
+        throw new UltraPlanError(
+          "invalid_scope",
+          `A blocker-driven reopen requires an OPEN, BLOCKING question (${questionID} is ${question.status}${question.blocking ? "" : ", non-blocking"}) — a non-blocking question needs no remediation route`,
+          { questionID, status: question.status, blocking: question.blocking },
+        );
+      }
+    } else {
+      if (typeof blocker.conflictID !== "string" || blocker.conflictID.trim().length === 0) {
+        throw new UltraPlanError("invalid_scope", "A blocking-conflict reopen requires a conflictID");
+      }
+      const conflictID = ConflictIDs.cast(blocker.conflictID.trim());
+      conflict = run.conflicts.find((c) => c.id === conflictID);
+      if (!conflict) {
+        throw new UltraPlanError("unknown_reference", `Conflict ${conflictID} does not exist in run ${run.id}`, {
+          conflictID,
+        });
+      }
+      if (conflict.status !== "open" || conflict.severity !== "blocking") {
+        throw new UltraPlanError(
+          "invalid_scope",
+          `A blocker-driven reopen requires an OPEN, BLOCKING conflict (${conflictID} is ${conflict.status}/${conflict.severity}) — non-blocking conflicts never wedge the workflow and are remediated through ordinary proposals`,
+          { conflictID, status: conflict.status, severity: conflict.severity },
+        );
+      }
+    }
+
+    // Exact remediation-target resolution (documented first-match order).
+    // ArchitectureRef carries `revision`; SectionRef does not.
+    const architectureScope =
+      (question !== undefined && "revision" in question.scope) ||
+      (conflict?.refs.some((ref) => ref.kind === "architecture") ?? false);
+    if (architectureScope) {
+      return this.freezeArchitectureReopen(run, {
+        ...(question
+          ? { type: "blocking_question" as const, questionID: question.id }
+          : { type: "blocking_conflict" as const, conflictIDs: [conflict!.id] }),
+      });
+    }
+
+    // -- Section-scoped blocker: resolve the exact target Section ------------
+    let sectionID: SectionID | undefined;
+    if (question) {
+      if ("revision" in question.scope) {
+        // Unreachable — architecture scope routed above.
+        throw new UltraPlanError("invalid_scope", `Question ${question.id} is Architecture-scoped`);
+      }
+      sectionID = question.scope.id;
+    } else {
+      for (const ref of conflict!.refs) {
+        if (ref.kind === "section") {
+          sectionID = ref.id;
+          break;
+        }
+      }
+      if (!sectionID) {
+        const decisions = await this.store.listDecisions(run.id);
+        for (const ref of conflict!.refs) {
+          if (ref.kind !== "decision") continue;
+          const decision = decisions.find((d) => d.id === ref.id);
+          if (!decision) continue;
+          if (decision.scope.architecture) {
+            return this.freezeArchitectureReopen(run, { type: "blocking_conflict", conflictIDs: [conflict!.id] });
+          }
+          const candidates = (decision.scope.sections ?? [])
+            .filter((id) => run.sections.some((mirror) => mirror.id === id))
+            .sort(
+              // canonical order = the run's committed Section order
+              (a, b) => run.sections.findIndex((m) => m.id === a) - run.sections.findIndex((m) => m.id === b),
+            );
+          if (candidates.length > 0) {
+            sectionID = candidates[0];
+            break;
+          }
+        }
+      }
+    }
+    if (!sectionID) {
+      throw new UltraPlanError(
+        "invalid_scope",
+        `${blocker.type === "blocking_question" ? `Question ${blocker.questionID}` : `Conflict ${blocker.conflictID}`} does not identify a Section or Architecture; no deterministic remediation target exists`,
+        question ? { questionID: question.id } : { conflictID: conflict!.id },
+      );
+    }
+
+    // Reuse the exact section reopen resolution (approved + pointers agree).
+    if (!run.sections.some((ref) => ref.id === sectionID)) {
+      throw new UltraPlanError("unknown_reference", `Section ${sectionID} is not part of run ${run.id}`, {
+        sectionID,
+      });
+    }
+    const root = await this.store.getSection(run.id, sectionID);
+    if (!root) {
+      throw new UltraPlanError("unknown_reference", `Section ${sectionID} is not committed`, { sectionID });
+    }
+    if (
+      root.status !== "approved" ||
+      root.currentRevision === undefined ||
+      root.approvedRevision === undefined ||
+      root.currentRevision !== root.approvedRevision
+    ) {
+      throw new UltraPlanError(
+        "invalid_scope",
+        `Section ${root.id} cannot be reopened: reopen targets an APPROVED Section whose current and approved revisions agree (status ${root.status}, current ${root.currentRevision ?? "none"}, approved ${root.approvedRevision ?? "none"})`,
+        { sectionID: root.id, status: root.status },
+      );
+    }
+
+    const reason: ReopenSectionReason =
+      blocker.type === "blocking_question"
+        ? { type: "blocking_question", questionID: question!.id }
+        : { type: "blocking_conflict", conflictIDs: [conflict!.id] };
+    const blockerLabel =
+      blocker.type === "blocking_question" ? `question ${question!.id}` : `conflict ${conflict!.id}`;
+    const change: ProposalChange = {
+      kind: "reopen_section",
+      target: { id: sectionID, revision: root.approvedRevision },
+      reason,
+      reopen: {
+        sectionTitle: root.title,
+        validation: "needs_review",
+        fromStage: run.stage,
+      },
+    };
+    if (!run.headSnapshot) {
+      throw new UltraPlanError("invalid_scope", `Run ${run.id} has no HEAD snapshot to bind the proposal to`);
+    }
+    const proposal: Proposal = {
+      id: ProposalIDs.from(
+        nextSequence((await this.store.listProposals(run.id)).map((p) => p.id), ProposalIDs.prefix),
+      ),
+      type: "amendment",
+      scope: { id: sectionID },
+      revision: 1,
+      status: "ready",
+      title: `Reopen ${sectionID} (blocker remediation)`,
+      summary: `Blocker-driven reopen (R1 §10-§14): the open blocking ${blockerLabel} identifies ${sectionID}@${root.approvedRevision} as its remediation target. Effect: status approved → reopened, active work → ${sectionID}${run.stage === "synthesis" ? ", stage synthesis → detail" : ""}. No new revision is created and the approved revision stays immutable. The ${blockerLabel} REMAINS OPEN until a later user-approved corrective Proposal commits its sanctioned cure.`,
+      changes: [change],
+      dependencies: [],
+      impact: { affectedSections: [sectionID], affectedDecisions: [] },
+      createdFrom: { id: run.headSnapshot },
+    };
+    return this.freezeProposal(run, proposal);
+  }
+
+  /**
+   * R1 §18-§20 — Architecture reopen admission. Freezes the closed
+   * `reopen_architecture` change (NO design content) bound to the exact
+   * Architecture-scoped blocker reason. Applied only by a user-approved
+   * amendment PlanCommit; the design change itself is the SEPARATE
+   * `amend_architecture` Proposal prepared in the remediation substate.
+   */
+  private async freezeArchitectureReopen(
+    run: PlanningRun,
+    reason: ReopenArchitectureReason,
+  ): Promise<PreparedProposal> {
+    if (!run.architecture) {
+      throw new UltraPlanError("invalid_scope", `Run ${run.id} has no committed Architecture to reopen`, {
+        planID: run.id,
+      });
+    }
+    const architecture = await this.store.getArchitecture(run.id);
+    if (!architecture || architecture.revision !== run.architecture.revision) {
+      throw new UltraPlanError(
+        "invalid_scope",
+        `Run ${run.id} binds ARCH@${run.architecture.revision}, which does not resolve to the committed Architecture`,
+        { architectureRevision: run.architecture.revision },
+      );
+    }
+    if (!run.headSnapshot) {
+      throw new UltraPlanError("invalid_scope", `Run ${run.id} has no HEAD snapshot to bind the proposal to`);
+    }
+    const blockerLabel =
+      reason.type === "blocking_question"
+        ? `question ${reason.questionID}`
+        : reason.type === "blocking_conflict"
+          ? `conflict ${reason.conflictIDs.join(", ")}`
+          : `findings ${reason.findingIDs.join(", ")} of report ${reason.reportID}`;
+    const change: ProposalChange = {
+      kind: "reopen_architecture",
+      target: { ...run.architecture },
+      reason,
+    };
+    const proposal: Proposal = {
+      id: ProposalIDs.from(
+        nextSequence((await this.store.listProposals(run.id)).map((p) => p.id), ProposalIDs.prefix),
+      ),
+      type: "amendment",
+      scope: { ...run.architecture },
+      revision: 1,
+      status: "ready",
+      title: `Reopen ARCH@${architecture.revision} (blocker remediation)`,
+      summary: `Blocker-driven Architecture reopen (R1 §18-§20): the ${blockerLabel} is scoped to ARCH@${architecture.revision}, so the sanctioned remediation path is the architecture-remediation workflow. Effect: stage ${run.stage} → detail, active work → ARCH@${architecture.revision}. ARCH@${architecture.revision} stays approved and immutable — NO new revision is created by reopening, Sections stay unchanged, and the design change itself will be a separate user-approved amend_architecture Proposal. Old SynthesisInput/Manifest/ValidationReport artifacts remain immutable history.`,
+      changes: [change],
+      dependencies: [],
+      impact: { affectedSections: [], affectedDecisions: [] },
       createdFrom: { id: run.headSnapshot },
     };
     return this.freezeProposal(run, proposal);
@@ -3315,7 +3854,11 @@ export class UltraPlanController {
       plannedDecisionIds?: ReadonlySet<DecisionID>;
       /** The exact question objects raised EARLIER in this same proposal. */
       plannedQuestions?: readonly OpenQuestion[];
-    } = {},
+      /** R1a: the id THIS proposal will carry (revise_proposal self-binding). */
+      proposalID: ProposalID;
+      /** R1a: the fully resolved changes EARLIER in this same proposal. */
+      resolvedChanges?: readonly ProposalChange[];
+    },
   ): Promise<{ change: ProposalChange; affectedDecision?: DecisionID; affectedSection?: SectionID }> {
     const now = this.now();
     switch (change.kind) {
@@ -3422,6 +3965,18 @@ export class UltraPlanController {
             },
           },
         };
+        // R1 (2E1 §12 parity): the Harness resolves every dependency contract
+        // binding in the generic path EXACTLY like the dedicated checkpoint
+        // tool — the exact approved contract revision of each structural
+        // dependency, or explicit absence (never "latest", never model-bound).
+        for (const dependency of revision.dependencies) {
+          const dependencyRoot = await this.store.getSection(run.id, dependency.sectionID);
+          if (dependencyRoot?.approvedRevision !== undefined) {
+            dependency.contractRevision = dependencyRoot.approvedRevision;
+          } else {
+            delete dependency.contractRevision;
+          }
+        }
         return {
           change: { kind: "amend_section", supersedes: { id: target.sectionID, revision: target.revision }, revision },
           affectedSection: target.sectionID,
@@ -3528,6 +4083,105 @@ export class UltraPlanController {
           change: {
             kind: "resolve_question",
             resolution: { questionID, resolution: resolutionText },
+          },
+        };
+      }
+      case "resolve_conflict": {
+        if (!change.ref?.id) {
+          throw new UltraPlanError("invalid_scope", "resolve_conflict requires a conflict ref");
+        }
+        const conflictID = ConflictIDs.cast(change.ref.id);
+        const conflict = run.conflicts.find((c) => c.id === conflictID);
+        if (!conflict) {
+          throw new UltraPlanError("unknown_reference", `Conflict ${conflictID} does not exist in run ${run.id}`);
+        }
+        if (conflict.status !== "open") {
+          throw new UltraPlanError(
+            "conflict_resolution_invalid",
+            `Conflict ${conflictID} is already resolved; resolutions are immutable historical state`,
+            { conflictID },
+          );
+        }
+        const action = readStringField(change.content, "action");
+        if (action !== "revise_proposal" && action !== "amend_decision" && action !== "amend_architecture") {
+          throw new UltraPlanError(
+            "conflict_resolution_invalid",
+            `resolve_conflict action must be revise_proposal, amend_decision, or amend_architecture (got "${action}")`,
+            { conflictID, action },
+          );
+        }
+        // §6 — the resolution must bind REAL remediation, proven
+        // deterministically from this same Proposal:
+        //  - amend_decision: the paired amend_decision change EARLIER in this
+        //    proposal must supersede a Decision the conflict names; the
+        //    resolution binds that change's exact resulting DecisionRef.
+        //  - amend_architecture: the paired amendment change (Phase R1b) must
+        //    be present EARLIER; the resolution binds the exact resulting
+        //    ARCH@n+1.
+        //  - revise_proposal: the resolution binds THIS proposal's own exact
+        //    ref; the freeze post-pass verifies the conflict's refs are
+        //    actually addressed by the proposal (scope or another change).
+        if (action === "amend_decision") {
+          const conflictDecisionIds = new Set(
+            conflict.refs.filter((ref) => ref.kind === "decision").map((ref) => ref.id),
+          );
+          const paired = [...(context.resolvedChanges ?? [])]
+            .reverse()
+            .find(
+              (resolvedChange) =>
+                resolvedChange.kind === "amend_decision" && conflictDecisionIds.has(resolvedChange.decision.id),
+            );
+          if (!paired || paired.kind !== "amend_decision") {
+            throw new UltraPlanError(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${conflictID}, amend_decision) requires an amend_decision change EARLIER in this same proposal superseding a Decision the conflict names (${conflict.refs.map((ref) => (ref.kind === "decision" ? ref.id : ref.kind)).join(", ") || "no decision refs"})`,
+              { conflictID, action },
+            );
+          }
+          return {
+            change: {
+              kind: "resolve_conflict",
+              conflictID,
+              resolution: {
+                action,
+                ref: { kind: "decision", id: paired.decision.id, revision: paired.decision.revision },
+              },
+            },
+            affectedDecision: paired.decision.id,
+          };
+        }
+        if (action === "amend_architecture") {
+          const paired = [...(context.resolvedChanges ?? [])]
+            .reverse()
+            .find((resolvedChange) => resolvedChange.kind === "amend_architecture");
+          if (!paired || paired.kind !== "amend_architecture") {
+            throw new UltraPlanError(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${conflictID}, amend_architecture) requires an amend_architecture change EARLIER in this same proposal`,
+              { conflictID, action },
+            );
+          }
+          return {
+            change: {
+              kind: "resolve_conflict",
+              conflictID,
+              resolution: {
+                action,
+                ref: {
+                  kind: "architecture",
+                  revision: paired.architecture.revision,
+                },
+              },
+            },
+          };
+        }
+        // revise_proposal — self-binding; the post-pass validates that the
+        // conflict's refs are addressed by this proposal's scope/changes.
+        return {
+          change: {
+            kind: "resolve_conflict",
+            conflictID,
+            resolution: { action, ref: { kind: "proposal", id: context.proposalID, revision: 1 } },
           },
         };
       }
@@ -3692,6 +4346,16 @@ export class UltraPlanController {
           { kind: change.kind, stage },
         );
       }
+      // R1a §4-§7: conflict resolution rides the ordinary design-proposal
+      // machinery in the stages where prepare_proposal exists — never in the
+      // single-purpose completion/final proposals.
+      if (change.kind === "resolve_conflict" && type !== "design_checkpoint" && type !== "amendment") {
+        throw new UltraPlanError(
+          "proposal_type_invalid",
+          `resolve_conflict is only valid inside design_checkpoint or amendment proposals (got ${type})`,
+          { kind: change.kind, type },
+        );
+      }
     }
 
     const { scope: proposalScope, sectionID: scopeSectionID } = await this.proposalScope(
@@ -3710,6 +4374,13 @@ export class UltraPlanController {
     let plannedArchitectureRevision: number | undefined;
     const plannedDecisionIds = new Set<DecisionID>();
     const plannedQuestions: OpenQuestion[] = [];
+    // R1a: the proposal id is assigned BEFORE change resolution so a
+    // `resolve_conflict(revise_proposal)` can bind the carrying proposal's own
+    // exact ref (the only Proposal identity whose relationship to the conflict
+    // the change can prove deterministically).
+    const proposalID = ProposalIDs.from(
+      nextSequence((await this.store.listProposals(run.id)).map((p) => p.id), ProposalIDs.prefix),
+    );
     for (const change of changes) {
       if (!PREPARED_CHANGE_KINDS.includes(change.kind)) {
         throw new UltraPlanError(
@@ -3721,6 +4392,8 @@ export class UltraPlanController {
         plannedArchitectureRevision,
         plannedDecisionIds,
         plannedQuestions,
+        proposalID,
+        resolvedChanges: parsedChanges,
       });
       parsedChanges.push(resolved.change);
       if (resolved.change.kind === "add_architecture") {
@@ -3736,6 +4409,50 @@ export class UltraPlanController {
       if (resolved.affectedSection) affectedSections.add(resolved.affectedSection);
     }
 
+    // R1a §6: `resolve_conflict(revise_proposal)` post-pass — the binding is
+    // valid only when the conflict's refs are ADDRESSED by this exact
+    // proposal (its scope, or another change's target). A proposal with no
+    // deterministic relationship to the conflict can never legitimize the
+    // resolution; there is no semantic heuristic — pure ref matching.
+    const addressedRefs: MemoryRef[] = [
+      ...("revision" in proposalScope
+        ? [{ kind: "architecture" as const, revision: proposalScope.revision }]
+        : [{ kind: "section" as const, id: proposalScope.id }]),
+    ];
+    for (const parsed of parsedChanges) {
+      if (parsed.kind === "add_decision") addressedRefs.push({ kind: "decision", id: parsed.decision.id });
+      if (parsed.kind === "amend_decision") {
+        addressedRefs.push({ kind: "decision", id: parsed.supersedes.id });
+        addressedRefs.push({ kind: "decision", id: parsed.decision.id });
+      }
+      if (parsed.kind === "add_section") addressedRefs.push({ kind: "section", id: parsed.section.id });
+      if (parsed.kind === "amend_section") addressedRefs.push({ kind: "section", id: parsed.revision.sectionID });
+      if (parsed.kind === "add_section_revision") {
+        addressedRefs.push({ kind: "section", id: parsed.revision.sectionID });
+      }
+      if (parsed.kind === "complete_section") addressedRefs.push({ kind: "section", id: parsed.target.id });
+      if (parsed.kind === "add_architecture") addressedRefs.push({ kind: "architecture", revision: parsed.architecture.revision });
+      if (parsed.kind === "resolve_question") addressedRefs.push({ kind: "question", id: parsed.resolution.questionID });
+      if (parsed.kind === "raise_question") addressedRefs.push({ kind: "question", id: parsed.question.id });
+    }
+    const refMatches = (a: MemoryRef, b: MemoryRef): boolean =>
+      a.kind === b.kind &&
+      (("id" in a) === ("id" in b)) &&
+      (!("id" in a) || !("id" in b) || a.id === b.id);
+    for (const parsed of parsedChanges) {
+      if (parsed.kind !== "resolve_conflict" || parsed.resolution.action !== "revise_proposal") continue;
+      const conflict = run.conflicts.find((c) => c.id === parsed.conflictID);
+      if (!conflict || conflict.refs.length === 0) continue;
+      const addressed = conflict.refs.some((ref) => addressedRefs.some((target) => refMatches(ref, target)));
+      if (!addressed) {
+        throw new UltraPlanError(
+          "conflict_resolution_invalid",
+          `resolve_conflict(${parsed.conflictID}, revise_proposal) is not a valid remediation binding: none of the conflict's refs (${conflict.refs.map((ref) => ref.kind + ("id" in ref ? ` ${ref.id}` : "")).join(", ")}) is addressed by this proposal's scope or changes`,
+          { conflictID: parsed.conflictID, action: "revise_proposal" },
+        );
+      }
+    }
+
     if (!run.headSnapshot) {
       throw new UltraPlanError(
         "invalid_scope",
@@ -3744,9 +4461,7 @@ export class UltraPlanController {
     }
 
     const proposal: Proposal = {
-      id: ProposalIDs.from(
-        nextSequence((await this.store.listProposals(run.id)).map((p) => p.id), ProposalIDs.prefix),
-      ),
+      id: proposalID,
       type,
       scope: proposalScope,
       revision: 1,
@@ -3883,8 +4598,16 @@ export class UltraPlanController {
 
     // -- Authoritative resolution (§7/§8/§12) --------------------------------
     // Durable allocator semantics: continue the run's committed SEC sequence.
+    // R1 §30: the sequence is taken over ALL historical committed Section ids
+    // (the registry), not the current mirror — after an Architecture amendment
+    // resets `run.sections` to [], re-decomposition must allocate FRESH ids
+    // (SEC-004…), never recycle the invalidated historical ones. Uncommitted
+    // allocations are still re-issuable (rejected proposals never persist).
     // Draft order IS the canonical order and is frozen into the proposal.
-    let sequence = nextSequence(run.sections.map((ref) => ref.id), SectionIDs.prefix);
+    const historicalSectionIds = (await this.store.listSections(run.id)).map((section) => section.id);
+    const allocatorBase =
+      historicalSectionIds.length > 0 ? historicalSectionIds : run.sections.map((ref) => ref.id);
+    let sequence = nextSequence(allocatorBase, SectionIDs.prefix);
     const idByKey = new Map<string, SectionID>();
     for (const draft of drafts) {
       idByKey.set(draft.key, SectionIDs.from(sequence++));

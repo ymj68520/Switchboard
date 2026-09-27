@@ -1,4 +1,4 @@
-# Ultra Plan Agent Protocol — v0.11 (Phase 2A + 2A.1 + 2B1 + 2C + 2D + 2E1 + 2E2 + 2F + 2G + 2H + 2I + 2J)
+# Ultra Plan Agent Protocol — v0.13 (Phase 2A + 2A.1 + 2B1 + 2C + 2D + 2E1 + 2E2 + 2F + 2G + 2H + 2I + 2J + R1 + R2)
 
 **Status:** Frozen v0.1 contract as corrected by the Phase 2A.1
 authority-boundary freeze, extended by the Phase 2B1 transaction engine
@@ -280,7 +280,21 @@ The planning agent may NOT — and no tool exists that would allow it:
   never commit, even with an Approval (the engine independently reruns the
   gate and requires exact identity equality at commit);
 - authorize or trigger final execution handoff — that requires explicit Final Plan
-  approval and is executed by the Harness.
+  approval and is executed by the Harness;
+- resolve a Conflict directly (R1 §5): there is NO `ultraplan_resolve_conflict`
+  tool (forbidden name) and the model can never set `status = resolved` or author
+  a `resolution` — the ONLY path is a user-approved `resolve_conflict` change
+  inside a Proposal, whose remediation binding the Harness derives (§7.16);
+- amend or reopen the Architecture outside the remediation workflow (R1 §22/§38):
+  `amend_architecture` / `reopen_architecture` are NOT part of the generic
+  proposal vocabulary — the only entry paths are the narrow blocker-driven
+  `request_reopen` reasons and `ultraplan_prepare_architecture_amendment` in the
+  architecture-remediation substate; `set_architecture`, `set_architecture_revision`,
+  `mark_architecture_reopened`, `clear_sections`, `reset_dag`, and
+  `force_redecomposition` are forbidden names;
+- abort the run without the USER: `ultraplan_request_abort` carries zero
+  authority-bearing arguments and applies nothing — the lifecycle transition
+  happens only behind the real one-shot user confirmation (R1 §16).
 
 Prohibited tool names that MUST NEVER be registered: `ultraplan_approve`,
 `ultraplan_commit`, `ultraplan_force_stage`, `ultraplan_complete_run`,
@@ -326,6 +340,8 @@ Every model-visible tool has exactly one authority class:
 | `ultraplan_run_semantic_validation` | derived_artifact | `run_semantic_validation` | yes — ONLY in synthesis with a current input+manifest | false (invokes the ISOLATED validator — the model supplies no report content; persists an immutable ValidationReport; never a PlanCommit, never HEAD movement) |
 | `ultraplan_prepare_final_plan` | proposal_intent | `prepare_final_plan` | yes — ONLY in synthesis/final-candidate-ready (or final-proposal-ready for idempotent retrieval) | false (reruns the Finalization Gate and freezes the exact final_plan Proposal from the CURRENT candidate — the model supplies NOTHING; the Proposal is not approval, commits nothing, never moves HEAD, and never changes the stage) |
 | `ultraplan_request_finalization` | derived_artifact | `request_finalization` | yes — ONLY in synthesis/validation-clean or synthesis/final-candidate-ready | false (builds/reuses the EvidenceAuditSnapshot and evaluates the pure Finalization Gate; pass freezes an immutable FinalPlanCandidate — no PlanCommit, no HEAD movement, no stage change, never `PlanningRun.finalPlan`, never user authorization; blocked/stale return exact machine reasons and persist only the audit) |
+| `ultraplan_request_abort` | working_state | `request_abort` | yes — active lifecycle, stage ∈ discovery/architecture/detail/synthesis | false (ZERO authority-bearing arguments; a REAL one-shot `ToolContext.ask` with `always: []` gates the narrow Harness `abortRun` transition; terminal, never a PlanCommit, never a blocker-resolution substitute — R1 §16/§17) |
+| `ultraplan_prepare_architecture_amendment` | proposal_intent | `prepare_architecture_amendment` | yes — ONLY in detail/architecture-remediation | false (freezes the `amend_architecture` amendment INTENT — the ONLY sanctioned way to revise an approved Architecture; optional resolve_question/resolve_conflict resolutions bind the exact resulting ARCH@n+1; the commit invalidates the Section DAG; R1 §22-§26) |
 
 `allowedStages`/`allowedLifecycle` in code are DERIVED from `getCapabilities`, so the
 registry cannot drift from enforcement. The matrix below is the human-readable form of
@@ -333,7 +349,7 @@ the same truth and is pinned by `test/capabilities.test.ts`.
 
 ---
 
-## 4. State → Capability Matrix (v0.11)
+## 4. State → Capability Matrix (v0.13; grants unchanged by R2 — R2 adds no tool and no grant, see §7.17)
 
 Stage and lifecycle are separate axes and are never collapsed. Since Phase 2D,
 the DETAIL column is resolved into STRUCTURED SUBSTATES derived from run state
@@ -374,29 +390,42 @@ Proposal binding is likewise derived, never stored; a stale Final Proposal
 falls back to final-candidate-ready (prepare is idempotent) and is refused
 pre-ask at the approval boundary itself.
 
-| Capability | no run | discovery | architecture | detail decomp-needed | detail section-ready (both substates) | synthesis no-input | synthesis input/manifest-ready (unvalidated) | synthesis validation-findings | synthesis validation-clean | synthesis final-candidate-ready (current candidate) | synthesis final-proposal-ready (current final Proposal) | final | handoff_pending | completed/aborted |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| start_or_resume | ✓ | ✓¹ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓² |
-| read_status | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| read_memory | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| record_question | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
-| propose_question_resolution | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
-| raise_conflict | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
-| promote_evidence | — | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
-| request_architecture | — | ✓ | — | — | — | — | — | — | — | — | — | — | — | — |
-| prepare_proposal | — | — | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
-| prepare_decomposition | — | — | — | ✓ | — | — | — | — | — | — | — | — | — | — |
-| prepare_section_checkpoint | — | — | — | — | ✓ | — | — | — | — | — | — | — | — | — |
-| request_section_focus | — | — | — | — | ✓ | — | — | — | — | — | — | — | — | — |
-| request_user_approval | — | — | ✓ | ✓ | ✓ | — | — | — | — | — | ✓¹⁰ | — | — | — |
-| request_completion | — | — | ✓ | — | ✓⁴ (checkpointed only) | — | — | — | — | — | — | — | — | — |
-| begin_synthesis | — | — | — | — | — | ✓ | ✓⁶ | — | ✓⁶ | — | — | — | — | — |
-| submit_synthesis_manifest | — | — | — | — | — | — | ✓ | ✓⁷ | ✓ | — | — | — | — | — |
-| run_semantic_validation | — | — | — | — | — | — | ✓ | ✓ | ✓ | — | — | — | — | — |
-| request_reopen | — | — | — | — | ✓⁸ | — | — | ✓ | — | — | — | — | — | — |
-| request_finalization | — | — | — | — | — | — | — | — | ✓⁹ | ✓⁹ | ✓⁹ | — | — | — |
-| prepare_final_plan | — | — | — | — | — | — | — | — | — | ✓¹⁰ | ✓¹⁰ (idempotent) | — | — | — |
-| request_synthesis | — | — | — | — | — | —⁵ | —⁵ | —⁵ | —⁵ | — | — | — | — | — |
+Since Phase R1 the matrix gains: (a) `request_abort` — granted in EVERY active
+stage column (discovery/architecture/all detail substates/all synthesis
+substates), never in `final`/`handoff_pending`/terminal (§16); (b)
+`request_reopen` — granted in EVERY synthesis substate (the blocker-cure route
+out of synthesis, §10-§14) and in `detail/decomposition-needed` (the
+blocker-driven ARCHITECTURE reopen must be reachable before any Section
+exists, §18); (c) a FOURTH detail substate `detail/architecture-remediation`
+(`activeWork = {type: "architecture"}`, entered only by an approved
+`reopen_architecture` PlanCommit) with the minimal §21 surface; (d) the
+`prepare_architecture_amendment` capability, granted ONLY there.
+
+| Capability | no run | discovery | architecture | detail decomp-needed | detail arch-remediation | detail section-ready (both substates) | synthesis no-input | synthesis input/manifest-ready (unvalidated) | synthesis validation-findings | synthesis validation-clean | synthesis final-candidate-ready (current candidate) | synthesis final-proposal-ready (current final Proposal) | final | handoff_pending | completed/aborted |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| start_or_resume | ✓ | ✓¹ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓² |
+| read_status | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| read_memory | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| record_question | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| propose_question_resolution | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| raise_conflict | — | — | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| promote_evidence | — | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
+| request_architecture | — | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| prepare_proposal | — | — | ✓ | ✓ | — | ✓ | — | — | — | — | — | — | — | — | — |
+| prepare_decomposition | — | — | — | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+| prepare_section_checkpoint | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | — | — |
+| request_section_focus | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | — | — |
+| request_user_approval | — | — | ✓ | ✓ | — | ✓ | — | — | — | — | — | ✓¹⁰ | — | — | — |
+| request_completion | — | — | ✓ | — | — | ✓⁴ (checkpointed only) | — | — | — | — | — | — | — | — | — |
+| begin_synthesis | — | — | — | — | — | — | ✓ | ✓⁶ | — | ✓⁶ | — | — | — | — | — |
+| submit_synthesis_manifest | — | — | — | — | — | — | — | ✓ | ✓⁷ | ✓ | — | — | — | — | — |
+| run_semantic_validation | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | — | — | — | — | — |
+| request_reopen | — | — | — | ✓¹¹ | — | ✓⁸ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| request_finalization | — | — | — | — | — | — | — | — | — | ✓⁹ | ✓⁹ | ✓⁹ | — | — | — |
+| prepare_final_plan | — | — | — | — | — | — | — | — | — | — | ✓¹⁰ | ✓¹⁰ (idempotent) | — | — | — |
+| prepare_architecture_amendment | — | — | — | — | ✓ | — | — | — | — | — | — | — | — | — | — |
+| request_abort | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| request_synthesis | — | — | — | — | — | — | —⁵ | —⁵ | —⁵ | —⁵ | — | — | — | — | — |
 
 ¹ With an active run present, `ultraplan_start` RESUMES it (never creates a second).
 ² Creates a NEW run (completed/aborted runs are terminal).
@@ -441,6 +470,9 @@ controller independently re-verifies the proposal's type, candidate binding,
 and current gate identity BEFORE any user-facing confirmation (§57), and the
 transaction engine reruns the gate with exact identity equality at commit
 (§25-§27). Ordinary synthesis proposals can never use this approval path.
+¹¹ R1 §18/§41: granted in decomposition-needed for the BLOCKER-DRIVEN
+ARCHITECTURE reopen only — a Section target is still refused precisely (no
+Section exists there).
 
 Rationale highlights:
 
@@ -576,6 +608,16 @@ ids cannot authorize a reopen — plus the engine-side inner codes
 and `reopen_target_unsupported` (no selected finding affects the exact target
 SectionRevision — an Architecture-level finding cannot be falsely resolved
 through a Section reopen).
+
+R1 blocker-remediation codes: `conflict_resolution_invalid` (a
+resolve_conflict binding that witnesses no real remediation — no paired
+change, wrong ref, already-resolved conflict, wrong proposal type/stage), and
+the engine-level `amendment_base_mismatch` / `amendment_stage_invalid`
+(amend_architecture supersedes a non-current ARCH, or runs outside the
+architecture-remediation detail substate). The §7 reopen vocabulary gains
+`blocking_question` / `blocking_conflict` reasons with the established
+`reopen_reason_invalid` / `reopen_target_unsupported` / `reopen_stage_invalid`
+surfaces, and `abort_not_allowed` guards the terminal transition.
 
 Phase 2H finalization codes: `finalization_stale` (the authoritative state —
 HEAD, synthesis identity, validation report, or reachable Evidence state —
@@ -1684,6 +1726,249 @@ handoff is a RECOVERABLE SIDE-EFFECT workflow, not another PlanCommit.
   without a confirmed delivered handoff. Runtime incompatibility leaves the
   approved FinalPlan durable and the run resumable at handoff_pending.
 
+## 7.16 Blocker Cure, Deadlock Freedom & Architecture Remediation (Phase R1)
+
+The governing invariant: NO reachable active planning state may become
+permanently wedged by a blocker the Harness itself allows to be created. Every
+open blocking Question, open blocking Conflict, semantic-validation finding,
+dependency invalidation, and architecture-level finding has a sanctioned path
+to resolution through Proposal → user Approval → PlanCommit, to reopen →
+Detail → amendment → Approval → PlanCommit, or to the explicitly
+user-authorized terminal abort. No direct model mutation, no force flags, no
+finalization bypass exists anywhere on those paths.
+
+- **Conflict resolution lifecycle (§4-§6):** the closed `resolve_conflict`
+  change (legal ONLY inside design_checkpoint/amendment proposals in
+  architecture/detail) performs `open → resolved`; the resolution is
+  `{action: revise_proposal | amend_decision | amend_architecture, ref}` with
+  the ref Harness-derived, never model-authored: `amend_decision` binds the
+  exact resulting DecisionRef of a paired `amend_decision` change EARLIER in
+  the same proposal superseding a Decision the conflict names;
+  `amend_architecture` binds the exact resulting ARCH@n+1 of the paired
+  amendment; `revise_proposal` binds the CARRYING proposal's own exact ref,
+  valid only when the conflict's refs are addressed by the proposal's scope or
+  changes (pure ref matching — no heuristics). Resolutions are immutable
+  historical state; one resolution per conflict per proposal; the transaction
+  engine independently re-validates every binding against staged state.
+- **The conflict self-block exception (§7):** the `conflict_blocking` gate is
+  unchanged EXCEPT that a blocking conflict is ignored when THIS exact
+  proposal carries a sanctioned remediation explicitly bound to it —
+  `resolve_conflict(C)` or a blocker-driven reopen whose `conflictIDs` include
+  C. Unrelated blocking conflicts still block. No generic ignore/force flag
+  exists.
+- **New blocking conflicts are remediable by construction (§8):** the raise
+  boundary refuses a blocking conflict whose refs identify no
+  Architecture/Section/Decision; warning conflicts stay unrestricted;
+  historical conflicts are never rewritten.
+- **Blocker-driven reopens (§9-§14):** `request_reopen` gains the closed
+  reasons `blocking_question` and `blocking_conflict` (alongside
+  `semantic_validation` and `dependency_review`). The model names the blocker
+  ONLY; the Harness resolves the exact remediation target — a question's own
+  scope, a conflict's refs in a documented first-match order (ArchitectureRef
+  → the Architecture; else SectionRef → that Section; else DecisionRef → the
+  decision's scope), and never an arbitrary Section (§11/§12). The
+  blocker-driven reopen never requires or fabricates a ValidationReport; the
+  blocker stays OPEN through the reopen — the cure is the later user-approved
+  corrective Proposal (`resolve_conflict` / `resolve_question`).
+- **Explicit abort (§16-§17):** `ultraplan_request_abort` — zero
+  authority-bearing arguments, REAL one-shot `ToolContext.ask` with
+  `always: []`; on Allow the narrow `abortRun` transition sets
+  `lifecycle = aborted` (terminal) and clears activeWork, appending one
+  `run.lifecycle_changed` event. Abort creates NO FinalPlan, NO handoff, NO
+  Build turn, NO PlanCommit, moves NO HEAD, and erases nothing. A later
+  /ultra-plan requires a fresh admission and creates a NEW run. Abort is a
+  terminal escape hatch, never a blocker-resolution substitute (§17) — the
+  conflict lifecycle is mandatory regardless.
+- **Architecture reopen (§18-§20):** `reopen_architecture` (amendment
+  proposals only, scoped to the exact ARCH@n) — admitted from synthesis or
+  detail for an Architecture-scoped validation finding, blocking
+  architecture-scoped question, or blocking conflict whose refs identify the
+  Architecture. The commit moves stage → detail and activeWork →
+  `{type: "architecture"}`; ARCH@n stays approved and immutable; NO new
+  revision is created by reopening; Sections stay unchanged; old derived
+  artifacts go stale through the existing identity rules.
+- **The architecture-remediation substate (§21):** `activeWork =
+  {type: "architecture"}` exposes the minimal surface — reads, questions,
+  evidence promotion, `prepare_architecture_amendment`, `request_abort`.
+  `raise_conflict` is deliberately absent (a NEW conflict during remediation
+  could have no remediable target); Section completion/focus/decomposition
+  and generic proposals are withheld.
+- **The Architecture amendment (§22-§26):** `amend_architecture` (dedicated
+  tool only) carries the COMPLETE exact ARCH@n+1 (Harness-assigned revision,
+  frozen "approved", written verbatim); ARCH@n stays byte-identical; the same
+  proposal may carry `resolve_question` / `resolve_conflict(action=
+  amend_architecture)` resolutions bound to the exact ARCH@n+1 (engine-
+  verified). ONE transaction atomically publishes ARCH@n+1, the run pointer,
+  blocker resolutions, the CONSERVATIVE DAG INVALIDATION (old roots marked
+  needs_review as durable history, `run.sections → []`, activeWork cleared),
+  the Snapshot, the PlanCommit, and HEAD. A failure leaves everything
+  unchanged with the Approval durable (§35/§36).
+- **Decomposition provenance + re-decomposition (§27-§30, §50-§51):**
+  `run.sectionDecompositionArchitecture` (+ the additive snapshot field)
+  records the exact ARCH revision the current DAG was decomposed from —
+  cleared by the amendment, re-set by the next decomposition, load-validated
+  (present ⇒ sections non-empty ⇒ equals the current ARCH revision). After an
+  amendment the run enters detail/decomposition-needed against ARCH@n+1; the
+  SAME `ultraplan_prepare_section_decomposition` workflow applies; the durable
+  allocator continues the run's historical SEC sequence (fresh SEC-004… — no
+  recycling); old Section roots/revisions/contracts and Snapshots remain
+  exact-readable history, never resolved as current. The only path back to
+  finalization is the full pipeline on the new identity (§31/§32).
+
+## 7.17 Context Architecture — Assembler, Budget & Compaction Independence (Phase R2)
+
+R2 closes the Context decision of the v0.1 Exit Review: the frozen Context
+Architecture (spec §13-§16, §28) is implemented as ONE production assembly
+path. The frozen architecture text is unmodified; everything here implements it.
+
+- **Single authority (brief §3):** `assemblePlanningContext(state)` over a
+  `capturePlanningContextState(planID)` read is the ONLY production context
+  path. The former phase-specific L0 renderer is an L0 INPUT to the assembler —
+  its fragment functions are shared, and it survives only as a legacy embedder
+  view pinned by tests; the system-transform injects assembler output ONLY, so
+  no old-fragment + new-fragment duplicate exists.
+- **Snapshot-consistent read boundary (brief §5):** the assembler never stitches
+  one prompt from many independent "latest" reads. `capturePlanningContextState`
+  is a PlanStore boundary method: on the durable store it performs ONE refresh
+  of the atomically-published document and reads every family from that single
+  hydrated state (no writer lock held); the returned view is immutable and
+  resolves CURRENT artifacts strictly through the HEAD Snapshot's exact revision
+  pointers.
+- **Read-only assembly (brief §4):** assembly reads, projects, budgets, renders.
+  It can never create Proposals, mutate the PlanningRun, move HEAD, promote
+  Evidence, resolve Questions/Conflicts, create PlanCommits, or change workflow
+  stage. A model inference never incurs planning-state side effects because
+  context was assembled.
+- **Authority identity binding (brief §6):** every assembly binds PlanID, HEAD
+  commit, stage, and activeWork — in the rendered envelope and in the trace. If
+  HEAD moves after assembly, the context is merely a stale read projection;
+  transaction/capability revalidation remains the only authority.
+- **Layers L0-L5 (spec §14):** L0 planning protocol (rules + stage guidance,
+  compact — no duplication of L1/L3 data); L1 the deterministic run-state
+  capsule (PlanID, lifecycle, stage, derived workflow substate, active work,
+  HEAD commit/snapshot, architecture ref, section progress counts, blocking
+  Question/Conflict counts WITH exact ids); L2 global committed memory (goal,
+  hard+active constraints, the compact approved Architecture — all automatic);
+  L3 active scope (section work: active Section, current approved/current
+  revision, direct dependency contracts, transitive dependencies compressed,
+  section-scoped + inherited decisions, relevant interfaces, scope-relevant
+  questions/conflicts, downstream impact summary; architecture work: the exact
+  current Architecture at relevant/full, its referenced decisions, its
+  questions/conflicts; synthesis: the derived-artifact identity capsule; before
+  artifacts: intentionally sparse, never fabricated); L4 working context (the
+  current ready/awaiting Proposal with its exact hash, frozen-not-committed
+  markers, candidate question resolutions — visibly separated from committed
+  memory, never the conversation); L5 the available operations rendered from
+  `getCapabilities` — the single capability authority (no second hand-authored
+  matrix), informational only: server-side Controller authorization is
+  unchanged and omission from context is never an authorization mechanism.
+- **Projection levels (spec §15; brief §8-§10):** identity / summary / relevant
+  / full are REAL per-artifact deterministic projections that materially differ.
+  Existing approved STABLE projections are canonical where they exist —
+  `SectionRevision.projection.compact` is the revision summary, SectionContracts
+  render verbatim, the Architecture compact is the deterministic structured
+  projection. Approved design is never re-summarized; no model call ever
+  creates a projection; compression NEVER truncates text mid-field — a lower
+  level is a different deterministic projection.
+- **The required-L2 Architecture rule (brief §16):** the Architecture compact is
+  a P2 fragment whose MINIMUM compact representation is non-droppable — P2
+  governs compression/order decisions, never total removal of this required L2
+  fragment (spec §14 "always includes" + §16 P2 classification, resolved
+  without violating either).
+- **Budget semantics (spec §16; brief §44):** P0 never drops (protocol, run
+  state, goal, hard constraints, active artifact identity, blocking
+  questions/conflicts, blocking-path evidence); P1 degrades then drops only
+  where explicitly droppable; P2 then P3 degrade/drop first (full → relevant →
+  summary → identity, one deterministic step at a time, stable canonical
+  tie-breaking). Degradation is a fixed-order deterministic action loop — no
+  model calls decide importance. The budget applies ONLY to the Ultra Plan
+  assembled context — never the conversation, tool schemas, host prompts, or
+  responses.
+- **Budget configuration (brief §46):** adapter-level, deterministic,
+  provider-neutral environment settings read once per hook creation:
+  `ULTRA_PLAN_CONTEXT_BUDGET_TOKENS` (estimated-token ceiling; default 12000,
+  a conservative documented choice) and `ULTRA_PLAN_CONTEXT_OVERFLOW`
+  (`render` (default) | `fail`). Core hardcodes no provider-specific window.
+- **Token estimation (brief §47):** the audited OpenCode 1.18.x runtime exposes
+  no reliable tokenizer API for arbitrary candidate context, so a deterministic
+  documented estimator is used: `estimateTokens(text) = ceil(asciiUnits/4) +
+  nonAsciiUnits` (code points ≤ U+007F count 1 asciiUnit, others 1
+  nonAsciiUnit). Pure, stable, UTF-8-safe, provider-neutral, conservative for
+  budgeting; these are budget ESTIMATES, never provider billing counts. No
+  model-specific tokenizer subsystem was added.
+- **Required-content overflow (brief §17):** if the required minimum exceeds
+  the budget, P0 is never silently dropped. Default behavior (`render`): ALL
+  required minimum content renders, `trace.overBudget = true`, and a
+  structured `ultraplan.context.warning` diagnostic is emitted. The `fail`
+  setting throws `context_budget_exceeded` before inference for hosts whose
+  transform can fail a turn safely — the OpenCode transform's throw semantics
+  are unverified, so fail is opt-in and the default documents the host
+  limitation honestly.
+- **Evidence retrieval (spec §28; brief §36-§43):** structural paths only —
+  no vectors, no similarity, no classifier. P0: evidence of blocking
+  questions/conflicts through the exact represented chain (scope artifact →
+  exact Decisions → evidence refs). P1: evidence referenced by active
+  decisions + evidence directly scoped to the active Section (the scope kind
+  the model represents). P2: dependency/architecture evidence. P3: run-scope
+  supplementary evidence — the first class dropped. Dedup is by exact ref with
+  the effective priority = highest of all retrieval reasons; the trace
+  preserves all reasons. Stale/needs-validation evidence renders with its
+  exact state — never refreshed, never hidden. Where no represented edge
+  connects a blocker to evidence, nothing is invented.
+- **Retrieval reasons (brief §54):** the closed §19 vocabulary plus the
+  documented additions: `protocol`, `run_state`, `goal`, `capabilities`,
+  `architecture_compact` (the always-included structural fragments) and
+  `blocking_evidence`, `active_decision_evidence`, `active_section_evidence`,
+  `architecture_evidence`, `dependency_evidence` (evidence paths). No
+  free-form prose ever drives retrieval.
+- **ContextTrace (spec §19; brief §51-§55):** implemented with two documented
+  adaptations to the real type system: `included[].ref` is optional (L0/L1/L5
+  and the synthesis capsule are structural fragments; `fragmentId` is always
+  present), and the reason vocabulary gains the additions above. Each included
+  entry records ref/layer/priority/projection/desiredDetail/reasons/
+  estimatedTokens/budgetDecision (kept | downgraded | dropped); exclusions
+  carry stable machine reasons (`budget_dropped_p3` …,
+  `resolved_conflict_not_current`). The trace id is a deterministic hash of the
+  assembly decisions (no allocator, no clock — assembly stays read-only); the
+  trace is observability ONLY: never persisted through PlanCommit, never
+  HEAD-moving, never authority, and its logging is best-effort (a logging
+  failure cannot change context correctness). A bounded ephemeral latest-trace
+  diagnostic cache exists for tests/embedders.
+- **Structured logging (brief §73):** the transform emits single-line JSON on
+  `ultraplan.context.trace` (ids, refs, projection levels, reasons, estimated
+  tokens, budget usage — never full prompt content). The live smoke parses this
+  log; the model is never asked to prove injection by repeating text (§72).
+- **Compaction independence (spec §18; brief §68-§71/§100):** the audited host
+  primitives are real — POST `/session/{id}/summarize` (the TUI
+  session.compact path), the `session.compacted` event, and the
+  `experimental.session.compacting` / `experimental.compaction.autocontinue`
+  plugin hooks. Because every inference's context is re-assembled from durable
+  authority through the transform, REAL host compaction cannot remove committed
+  planning context: pre- and post-compaction traces carry the same PlanID,
+  HEAD, stage, activeWork, goal, constraints, and active-scope authority.
+  Conversation detail may differ; committed planning context must not.
+- **Lifecycle boundaries (brief §65-§67):** aborted and completed runs receive
+  NO planning injection (`findActiveRunBySession` never returns them — §65/§67
+  hold); a `handoff_pending` run receives the minimal NON-authoritative
+  handoff-status context (L0 boundary + L1 + read-only L5 — assembly mode
+  `handoff-status`), never planning L2-L4, and Build continues to receive the
+  deterministic ExecutionHandoff boundary (§66). R2 adds NO tool, NO grant, and
+  no change to the §4 capability matrix.
+- **Fail-closed assembly (brief §93):** internally inconsistent authoritative
+  state (missing active Section root, a dependency naming an uncommitted
+  Section, a bound approved revision with no content, an invalid exact decision
+  ref) throws `context_state_invalid` — the broken fragment is never silently
+  omitted while pretending the context is valid.
+- **Explicit refs (brief §57; spec §15):** the assembler accepts optional
+  exact `explicitRefs` and upgrades/creates their fragments deterministically
+  (reason `explicit_reference`, full projection). No conversation parsing, no
+  regex workflow control; no production caller is wired yet — the capability is
+  documented and deterministically tested.
+- **Context is never authority (brief §94):** rendered context is informative.
+  The model cannot return rendered text as proof of Approval, Proposal, commit,
+  evidence provenance, or workflow state; every tool/controller/transaction
+  authority is unchanged. R2 introduced no authorization surface.
+
 ## 8. Evidence Promotion Rules
 
 Trust domains stay separate: Plan Memory is approved/authoritative; repository
@@ -1742,6 +2027,14 @@ Verified against the installed OpenCode plugin/SDK (see phase-2a-report.md):
   (`dynamicModelSwitch=false`, `dynamicAgentSwitch=false`); no speculative APIs exist
   in the adapter.
 
-The L0 Planning Protocol (`src/context/protocol.ts`) is rendered deterministically from
-static rules plus the live capability set, and injected into planning-model system
-context via `experimental.chat.system.transform` ONLY for sessions with an active run.
+The L0 Planning Protocol (`src/context/protocol.ts`) provides the protocol
+fragment rules; since R2 (§7.17) the production system-context injection is the
+FULL context assembler (`src/context/assembler.ts`) — deterministic L0-L5
+assembly with budget management and a ContextTrace — injected via
+`experimental.chat.system.transform` ONLY for sessions with an active or
+handoff_pending run (aborted/completed runs receive nothing). Verified host
+compaction primitives (R2 audit): `POST /session/{id}/summarize`, the
+`session.compacted` event, and the `experimental.session.compacting` /
+`experimental.compaction.autocontinue` hooks. Adapter-level context budget
+settings: `ULTRA_PLAN_CONTEXT_BUDGET_TOKENS` (default 12000) and
+`ULTRA_PLAN_CONTEXT_OVERFLOW` (`render` (default) | `fail`).

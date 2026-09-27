@@ -42,6 +42,7 @@ import {
 import type {
   ApprovalID,
   CommitID,
+  ConflictID,
   PlanID,
   ProposalID,
   QuestionID,
@@ -52,6 +53,7 @@ import { isActiveRun } from "../core/state-machine.js";
 import { UltraPlanError } from "../core/errors.js";
 import type {
   Architecture,
+  Conflict,
   Constraint,
   Decision,
   OpenQuestion,
@@ -141,6 +143,8 @@ import type {
 import type { Evidence } from "../repository/evidence.js";
 import type { PlanEvent, PlanEventDetail } from "./events.js";
 import type { Snapshot, SnapshotState } from "./snapshots.js";
+import type { PlanningContextState } from "../context/state.js";
+import { buildPlanningContextState } from "../context/state.js";
 
 export interface CommitTransactionInput {
   planID: PlanID;
@@ -465,6 +469,8 @@ export interface PlanStore {
    * Idempotent: completing a completed run returns the run unchanged.
    */
   completeHandoffRun(planID: PlanID): Promise<PlanningRun>;
+  /** R1a §16: explicit terminal abort — user-confirmed upstream, state-legal here. */
+  abortRun(planID: PlanID): Promise<PlanningRun>;
 
   // -- Committed FinalPlans (Phase 2I; READ-ONLY here — the single writer is
   //    the final_plan transaction inside commitTransaction/publishTransaction;
@@ -478,6 +484,17 @@ export interface PlanStore {
   /** The most recently committed FinalPlan for the run (insertion order). */
   getCurrentFinalPlan(planID: PlanID): Promise<FinalPlan | undefined>;
   listFinalPlans(planID: PlanID): Promise<FinalPlan[]>;
+
+  // -- Snapshot-consistent context read boundary (R2 brief §5) ---------------
+  /**
+   * ONE coherent read of everything context assembly needs, as one immutable
+   * view. Never stitches a prompt from many independent "latest" reads: on
+   * the durable store this is one refresh of the atomically-published document
+   * followed by reads from that single hydrated state; no writer lock is held.
+   * Read-only — it never mutates anything. Undefined when the plan does not
+   * exist.
+   */
+  capturePlanningContextState(planID: PlanID): Promise<PlanningContextState | undefined>;
 }
 
 interface RevisionRegistry<T> {
@@ -563,6 +580,9 @@ interface StagedState {
   decisions: RevisionRegistry<Decision>;
   openQuestions: OpenQuestion[];
   constraints: Constraint[];
+  /** Staged conflicts — R1a: ONLY an approved resolve_conflict change mutates them. */
+  conflicts: Conflict[];
+  resolvedConflicts: ConflictID[];
   /** Staged run stage — only an architecture_completion commit may move it. */
   stage: PlanningRun["stage"];
   /**
@@ -575,6 +595,9 @@ interface StagedState {
   runDecisions: DecisionRef[];
   /** Staged PlanningRun.finalPlan — ONLY the Final PlanCommit sets the pointer. */
   runFinalPlan: FinalPlanRef | undefined;
+  /** R1b §50: staged decomposition provenance (set by decomposition, cleared by amendment). */
+  sectionDecompositionArchitecture: ArchitectureRef | undefined;
+  provenanceTouched: boolean;
   /** True when the run had NO committed sections before this proposal. */
   sectionsStartedEmpty: boolean;
   /** Staged active-work focus — only the initial decomposition commit sets it. */
@@ -1572,6 +1595,40 @@ export class InMemoryPlanStore implements PlanStore {
     return [...(this.finalPlans.get(planID)?.values() ?? [])];
   }
 
+  // -- Snapshot-consistent context read boundary (R2 brief §5) ----------------
+  // In-memory consistency is automatic (single-threaded synchronous reads);
+  // the durable store overrides this with ONE refreshFromDisk before the same
+  // map reads — never per-read refreshes, never a writer lock.
+
+  async capturePlanningContextState(planID: PlanID): Promise<PlanningContextState | undefined> {
+    const run = this.runs.get(planID);
+    if (!run) return undefined;
+    const snapshot = run.headSnapshot ? this.snapshots.get(planID)?.get(run.headSnapshot) : undefined;
+    const sectionRegistry = this.sectionRevisions.get(planID);
+    const architectureRegistry = this.architectures.get(planID);
+    const architecture =
+      snapshot?.state.architectureRevision !== undefined
+        ? architectureRegistry?.byKey.get(revisionKey("ARCH", snapshot.state.architectureRevision))
+        : undefined;
+    return buildPlanningContextState({
+      run,
+      ...(snapshot ? { headSnapshot: snapshot } : {}),
+      ...(architecture ? { architecture } : {}),
+      sections: [...(this.sections.get(planID)?.values() ?? [])],
+      sectionRevisions: (ref) => sectionRegistry?.byKey.get(revisionKey(ref.id, ref.revision)),
+      decisions: new Map([...(this.decisions.get(planID)?.byKey ?? [])]),
+      evidence: [...(this.evidence.get(planID)?.latest.values() ?? [])],
+      proposals: [...(this.proposals.get(planID)?.values() ?? [])],
+      synthesisInputs: [...(this.synthesisInputs.get(planID)?.values() ?? [])],
+      synthesisManifests: [...(this.synthesisManifests.get(planID)?.values() ?? [])],
+      validationReports: [...(this.validationReports.get(planID)?.values() ?? [])],
+      evidenceAudits: [...(this.evidenceAudits.get(planID)?.values() ?? [])],
+      finalPlanCandidates: [...(this.finalPlanCandidates.get(planID)?.values() ?? [])],
+      finalPlans: [...(this.finalPlans.get(planID)?.values() ?? [])],
+      executionHandoffs: [...(this.executionHandoffs.get(planID)?.values() ?? [])],
+    });
+  }
+
   // -- Runtime handoff (Phase 2J) ---------------------------------------------
 
   async saveExecutionHandoff(planID: PlanID, handoff: ExecutionHandoff): Promise<{ handoff: ExecutionHandoff; created: boolean }> {
@@ -1864,6 +1921,41 @@ export class InMemoryPlanStore implements PlanStore {
     const updated: PlanningRun = { ...run, lifecycle: "completed", revision: run.revision + 1, updatedAt: this.now() };
     this.runs.set(planID, updated);
     await this.appendEvent(planID, { type: "run.lifecycle_changed", from: run.lifecycle, to: "completed" });
+    return updated;
+  }
+
+  /**
+   * R1a §16 — the explicit terminal abort. A narrow Harness-owned workflow
+   * transition (never a Proposal/PlanCommit): lifecycle active → aborted,
+   * activeWork cleared, one `run.lifecycle_changed` event. Committed Plan
+   * Memory, HEAD, Proposals/Approvals/Commits, Evidence, and the final history
+   * are untouched; `aborted` is terminal (a new run requires a fresh
+   * /ultra-plan admission). The CALLER must have performed the real one-shot
+   * user confirmation (controller beginAbort/confirmAbort) — this operation
+   * only enforces the state legality: active runs in
+   * discovery/architecture/detail/synthesis.
+   */
+  async abortRun(planID: PlanID): Promise<PlanningRun> {
+    const run = this.runs.get(planID);
+    if (!run) {
+      throw new UltraPlanError("run_not_found", `PlanningRun ${planID} does not exist`, { planID });
+    }
+    if (run.lifecycle !== "active" || run.stage === "final") {
+      throw new UltraPlanError(
+        "abort_not_allowed",
+        `A run can only be aborted while lifecycle=active and stage is discovery/architecture/detail/synthesis (run is ${run.lifecycle}/${run.stage})`,
+        { planID, lifecycle: run.lifecycle, stage: run.stage },
+      );
+    }
+    const updated: PlanningRun = {
+      ...run,
+      lifecycle: "aborted",
+      activeWork: undefined,
+      revision: run.revision + 1,
+      updatedAt: this.now(),
+    };
+    this.runs.set(planID, updated);
+    await this.appendEvent(planID, { type: "run.lifecycle_changed", from: run.lifecycle, to: "aborted" });
     return updated;
   }
 
@@ -2512,6 +2604,80 @@ export class InMemoryPlanStore implements PlanStore {
             { stage: run.stage },
           );
         }
+        // R1a §10-§14: blocker-driven reasons run in synthesis or detail and
+        // bind exact, currently-open, currently-blocking blockers whose
+        // remediation target is THIS section.
+        if (change.reason.type === "blocking_question") {
+          if (run.stage !== "synthesis" && run.stage !== "detail") {
+            addFailure(
+              "reopen_stage_invalid",
+              `A blocker-driven reopen requires stage=synthesis or detail (run is in ${run.stage})`,
+              { stage: run.stage },
+            );
+          }
+          const blockerReason = change.reason;
+          const question = run.openQuestions.find((q) => q.id === blockerReason.questionID);
+          if (!question) {
+            addFailure("unknown_reference", `Question ${blockerReason.questionID} does not exist in run ${run.id}`);
+          } else if (question.status !== "open" || !question.blocking) {
+            addFailure(
+              "reopen_reason_invalid",
+              `A blocker-driven reopen requires an OPEN, BLOCKING question (${question.id} is ${question.status}/${question.blocking ? "blocking" : "non-blocking"})`,
+              { questionID: question.id },
+            );
+          } else if ("revision" in question.scope || question.scope.id !== change.target.id) {
+            addFailure(
+              "reopen_target_unsupported",
+              `Question ${question.id} is not scoped to ${change.target.id}; the reopen target must be the blocker's own remediation target`,
+              { questionID: question.id, sectionID: change.target.id },
+            );
+          }
+        }
+        if (change.reason.type === "blocking_conflict") {
+          if (run.stage !== "synthesis" && run.stage !== "detail") {
+            addFailure(
+              "reopen_stage_invalid",
+              `A blocker-driven reopen requires stage=synthesis or detail (run is in ${run.stage})`,
+              { stage: run.stage },
+            );
+          }
+          if (change.reason.conflictIDs.length === 0) {
+            addFailure(
+              "reopen_reason_invalid",
+              "A blocking_conflict reopen must bind at least one conflictID",
+              { sectionID: change.target.id },
+            );
+          }
+          for (const conflictID of change.reason.conflictIDs) {
+            const conflict = run.conflicts.find((c) => c.id === conflictID);
+            if (!conflict) {
+              addFailure("unknown_reference", `Conflict ${conflictID} does not exist in run ${run.id}`);
+              continue;
+            }
+            if (conflict.status !== "open" || conflict.severity !== "blocking") {
+              addFailure(
+                "reopen_reason_invalid",
+                `A blocker-driven reopen requires an OPEN, BLOCKING conflict (${conflict.id} is ${conflict.status}/${conflict.severity})`,
+                { conflictID: conflict.id },
+              );
+              continue;
+            }
+            const identifiesTarget =
+              conflict.refs.some((ref) => ref.kind === "section" && ref.id === change.target.id) ||
+              conflict.refs.some((ref) => {
+                if (ref.kind !== "decision") return false;
+                const decision = this.decisions.get(run.id)?.latest.get(ref.id);
+                return decision?.scope.sections?.includes(change.target.id) ?? false;
+              });
+            if (!identifiesTarget) {
+              addFailure(
+                "reopen_target_unsupported",
+                `Conflict ${conflict.id} does not identify ${change.target.id} as its remediation target`,
+                { conflictID: conflict.id, sectionID: change.target.id },
+              );
+            }
+          }
+        }
         const section = this.sections.get(run.id)?.get(change.target.id);
         if (!section) {
           addFailure("unknown_reference", `Section ${change.target.id} is not committed`);
@@ -2592,6 +2758,122 @@ export class InMemoryPlanStore implements PlanStore {
               );
             }
           }
+        }
+      }
+    }
+
+    // R1b §19-§20: reopen_architecture boundary — amendment proposals only,
+    // scoped to the exact target ArchitectureRef, with the same report
+    // revalidation the section reopen applies (registry-backed here, so it
+    // also holds for hostile direct engine calls).
+    const hasArchReopen = proposal.changes.some((c) => c.kind === "reopen_architecture");
+    if (hasArchReopen) {
+      if (proposal.type !== "amendment") {
+        addFailure(
+          "reopen_type_invalid",
+          `reopen_architecture is only valid inside an amendment proposal (got ${proposal.type})`,
+          { proposalID: proposal.id, type: proposal.type },
+        );
+      }
+      if (run.stage !== "synthesis" && run.stage !== "detail") {
+        addFailure(
+          "reopen_stage_invalid",
+          `An Architecture reopen runs in synthesis or detail (run is in ${run.stage})`,
+          { stage: run.stage },
+        );
+      }
+      for (const change of proposal.changes) {
+        if (change.kind !== "reopen_architecture" || change.reason.type !== "semantic_validation") continue;
+        const report = this.validationReports.get(run.id)?.get(change.reason.reportID);
+        if (!report) {
+          addFailure("unknown_reference", `ValidationReport ${change.reason.reportID} does not exist in run ${run.id}`);
+          continue;
+        }
+        if (report.hash !== change.reason.reportHash) {
+          addFailure(
+            "reopen_report_mismatch",
+            `The reopen binds report hash ${change.reason.reportHash.slice(0, 16)}…, but ${report.id} hashes to ${report.hash.slice(0, 16)}…`,
+            { reportID: report.id },
+          );
+        }
+        if (report.result !== "findings") {
+          addFailure(
+            "reopen_reason_invalid",
+            `${report.id} is clean; a clean report cannot authorize a reopen`,
+            { reportID: report.id },
+          );
+        }
+        const selectedIDs = change.reason.findingIDs;
+        const knownFindings = new Set(report.findings.map((finding) => finding.id));
+        if (selectedIDs.length === 0 || selectedIDs.some((findingID) => !knownFindings.has(findingID))) {
+          addFailure(
+            "reopen_reason_invalid",
+            `The reopen cites findings that do not exist in ${report.id}`,
+            { reportID: report.id },
+          );
+          continue;
+        }
+        const affectsArchitecture = report.findings.some(
+          (finding) =>
+            selectedIDs.includes(finding.id) && finding.scope.architecture?.revision === change.target.revision,
+        );
+        if (!affectsArchitecture) {
+          addFailure(
+            "reopen_target_unsupported",
+            `No selected finding of ${report.id} is scoped to ARCH@${change.target.revision}`,
+            { reportID: report.id, revision: change.target.revision },
+          );
+        }
+        const currentIdentity = this.currentSynthesisIdentity(run.id);
+        if (
+          !currentIdentity ||
+          currentIdentity.inputHash !== report.inputHash ||
+          currentIdentity.manifestHash !== report.manifestHash
+        ) {
+          addFailure(
+            "reopen_report_stale",
+            `ValidationReport ${report.id} no longer binds the current synthesis identity; rerun semantic validation after the rework cycle`,
+            { reportID: report.id },
+          );
+        }
+      }
+    }
+
+    // R1a §4-§7 conflict-resolution boundary: `resolve_conflict` rides ONLY
+    // design_checkpoint/amendment proposals in the stages where
+    // prepare_proposal exists (architecture/detail). The commit re-checks
+    // everything the freeze validated — the conflict exists and is open, and
+    // the remediation binding witnesses the staged result — so hostile direct
+    // engine calls fail closed exactly like the controller path.
+    const hasResolveConflict = proposal.changes.some((c) => c.kind === "resolve_conflict");
+    if (hasResolveConflict) {
+      if (proposal.type !== "design_checkpoint" && proposal.type !== "amendment") {
+        addFailure(
+          "conflict_resolution_invalid",
+          `resolve_conflict is only valid inside design_checkpoint or amendment proposals (got ${proposal.type})`,
+          { proposalID: proposal.id, type: proposal.type },
+        );
+      }
+      if (run.stage !== "architecture" && run.stage !== "detail") {
+        addFailure(
+          "conflict_resolution_invalid",
+          `Conflict resolution requires stage=architecture or detail (run is in ${run.stage}); synthesis blockers are remediated through the sanctioned reopen → detail loop`,
+          { stage: run.stage },
+        );
+      }
+      for (const change of proposal.changes) {
+        if (change.kind !== "resolve_conflict") continue;
+        const conflict = run.conflicts.find((c) => c.id === change.conflictID);
+        if (!conflict) {
+          addFailure("unknown_reference", `Conflict ${change.conflictID} does not exist in run ${run.id}`);
+          continue;
+        }
+        if (conflict.status !== "open") {
+          addFailure(
+            "conflict_resolution_invalid",
+            `Conflict ${change.conflictID} is already resolved; resolutions are immutable historical state`,
+            { conflictID: change.conflictID },
+          );
         }
       }
     }
@@ -2753,12 +3035,16 @@ export class InMemoryPlanStore implements PlanStore {
       decisions: cloneRegistry(emptyRegistryOr(this.decisions, run.id)),
       openQuestions: run.openQuestions.map((q) => ({ ...q })),
       constraints: run.constraints.map((c) => ({ ...c })),
+      conflicts: run.conflicts.map((c) => ({ ...c, ...(c.resolution ? { resolution: { ...c.resolution } } : {}) })),
+      resolvedConflicts: [],
       stage: run.stage,
       lifecycle: run.lifecycle,
       runArchitecture: run.architecture,
       runSections: run.sections.map((ref) => ({ id: ref.id })),
       runDecisions: [...run.decisions],
       runFinalPlan: run.finalPlan,
+      sectionDecompositionArchitecture: run.sectionDecompositionArchitecture,
+      provenanceTouched: false,
       sectionsStartedEmpty: run.sections.length === 0,
       activeWork: run.activeWork,
       addedSections: [],
@@ -2769,7 +3055,7 @@ export class InMemoryPlanStore implements PlanStore {
     };
 
     for (const change of proposal.changes) {
-      this.stageChange(staged, change, addFailure, approval);
+      this.stageChange(staged, change, addFailure, approval, proposal);
     }
 
     // Phase 2C: the architecture_completion commit and the architecture →
@@ -2877,11 +3163,29 @@ export class InMemoryPlanStore implements PlanStore {
 
     // Blocking-conflict intersection (conservative: a blocking conflict with no
     // refs is treated as run-global; §15).
+    //
+    // R1a §7 — the CONFLICT SELF-BLOCK EXCEPTION. The gate must never reject
+    // the exact transaction authorized to remediate a conflict. Exempt = the
+    // conflicts explicitly named by sanctioned remediation changes in THIS
+    // exact Proposal: `resolve_conflict(C)` (which already staged C to
+    // `resolved` above), plus the conflictIDs bound by blocker-driven
+    // reopen reasons. No generic ignore/force flag exists; UNRELATED blocking
+    // conflicts still block the transaction exactly as before.
+    const remediatedConflictIDs = new Set<ConflictID>([
+      ...proposal.changes.flatMap((c) => (c.kind === "resolve_conflict" ? [c.conflictID] : [])),
+      ...proposal.changes.flatMap((c) =>
+        c.kind === "reopen_section" && c.reason.type === "blocking_conflict" ? c.reason.conflictIDs : [],
+      ),
+      ...proposal.changes.flatMap((c) =>
+        c.kind === "reopen_architecture" && c.reason.type === "blocking_conflict" ? c.reason.conflictIDs : [],
+      ),
+    ]);
     const changedTargets = staged.committedChanges
       .map((change) => change.ref)
       .filter((ref): ref is MemoryRef => ref !== undefined);
-    for (const conflict of run.conflicts) {
+    for (const conflict of staged.conflicts) {
       if (conflict.status !== "open" || conflict.severity !== "blocking") continue;
+      if (remediatedConflictIDs.has(conflict.id)) continue;
       const intersects =
         conflict.refs.length === 0 ||
         conflict.refs.some((ref) => changedTargets.some((target) => refTargetsMatch(ref, target)));
@@ -2947,10 +3251,18 @@ export class InMemoryPlanStore implements PlanStore {
       ...run,
       openQuestions: staged.openQuestions,
       constraints: staged.constraints,
+      conflicts: staged.conflicts,
       stage: staged.stage,
       lifecycle: staged.lifecycle,
       architecture: staged.runArchitecture,
       sections: staged.runSections.map((mirror) => ({ id: mirror.id })),
+      // R1b §50: provenance is present only when staged/persisted state carries
+      // it (set by decomposition, CLEARED by amend_architecture — an explicit
+      // value so the run spread's prior key cannot survive), absent for legacy
+      // runs.
+      sectionDecompositionArchitecture: staged.provenanceTouched
+        ? staged.sectionDecompositionArchitecture
+        : run.sectionDecompositionArchitecture,
       decisions: staged.runDecisions,
       ...(staged.runFinalPlan ? { finalPlan: staged.runFinalPlan } : {}),
       activeWork: staged.activeWork,
@@ -2964,6 +3276,7 @@ export class InMemoryPlanStore implements PlanStore {
     change: ProposalChange,
     addFailure: (code: string, message: string, detail?: Record<string, unknown>) => void,
     approval: Approval,
+    proposal: Proposal,
   ): void {
     switch (change.kind) {
       case "add_decision": {
@@ -3239,6 +3552,12 @@ export class InMemoryPlanStore implements PlanStore {
           return;
         }
         staged.activeWork = { type: "section", id: target.id };
+        // R1b §50: record the decomposition provenance — the exact Architecture
+        // revision this DAG was decomposed from (the proposal's committed scope).
+        if ("revision" in proposal.scope) {
+          staged.sectionDecompositionArchitecture = { ...proposal.scope };
+          staged.provenanceTouched = true;
+        }
         staged.committedChanges.push({ kind: change.kind, ref: { kind: "section", id: target.id } });
         return;
       }
@@ -3273,6 +3592,103 @@ export class InMemoryPlanStore implements PlanStore {
         staged.committedChanges.push({
           kind: change.kind,
           ref: { kind: "question", id: resolution.questionID },
+        });
+        return;
+      }
+      case "resolve_conflict": {
+        // R1a §4-§7: the ONLY open → resolved transition for a Conflict —
+        // staged by an approved change, verified against the SAME staged
+        // state the resolution binds (never against HEAD-relative state).
+        const conflict = staged.conflicts.find((c) => c.id === change.conflictID);
+        if (!conflict) {
+          addFailure("unknown_reference", `Conflict ${change.conflictID} does not exist`);
+          return;
+        }
+        if (conflict.status === "resolved") {
+          addFailure(
+            "conflict_resolution_invalid",
+            `Conflict ${change.conflictID} is already resolved${conflict.resolution ? ` (by ${conflict.resolution.action})` : ""}; resolutions are immutable historical state`,
+            { conflictID: change.conflictID },
+          );
+          return;
+        }
+        if (staged.resolvedConflicts.includes(change.conflictID)) {
+          addFailure(
+            "conflict_resolution_invalid",
+            `This transaction already stages a resolution for ${change.conflictID}; one resolution per conflict per proposal`,
+            { conflictID: change.conflictID },
+          );
+          return;
+        }
+        // §6: the binding must witness REAL remediation in the staged result.
+        if (change.resolution.action === "amend_decision") {
+          const ref = change.resolution.ref;
+          if (ref.kind !== "decision" || !("revision" in ref) || ref.revision === undefined) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}, amend_decision) must bind an exact DecisionRef`,
+              { conflictID: change.conflictID },
+            );
+            return;
+          }
+          const decision = staged.decisions.byKey.get(revisionKey(ref.id, ref.revision));
+          if (!decision) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}) binds ${ref.id}@${ref.revision}, which this transaction does not create and the run does not contain`,
+              { conflictID: change.conflictID, ref: `${ref.id}@${ref.revision}` },
+            );
+            return;
+          }
+          const conflictNamesDecision = conflict.refs.some((r) => r.kind === "decision" && r.id === ref.id);
+          if (!conflictNamesDecision) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}, amend_decision) binds ${ref.id}, but the conflict does not name that Decision`,
+              { conflictID: change.conflictID, decisionID: ref.id },
+            );
+            return;
+          }
+        } else if (change.resolution.action === "amend_architecture") {
+          const ref = change.resolution.ref;
+          if (ref.kind !== "architecture" || ref.revision === undefined) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}, amend_architecture) must bind an exact ArchitectureRef`,
+              { conflictID: change.conflictID },
+            );
+            return;
+          }
+          const architecture = staged.architectures.byKey.get(revisionKey("ARCH", ref.revision));
+          if (!architecture) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}) binds ARCH@${ref.revision}, which this transaction does not create`,
+              { conflictID: change.conflictID, revision: ref.revision },
+            );
+            return;
+          }
+        } else {
+          // revise_proposal: ref must be THIS proposal's own exact ref.
+          const ref = change.resolution.ref;
+          if (ref.kind !== "proposal" || ref.id !== proposal.id) {
+            addFailure(
+              "conflict_resolution_invalid",
+              `resolve_conflict(${change.conflictID}, revise_proposal) must bind the carrying Proposal's own exact ref (bound ${ref.kind}${"id" in ref ? ` ${ref.id}` : ""})`,
+              { conflictID: change.conflictID, proposalID: proposal.id },
+            );
+            return;
+          }
+        }
+        conflict.status = "resolved";
+        conflict.resolution = {
+          action: change.resolution.action,
+          ref: change.resolution.ref,
+        };
+        staged.resolvedConflicts.push(change.conflictID);
+        staged.committedChanges.push({
+          kind: change.kind,
+          ref: { kind: "conflict", id: change.conflictID },
         });
         return;
       }
@@ -3413,18 +3829,20 @@ export class InMemoryPlanStore implements PlanStore {
           return;
         }
         // §44: status approved → reopened, validation → needs_review; §44:
-        // activeWork → the exact target Section; stage synthesis → detail for
-        // a semantic-validation reopen (a dependency_review reopen already
-        // runs in detail and stays there, §50). Downstream propagation is
-        // deliberately NOT done here — needs_review reaches dependents only
-        // when the reopened Section's new revision/contract commits (§48).
+        // activeWork → the exact target Section; any reopen coming FROM
+        // synthesis moves the stage back to detail (semantic_validation and
+        // the R1a blocker-driven reasons alike — the reopen opens the detail
+        // remediation workflow). A detail dependency_review/blocker reopen
+        // stays in detail. Downstream propagation is deliberately NOT done
+        // here — needs_review reaches dependents only when the reopened
+        // Section's new revision/contract commits (§48).
         staged.sections.set(change.target.id, {
           ...section,
           status: "reopened",
           validation: "needs_review",
         });
         staged.activeWork = { type: "section", id: change.target.id };
-        if (change.reason.type === "semantic_validation") {
+        if (change.reopen.fromStage === "synthesis") {
           staged.stage = "detail";
         }
         staged.committedChanges.push({
@@ -3432,6 +3850,209 @@ export class InMemoryPlanStore implements PlanStore {
           ref: { kind: "section", id: change.target.id, revision: change.target.revision },
           resultingRevision: change.target.revision,
         });
+        return;
+      }
+      case "reopen_architecture": {
+        // R1b §19-§20: the sanctioned Architecture reopen — NO design content,
+        // NO new revision. The exact target must be the run's current
+        // Architecture; ARCH@n stays approved and immutable; Sections stay
+        // unchanged (invalidation belongs to the amend_architecture commit);
+        // the run enters the architecture-remediation workflow.
+        const architecture = staged.architectures.byKey.get(revisionKey("ARCH", change.target.revision));
+        if (!architecture) {
+          addFailure("unknown_reference", `Architecture ARCH@${change.target.revision} does not exist`);
+          return;
+        }
+        if (architecture.status !== "approved") {
+          addFailure(
+            "reopen_target_invalid",
+            `Architecture ARCH@${change.target.revision} is ${architecture.status}; reopen targets the approved Architecture`,
+            { revision: change.target.revision, status: architecture.status },
+          );
+          return;
+        }
+        const runArchitecture = staged.runArchitecture;
+        if (!runArchitecture || runArchitecture.revision !== change.target.revision) {
+          addFailure(
+            "reopen_target_invalid",
+            `reopen_architecture targets ARCH@${change.target.revision}, but the run's current Architecture is ${runArchitecture ? `ARCH@${runArchitecture.revision}` : "none"}`,
+            { target: change.target.revision, current: runArchitecture?.revision },
+          );
+          return;
+        }
+        if (staged.stage !== "synthesis" && staged.stage !== "detail") {
+          addFailure(
+            "reopen_stage_invalid",
+            `An Architecture reopen runs in synthesis or detail (run is in ${staged.stage})`,
+            { stage: staged.stage },
+          );
+        }
+        if (!("revision" in proposal.scope)) {
+          addFailure(
+            "reopen_scope_invalid",
+            `An Architecture reopen proposal is scoped to the exact ArchitectureRef (scope is ${proposal.scope.id})`,
+            { scope: proposal.scope.id },
+          );
+        } else if (proposal.scope.revision !== change.target.revision) {
+          addFailure(
+            "reopen_scope_invalid",
+            `The reopen proposal scope binds ARCH@${proposal.scope.revision}, not the target ARCH@${change.target.revision}`,
+            { scope: proposal.scope.revision, target: change.target.revision },
+          );
+        }
+        // semantic_validation revalidation (report existence/hash/result/
+        // identity currency/architecture scope) lives in the executeTransaction
+        // precondition block — the report registries are immutable within a
+        // transaction, and that block runs for hostile direct calls too.
+        if (change.reason.type === "blocking_question") {
+          if (staged.stage !== "synthesis" && staged.stage !== "detail") {
+            addFailure(
+              "reopen_stage_invalid",
+              `A blocker-driven reopen requires stage=synthesis or detail (run is in ${staged.stage})`,
+              { stage: staged.stage },
+            );
+          }
+          const blockerReason = change.reason;
+          const question = staged.openQuestions.find((q) => q.id === blockerReason.questionID);
+          if (!question) {
+            addFailure("unknown_reference", `Question ${blockerReason.questionID} does not exist in this run`);
+          } else if (question.status !== "open" || !question.blocking) {
+            addFailure(
+              "reopen_reason_invalid",
+              `A blocker-driven reopen requires an OPEN, BLOCKING question (${question.id} is ${question.status}/${question.blocking ? "blocking" : "non-blocking"})`,
+              { questionID: question.id },
+            );
+          } else if (!("revision" in question.scope) || question.scope.revision !== change.target.revision) {
+            addFailure(
+              "reopen_target_unsupported",
+              `Question ${question.id} is not scoped to ARCH@${change.target.revision}; the reopen target must be the blocker's own remediation target`,
+              { questionID: question.id, revision: change.target.revision },
+            );
+          }
+        }
+        if (change.reason.type === "blocking_conflict") {
+          if (staged.stage !== "synthesis" && staged.stage !== "detail") {
+            addFailure(
+              "reopen_stage_invalid",
+              `A blocker-driven reopen requires stage=synthesis or detail (run is in ${staged.stage})`,
+              { stage: staged.stage },
+            );
+          }
+          if (change.reason.conflictIDs.length === 0) {
+            addFailure(
+              "reopen_reason_invalid",
+              "A blocking_conflict reopen must bind at least one conflictID",
+              { revision: change.target.revision },
+            );
+          }
+          for (const conflictID of change.reason.conflictIDs) {
+            const conflict = staged.conflicts.find((c) => c.id === conflictID);
+            if (!conflict) {
+              addFailure("unknown_reference", `Conflict ${conflictID} does not exist in this run`);
+              continue;
+            }
+            if (conflict.status !== "open" || conflict.severity !== "blocking") {
+              addFailure(
+                "reopen_reason_invalid",
+                `A blocker-driven reopen requires an OPEN, BLOCKING conflict (${conflict.id} is ${conflict.status}/${conflict.severity})`,
+                { conflictID: conflict.id },
+              );
+              continue;
+            }
+            const identifiesArchitecture = conflict.refs.some(
+              (ref) =>
+                (ref.kind === "architecture" && (ref.revision === undefined || ref.revision === change.target.revision)) ||
+                (ref.kind === "decision" && staged.decisions.latest.get(ref.id)?.scope.architecture === true),
+            );
+            if (!identifiesArchitecture) {
+              addFailure(
+                "reopen_target_unsupported",
+                `Conflict ${conflict.id} does not identify ARCH@${change.target.revision} as its remediation target`,
+                { conflictID: conflict.id, revision: change.target.revision },
+              );
+            }
+          }
+        }
+        // §20: the reopen commit moves the run into the remediation workflow —
+        // stage → detail (from synthesis OR detail), activeWork → the exact
+        // Architecture. Sections, Architecture content, and HEAD-level design
+        // state are untouched by THIS commit.
+        staged.stage = "detail";
+        staged.activeWork = { type: "architecture" };
+        staged.committedChanges.push({
+          kind: change.kind,
+          ref: { kind: "architecture", revision: change.target.revision },
+          resultingRevision: change.target.revision,
+        });
+        return;
+      }
+      case "amend_architecture": {
+        // R1b §23-§26: the Architecture amendment — the ONLY sanctioned way to
+        // revise an approved Architecture. The exact base must be the run's
+        // CURRENT ARCH; the result is the complete ARCH@n+1 written verbatim;
+        // the Section DAG decomposed from ARCH@n is CONSERVATIVELY INVALIDATED
+        // (old roots stay durable history marked needs_review, run.sections →
+        // [], provenance cleared, activeWork cleared) — full re-decomposition
+        // against ARCH@n+1 is mandatory (brief §27, never DAG patching).
+        const base = staged.architectures.byKey.get(revisionKey("ARCH", change.supersedes.revision));
+        if (!base) {
+          addFailure("unknown_reference", `Amend base ARCH@${change.supersedes.revision} does not exist`);
+          return;
+        }
+        const runArchitecture = staged.runArchitecture;
+        if (!runArchitecture || runArchitecture.revision !== change.supersedes.revision) {
+          addFailure(
+            "amendment_base_mismatch",
+            `amend_architecture supersedes ARCH@${change.supersedes.revision}, but the run's current Architecture is ${runArchitecture ? `ARCH@${runArchitecture.revision}` : "none"}`,
+            { supersedes: change.supersedes.revision, current: runArchitecture?.revision },
+          );
+          return;
+        }
+        if (change.architecture.revision !== change.supersedes.revision + 1) {
+          addFailure(
+            "amendment_base_mismatch",
+            `amend_architecture must produce exactly ARCH@${change.supersedes.revision + 1} (got @${change.architecture.revision}); revisions are contiguous`,
+            { expected: change.supersedes.revision + 1, got: change.architecture.revision },
+          );
+          return;
+        }
+        if (change.architecture.status !== "approved") {
+          addFailure(
+            "change_invalid",
+            "amend_architecture stages the committed approved record; status is Harness-assigned at freeze",
+            { status: change.architecture.status },
+          );
+          return;
+        }
+        // §35/§36: the remediation substate is the only amendment stage.
+        if (staged.stage !== "detail" || staged.activeWork?.type !== "architecture") {
+          addFailure(
+            "amendment_stage_invalid",
+            `amend_architecture requires the architecture-remediation detail substate (stage=detail, activeWork=architecture); run is ${staged.stage}${staged.activeWork ? `/${staged.activeWork.type}` : "/no focus"}`,
+            { stage: staged.stage, activeWork: staged.activeWork?.type },
+          );
+          return;
+        }
+        this.stagePutRevision(staged.architectures, "ARCH", change.architecture.revision, change.architecture, "architecture", addFailure);
+        staged.runArchitecture = { id: "ARCH", revision: change.architecture.revision };
+        // §26 conservative invalidation: old roots remain durable history
+        // (never deleted), marked needs_review; the run's current Section set
+        // is reset so the run enters detail/decomposition-needed.
+        for (const [sectionID, section] of staged.sections) {
+          if (staged.runSections.some((mirror) => mirror.id === sectionID)) {
+            staged.sections.set(sectionID, { ...section, validation: "needs_review" });
+          }
+        }
+        staged.runSections = [];
+        staged.activeWork = undefined;
+        staged.sectionDecompositionArchitecture = undefined;
+        staged.provenanceTouched = true;
+        staged.committedChanges.push({
+          kind: change.kind,
+          ref: { kind: "architecture", revision: change.architecture.revision },
+          resultingRevision: change.architecture.revision,
+        });
+        staged.revised.push({ kind: "architecture", id: "ARCH", revision: change.architecture.revision });
         return;
       }
       case "add_final_plan": {
@@ -3621,6 +4242,12 @@ export class InMemoryPlanStore implements PlanStore {
         // exact ref the run header holds (durable load re-verifies both).
         ...(staged.runFinalPlan ? { finalPlanRevision: staged.runFinalPlan.revision } : {}),
         ...(sectionRootsState.length > 0 ? { sectionRoots: sectionRootsState } : {}),
+        // R1b §50/§51: the decomposition provenance as of THIS commit —
+        // present on decomposition commits, absent after amend_architecture
+        // invalidates the DAG (absence is meaningful, never backfilled).
+        ...(staged.sectionDecompositionArchitecture
+          ? { sectionDecompositionArchitectureRevision: staged.sectionDecompositionArchitecture.revision }
+          : {}),
         // Phase 2E2 (additive, optional): the workflow focus after this
         // commit — next Section after an ordinary completion, or absent when
         // the final completion cleared it (synthesis entry).
@@ -3742,6 +4369,37 @@ export class InMemoryPlanStore implements PlanStore {
             .map((d) => ({ id: d.id, revision: d.revision })),
         ],
       });
+      // R2: also mirror into the run's HEAD snapshot state (as prior commits
+      // would have) so the snapshot-consistent context read boundary resolves
+      // seeded artifacts. TEST-ONLY seam — production state changes always
+      // materialize their own snapshot inside commitTransaction.
+      const snapshot = run.headSnapshot ? this.snapshots.get(planID)?.get(run.headSnapshot) : undefined;
+      if (snapshot) {
+        const currentSections = [...(this.sections.get(planID)?.values() ?? [])];
+        this.snapshots.get(planID)?.set(run.headSnapshot!, {
+          ...snapshot,
+          state: {
+            ...snapshot.state,
+            ...(architecture ? { architectureRevision: architecture.revision } : {}),
+            sectionRevisions: Object.fromEntries(
+              [...(this.sectionRevisions.get(planID)?.latest ?? [])].map(([id, revision]) => [id, revision.revision]),
+            ),
+            decisionRevisions: Object.fromEntries(
+              [...(this.decisions.get(planID)?.latest ?? [])].map(([id, decision]) => [id, decision.revision]),
+            ),
+            sectionRoots: currentSections.map((section) => ({
+              id: section.id,
+              title: section.title,
+              objective: section.objective,
+              dependencies: section.dependencies,
+              status: section.status,
+              validation: section.validation,
+              ...(section.currentRevision !== undefined ? { currentRevision: section.currentRevision } : {}),
+              ...(section.approvedRevision !== undefined ? { approvedRevision: section.approvedRevision } : {}),
+            })),
+          },
+        });
+      }
     }
   }
 }

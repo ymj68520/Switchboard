@@ -199,11 +199,13 @@ describe("working-state operations", () => {
     // raise_conflict requires architecture stage or later (protocol matrix).
     await runInStage(store, controller, "ses_conflict", "architecture");
 
+    // R1a §8: a BLOCKING conflict must reference a remediable artifact —
+    // in the architecture stage the Architecture itself is the target.
     const conflict = await controller.raiseConflict("ses_conflict", {
       type: "decision",
       description: "Two statements contradict",
       severity: "blocking",
-      refs: [],
+      refs: [{ kind: "architecture" }],
     });
     expect(conflict.id).toBe("CONF-001");
 

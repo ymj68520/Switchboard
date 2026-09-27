@@ -615,11 +615,21 @@ describe("completion through PlanCommit only (tests 28-30)", () => {
 describe("conflict + evidence validation (tests 31-33)", () => {
   it("an open blocking conflict that intersects the changes blocks the commit (test 31)", async () => {
     const { controller, run } = await detailedWorld();
-    await controller.raiseConflict("ses_tx", {
-      type: "decision",
-      description: "decisions are frozen until storage is settled",
-      severity: "blocking",
-      refs: [],
+    // R1a §8: the raise boundary refuses unremediable blocking conflicts, so
+    // the run-global blocker for this ENGINE-gate test is seeded directly.
+    await controller.planStore.saveRun({
+      ...run,
+      conflicts: [
+        ...run.conflicts,
+        {
+          id: "CONF-001" as never,
+          type: "decision" as const,
+          refs: [],
+          description: "decisions are frozen until storage is settled",
+          severity: "blocking" as const,
+          status: "open" as const,
+        },
+      ],
     });
     const { prepared } = await prepareAwaiting(controller, "ses_tx", [DECISION_DRAFT]);
     await expect(
