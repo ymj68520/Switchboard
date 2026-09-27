@@ -9,7 +9,11 @@
  * drive, but bound to the live session. This is a standalone script, NOT a
  * production seam: production code gains no setup path.
  *
- * Usage: node scripts/opencode-handoff-setup.mjs <dataDir> <sessionID>
+ * Usage: node scripts/opencode-handoff-setup.mjs <dataDir> <sessionID> [--create <goal>]
+ *   --create: (TEST-ONLY, release smoke) no run exists yet for the session —
+ *   issue the start admission and create the run bound to the REAL session via
+ *   the real controller flow (startOrResume), WITHOUT any model turn. The
+ *   model-driven smoke never passes this flag.
  * Prints: PROBE-SETUP LIFECYCLE=<lifecycle> HEAD=<commit> FINAL=<ref>
  */
 import { readdir, readFile } from "node:fs/promises";
@@ -21,9 +25,13 @@ const entryURL = process.env.CRASH_PROBE_ENTRY
   ? pathToFileURL(process.env.CRASH_PROBE_ENTRY).href
   : pathToFileURL(path.join(repoRoot, "adapters", "opencode", "dist", "index.js")).href;
 
-const [, , dataDir, sessionID] = process.argv;
+const [, , dataDir, sessionID, createFlag, createGoal] = process.argv;
+// Optional TEST-ONLY stop point for the validator live smoke: drive to
+// synthesis/manifest-ready and exit BEFORE runSemanticValidation, so the
+// REAL validator adapter can be bound and exercised live.
+const stopAtManifest = process.argv.includes("--stop-at-manifest");
 if (!dataDir || !sessionID) {
-  console.error("usage: opencode-handoff-setup.mjs <dataDir> <sessionID>");
+  console.error("usage: opencode-handoff-setup.mjs <dataDir> <sessionID> [--create <goal>]");
   process.exit(2);
 }
 
@@ -50,6 +58,34 @@ if (!storeFile) {
   process.exit(1);
 }
 const store = new DurablePlanStore(storeFile, { now: () => new Date().toISOString() });
+let run = await store.findLatestRunBySession(sessionID);
+if (!run && createFlag !== "--create") {
+  console.error(`no PlanningRun for session ${sessionID}`);
+  process.exit(1);
+}
+if (!run) {
+  // TEST-ONLY release-smoke seam: create the run bound to the REAL session
+  // through the real controller entry (one-shot admission + startOrResume).
+  // No model turn is involved; production code gains no such path.
+  const admissionsURL = pathToFileURL(path.join(repoRoot, "adapters", "opencode", "dist", "core", "admissions.js")).href;
+  const runtimeURL = pathToFileURL(path.join(repoRoot, "adapters", "opencode", "dist", "runtime", "opencode-plugin.js")).href;
+  const creatingController = new UltraPlanController({
+    store,
+    now: () => new Date().toISOString(),
+    admissions: new (await import(admissionsURL)).InMemoryStartAdmissionLedger(),
+    runtime: new (await import(runtimeURL)).OpenCodeRuntimeAdapter(),
+    semanticValidator: {
+      async validate() {
+        return { text: JSON.stringify({ result: "clean", findings: [] }) };
+      },
+    },
+  });
+  creatingController.issueStartAdmission(sessionID);
+  const created = await creatingController.startOrResume(sessionID, createGoal || "Deterministic handoff smoke goal");
+  run = await store.findLatestRunBySession(sessionID);
+  console.log(`PROBE-SETUP-CREATED RUN=${created.run.id} SESSION=${sessionID}`);
+}
+
 const controller = new UltraPlanController({
   store,
   now: () => new Date().toISOString(),
@@ -59,12 +95,6 @@ const controller = new UltraPlanController({
     },
   },
 });
-
-const run = await store.findLatestRunBySession(sessionID);
-if (!run) {
-  console.error(`no PlanningRun for session ${sessionID}`);
-  process.exit(1);
-}
 
 const ARCH_CHANGE = {
   kind: "add_architecture",
@@ -170,6 +200,15 @@ async function drive() {
     ],
     unresolvedFindings: [],
   });
+  if (stopAtManifest) {
+    const stopped = await store.getRun(run.id);
+    console.log(
+      `PROBE-SETUP LIFECYCLE=${stopped.lifecycle} STAGE=${stopped.stage}` +
+        ` HEAD=${stopped.headCommit ?? "none"} STOPPED_AT=manifest-ready` +
+        ` SESSION=${sessionID}`,
+    );
+    return;
+  }
   await controller.runSemanticValidation(sessionID);
   const finalization = await controller.requestFinalization(sessionID);
   if (finalization.gate.result !== "pass") {

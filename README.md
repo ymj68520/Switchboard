@@ -79,6 +79,8 @@ The shared core must remain independent from any specific coding agent or model 
 
 Each adapter is responsible for translating native host state into Switchboard routing decisions and applying those decisions using capabilities supported by that host.
 
+> **OpenCode users:** the Ultra Plan planning harness (`/ultra-plan`) ships in `adapters/opencode`. See its user guide: [`adapters/opencode/README.md`](adapters/opencode/README.md).
+
 ## Routing
 
 Switchboard is designed around normalized workflow stages such as:

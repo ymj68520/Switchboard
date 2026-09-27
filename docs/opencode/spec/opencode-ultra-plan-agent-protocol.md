@@ -437,7 +437,7 @@ synthesis→final gate is WITHHELD permanently — it must never bypass the real
 pipeline (SynthesisManifest → semantic validation → Evidence Audit →
 Finalization Gate → FinalPlanCandidate). Even a CLEAN ValidationReport and a
 PASSING finalization do not make this shortcut meaningful: the synthesis →
-final edge belongs to the Final PlanCommit (a later phase), and the
+final edge belongs to the Final PlanCommit (delivered in Phase 2I), and the
 capability is granted nowhere.
 ⁶ Phase 2F §17: `begin_synthesis` stays granted in the no-input, unvalidated,
 and validation-clean substates DELIBERATELY — a repeated freeze at the same
@@ -1099,8 +1099,10 @@ active-work discipline with Harness-assigned identity.
 - **L0 (§31/§32):** detail guidance names the active section (title,
   objective, direct dependencies, each dependency's contract availability
   approved@n / no contract yet, current checkpoint + validation), the
-  design checklist, and the checkpoint tool. No Context Assembler, no token
-  budgeting, no ContextTrace (later phases).
+  design checklist, and the checkpoint tool. (Historical note, Phase 2E1-era
+  wording: the Context Assembler, token budgeting, and ContextTrace referenced
+  as future work here were delivered by R2 — see §7.17; the production L0
+  fragment is now the assembler's compact protocol layer.)
 
 ## 7.9 Section Completion & Work Progression (Phase 2E2)
 
@@ -1533,7 +1535,7 @@ from CURRENT state on every request; §29):
   revisions are one stable immutable family (FPC-001@1, FPC-001@2, …, §39).
   A candidate is NOT a Proposal, NOT user authorization, NOT the FinalPlan:
   it sets no `PlanningRun.finalPlan` (§40), transitions no stage (§76 —
-  synthesis → final belongs to the Final PlanCommit, a later phase), moves
+  synthesis → final belongs to the Final PlanCommit, delivered in Phase 2I), moves
   no HEAD (§42), and authorizes no Build. Its currency is DERIVED (§51):
   status shows `Final candidate: current|stale`, never mutating the stored
   candidate.

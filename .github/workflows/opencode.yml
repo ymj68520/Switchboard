@@ -1,0 +1,47 @@
+# Ultra Plan for OpenCode — deterministic release gate.
+#
+# Per the v0.1 release-readiness review (RR-04): every change must pass the
+# deterministic gate on the pinned Node version. Model-dependent live smokes
+# (smoke:opencode, smoke:opencode-context, smoke:opencode-handoff*) are NOT
+# run here — they require real gateway credentials/runtime and are the
+# explicitly-executed RC candidate gate (see
+# docs/opencode/spec/implementation/v0.1-release-readiness-review.md,
+# "CI / Release Gates").
+name: opencode-deterministic-gate
+
+on:
+  push:
+    paths:
+      - "adapters/opencode/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/opencode.yml"
+  pull_request:
+    paths:
+      - "adapters/opencode/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/opencode.yml"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Validated release boundary (docs/opencode/spec/implementation/
+    # v0.1-release-readiness-review.md): Node 24.21.0. The live-runtime
+    # validated OS is Windows; the deterministic gate is host-independent.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+      - name: Install (lockfile)
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck -w @switchboard/opencode
+      - name: Lint
+        run: npm run lint -w @switchboard/opencode
+      - name: Tests
+        run: npm test -w @switchboard/opencode
+      - name: Build
+        run: npm run build -w @switchboard/opencode

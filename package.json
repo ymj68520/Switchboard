@@ -17,6 +17,8 @@
     "build": "npm run build --workspaces --if-present",
     "smoke:opencode": "node scripts/opencode-live-smoke.mjs",
     "smoke:opencode-handoff": "node scripts/opencode-handoff-smoke.mjs",
+    "smoke:opencode-handoff-det": "node scripts/opencode-handoff-det-smoke.mjs",
+    "smoke:opencode-validator": "node scripts/opencode-validator-live.mjs",
     "smoke:opencode-context": "node scripts/opencode-context-smoke.mjs"
   }
 }
