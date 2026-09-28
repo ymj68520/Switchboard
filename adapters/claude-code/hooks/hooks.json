@@ -108,7 +108,7 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal|handoff)$",
+        "matcher": "mcp__.*phase.plan__(start_or_resume|approve_proposal|handoff|takeover_run|abort_run)$",
         "hooks": [
           {
             "type": "command",

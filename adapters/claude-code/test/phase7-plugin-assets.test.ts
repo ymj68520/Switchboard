@@ -61,12 +61,27 @@ describe("hooks.json (directive §35)", () => {
     );
   });
 
-  it("PermissionRequest matches only the phase-plan approval/recovery tools; UserPromptExpansion only phase-plan (bare or plugin-namespaced)", () => {
+  it("PermissionRequest matches only the phase-plan approval/recovery/control tools; UserPromptExpansion only phase-plan (bare or plugin-namespaced)", () => {
     // The host expands "/phase-plan" to the namespaced "phase-plan:phase-plan".
     expect(hooks.hooks.UserPromptExpansion![0]!.matcher).toBe("^phase-plan(:phase-plan)?$");
     const prMatcher = hooks.hooks.PermissionRequest![0]!.matcher!;
     expect(prMatcher).toContain("start_or_resume");
     expect(prMatcher).toContain("approve_proposal");
+    // Phase 16 — the control tools MUST reach the PermissionRequest hook:
+    // abort_run's session-scoped mode exit rides the allow decision there
+    // (live probe: a missing matcher silently drops the setMode transition).
+    expect(prMatcher).toContain("takeover_run");
+    expect(prMatcher).toContain("abort_run");
+    // ...and the regex really matches the host's namespaced tool names.
+    for (const tool of [
+      "mcp__plugin_phase-plan_phase-plan__start_or_resume",
+      "mcp__plugin_phase-plan_phase-plan__approve_proposal",
+      "mcp__plugin_phase-plan_phase-plan__handoff",
+      "mcp__plugin_phase-plan_phase-plan__takeover_run",
+      "mcp__plugin_phase-plan_phase-plan__abort_run",
+    ]) {
+      expect(new RegExp(prMatcher).test(tool)).toBe(true);
+    }
     // PreToolUse must see every tool: unknown tools default-deny under drift (§42)
     expect(hooks.hooks.PreToolUse![0]!.matcher).toBeUndefined();
   });
