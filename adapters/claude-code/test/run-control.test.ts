@@ -16,7 +16,8 @@ import { describe, expect, it } from "vitest";
 
 import { executePhasePlanTool, type PhasePlanToolContext } from "../src/mcp/tools.js";
 import { RuntimeError } from "../src/runtime/errors.js";
-import { handlePermissionRequest, handlePreToolUse } from "../src/hooks/handlers.js";
+import { ABORT_MODE_NORMALIZATION_NOTICE, handlePermissionRequest, handlePostToolUse, handlePreToolUse } from "../src/hooks/handlers.js";
+import type { PostToolUseInput } from "../src/hooks/parse.js";
 import type { HookOutput } from "../src/hooks/output.js";
 import { initializePlanStore, type PlanStore } from "../src/store/sqlite-store.js";
 import type { StoreClock } from "../src/store/migration-runner.js";
@@ -1040,3 +1041,146 @@ describe("run-control races (§57/§58)", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Abort host-mode normalization (Amendment A2 §9/§26–§28, E43-A2/E71-A2)
+// ---------------------------------------------------------------------------
+
+/** The delivered MCP success envelope for a tool result (bootstrap wrapping). */
+function deliveredAbortResponse(result: Record<string, unknown>): unknown {
+  return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...result }) }] };
+}
+
+function abortPostToolUseInput(toolResponse: unknown, permissionMode?: string): PostToolUseInput {
+  return {
+    sessionId: "S1",
+    ...(permissionMode === undefined ? {} : { permissionMode }),
+    hookEventName: "PostToolUse",
+    toolName: "mcp__plugin_phase-plan_phase-plan__abort_run",
+    toolInput: {},
+    toolUseId: "TU-A2-1",
+    toolResponse,
+  };
+}
+
+function tableRowCounts(store: PlanStore): Map<string, number> {
+  return store.withRead((tx) => {
+    const tables = (
+      tx
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name);
+    const counts = new Map<string, number>();
+    for (const table of tables) {
+      counts.set(table, (tx.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n);
+    }
+    return counts;
+  });
+}
+
+describe("abort host-mode normalization (Amendment A2 §9/§26–§28, E43-A2/E71-A2)", () => {
+  it("abort response requests the mode exit and never claims it happened; PostToolUse observes plan → the frozen A2 notice (§27/§28)", async () => {
+    const w = await activeWorld("S1");
+    try {
+      const result = callAbort(w.ctx, { sessionId: "S1", workspaceId: w.workspaceId, runId: w.runId, generation: 1 }) as unknown as Record<string, unknown>;
+      expect(result.mode_exit).toBe("requested");
+      expect(result.next as string).toContain("requested");
+      expect(result.next as string).not.toMatch(/has left Plan Mode|permission mode changed/i);
+
+      const plan = await handlePostToolUse(w.deps, abortPostToolUseInput(deliveredAbortResponse(result), "plan"));
+      expect(plan.kind).toBe("json");
+      const payload = plan.kind === "json" ? plan.payload : {};
+      const specific = payload.hookSpecificOutput as { hookEventName?: string; additionalContext?: string };
+      expect(specific.hookEventName).toBe("PostToolUse");
+      expect(specific.additionalContext).toBe(ABORT_MODE_NORMALIZATION_NOTICE);
+      // A2 §5 — the condition needs a POSITIVE plan observation; default or
+      // absent modes inject nothing (the host already left Plan Mode, or the
+      // mode is unobservable and no mismatch may be claimed).
+      const defaulted = await handlePostToolUse(w.deps, abortPostToolUseInput(deliveredAbortResponse(result), "default"));
+      expect(defaulted.kind).toBe("empty");
+      const unobserved = await handlePostToolUse(w.deps, abortPostToolUseInput(deliveredAbortResponse(result)));
+      expect(unobserved.kind).toBe("empty");
+    } finally {
+      closeWorld(w);
+    }
+  });
+
+  it("an idempotent abort replay is still a successful abort for the A2 condition (§5)", async () => {
+    const w = await activeWorld("S1");
+    try {
+      const ids = { sessionId: "S1", workspaceId: w.workspaceId, runId: w.runId, generation: 1 };
+      callAbort(w.ctx, ids, {}, { toolUseId: "TU-SAME" });
+      const retry = callAbort(w.ctx, ids, {}, { toolUseId: "TU-SAME" });
+      expect(retry.idempotent).toBe(true);
+      const notice = await handlePostToolUse(
+        w.deps,
+        abortPostToolUseInput(deliveredAbortResponse(retry as unknown as Record<string, unknown>), "plan"),
+      );
+      expect(notice.kind).toBe("json");
+    } finally {
+      closeWorld(w);
+    }
+  });
+
+  it("the abort stays terminal and the notice cannot mutate the Store; no execution artifacts exist in either mode outcome (§28/RI-23)", async () => {
+    const w = await activeWorld("S1");
+    try {
+      const result = callAbort(w.ctx, { sessionId: "S1", workspaceId: w.workspaceId, runId: w.runId, generation: 1 }) as unknown as Record<string, unknown>;
+      const afterAbort = tableRowCounts(w.store);
+      for (const mode of ["plan", "default", undefined]) {
+        const output = await handlePostToolUse(w.deps, abortPostToolUseInput(deliveredAbortResponse(result), mode));
+        expect(output.kind === "json" || output.kind === "empty").toBe(true);
+      }
+      expect(tableRowCounts(w.store)).toEqual(afterAbort);
+      // Terminal semantics are identical in both host-mode outcomes (RI-23).
+      expect(getPlanningRunRecord(w.store, w.runId)).toMatchObject({ lifecycle: "aborted", revision: w.runRevision + 1 });
+      expect(getBinding(w.store, w.runId)).toMatchObject({ state: "detached", generation: 2 });
+      expect(controlRowCount(w.store)).toBe(1);
+      expect((w.store.withRead((tx) => tx.prepare("SELECT COUNT(*) AS n FROM execution_handoffs").get()) as { n: number }).n).toBe(0);
+      expect((w.store.withRead((tx) => tx.prepare("SELECT COUNT(*) AS n FROM execution_bindings").get()) as { n: number }).n).toBe(0);
+    } finally {
+      closeWorld(w);
+    }
+  });
+
+  it("denied/failed/different-tool responses produce no PostToolUse success path and no Abort (§28)", async () => {
+    const w = await activeWorld("S1");
+    try {
+      // The bootstrap failure envelope (ok=false) — a denied or failed call.
+      const failed = await handlePostToolUse(
+        w.deps,
+        abortPostToolUseInput(
+          { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, code: "ABORT_NOT_AVAILABLE", message: "denied" }) }] },
+          "plan",
+        ),
+      );
+      expect(failed.kind).toBe("empty");
+      // A success envelope for a different operation status is not an abort.
+      const other = await handlePostToolUse(
+        w.deps,
+        abortPostToolUseInput({ content: [{ type: "text", text: JSON.stringify({ ok: true, status: "taken_over" }) }] }, "plan"),
+      );
+      expect(other.kind).toBe("empty");
+      // Unparseable responses never throw and never notice.
+      const junk = await handlePostToolUse(w.deps, abortPostToolUseInput("not-json", "plan"));
+      expect(junk.kind).toBe("empty");
+      expect(controlRowCount(w.store)).toBe(0);
+      expect(getPlanningRunRecord(w.store, w.runId)).toMatchObject({ lifecycle: "active", revision: w.runRevision });
+    } finally {
+      closeWorld(w);
+    }
+  });
+
+  it("no settings write path exists in the abort/normalization modules (CC-12, §28)", () => {
+    for (const rel of [
+      "src/hooks/handlers.ts",
+      "src/mcp/tools.ts",
+      "src/application/run-control-service.ts",
+      "src/store/run-control.ts",
+    ]) {
+      const src = fs.readFileSync(path.join(__dirname, "..", rel), "utf8");
+      expect(src).not.toMatch(/writeFileSync|appendFileSync|rmSync|mkdirSync/);
+      expect(src).not.toMatch(/settings\.json/);
+    }
+  });
+});

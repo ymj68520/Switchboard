@@ -85,6 +85,18 @@ describe("hooks.json (directive §35)", () => {
     // PreToolUse must see every tool: unknown tools default-deny under drift (§42)
     expect(hooks.hooks.PreToolUse![0]!.matcher).toBeUndefined();
   });
+
+  it("PostToolUse carries an abort_run matcher — Amendment A2's mode observer silently never fires without it", () => {
+    // Live-found in Phase 16: a missing matcher means the hook never runs and
+    // the host logs nothing, so the A2 normalization notice would be dead code.
+    const postMatchers = hooks.hooks.PostToolUse!.map((entry) => entry.matcher ?? "");
+    const abortEntry = postMatchers.find((m) => m.includes("abort_run"));
+    expect(abortEntry).toBeDefined();
+    expect(new RegExp(abortEntry!).test("mcp__plugin_phase-plan_phase-plan__abort_run")).toBe(true);
+    // The handoff delivery finalizer keeps its matcher; observation capture keeps the tool-class one.
+    expect(postMatchers.some((m) => m.includes("handoff"))).toBe(true);
+    expect(postMatchers.some((m) => m.includes("Read"))).toBe(true);
+  });
 });
 
 describe("phase-plan SKILL.md (E1/E2, directive §8/§9)", () => {
