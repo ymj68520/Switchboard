@@ -104,6 +104,20 @@
             ]
           }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_phase-plan_phase-plan__abort_run",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/phase-plan-runtime.mjs",
+              "hook",
+              "PostToolUse"
+            ]
+          }
+        ]
       }
     ],
     "PermissionRequest": [

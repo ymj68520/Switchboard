@@ -2574,15 +2574,21 @@ export function handleAbortRun(ctx: PhasePlanToolContext, rawArgs: Record<string
       }),
     },
   });
+  // Amendment A2 §27 — the response commits the Abort and reports the mode
+  // exit as REQUESTED only; whether the host applied it is observed later by
+  // the abort PostToolUse hook and is never claimed here.
   return {
     status: "aborted",
     idempotent: result.idempotent,
     control_id: result.control.controlId,
     run: runView(result.run),
     binding: bindingView(result.binding),
+    mode_exit: "requested",
     next:
-      "The PlanningRun is terminal (aborted); the session has left Plan Mode. All planning history is preserved and no Build "
-      + "authority exists. A later /phase-plan starts a NEW ordinary PlanningRun — the aborted run is never resumed or reused.",
+      "The PlanningRun is terminal (aborted); the abort is committed and a session-scoped Plan Mode exit was requested. "
+      + "If Claude Code is still in Plan Mode, use its normal permission-mode control to return to default/manual — "
+      + "this is host-mode normalization only. All planning history is preserved and no Build authority exists. "
+      + "A later /phase-plan starts a NEW ordinary PlanningRun — the aborted run is never resumed or reused.",
   };
 }
 

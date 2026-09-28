@@ -382,6 +382,71 @@ export function handleSessionEnd(deps: HookHandlerDeps, _input: SessionEndInput)
 // PostToolUse (Phase 9 §9/§11–§13/§59/§60) — Observation capture
 // ---------------------------------------------------------------------------
 
+/**
+ * Amendment A2 §10 — the frozen fail-visible normalization notice. Emitted
+ * ONLY when a successful abort is followed by a positive PostToolUse
+ * observation of permission_mode=plan (A2 §5 derived condition; never
+ * persisted, never a Store fact — A2 §17).
+ */
+export const ABORT_MODE_NORMALIZATION_NOTICE = [
+  "Phase Plan has been aborted successfully.",
+  "",
+  "The PlanningRun is terminal and no writable Phase Plan authority remains.",
+  "",
+  "Claude Code did not leave Plan Mode automatically.",
+  "Use Claude Code's normal permission-mode control to return this session to default/manual mode if you want to continue ordinary non-Phase-Plan work.",
+  "",
+  "This is host-mode normalization only. It does not resume, complete, or start a Phase Plan Build.",
+].join("\n");
+
+/**
+ * Parse the delivered MCP tool_response (bootstrap envelope shape A or the
+ * bare content array the host passes through, both observed live) into a
+ * successful abort outcome. Denials and errors never reach this — the tool
+ * never executed, and a failed/idempotent-mismatch response carries no
+ * `status: "aborted"`.
+ */
+function isSuccessfulAbortToolResponse(toolResponse: unknown): boolean {
+  let payload: unknown = toolResponse;
+  if (typeof payload === "object" && payload !== null && Array.isArray((payload as { content?: unknown }).content)) {
+    payload = (payload as { content: unknown[] }).content;
+  }
+  if (Array.isArray(payload)) {
+    const first = payload[0] as { type?: string; text?: unknown } | undefined;
+    if (first === undefined || typeof first.text !== "string") return false;
+    payload = first.text;
+  }
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      return false;
+    }
+  }
+  if (typeof payload !== "object" || payload === null) return false;
+  const record = payload as Record<string, unknown>;
+  return record.ok === true && record.status === "aborted";
+}
+
+/**
+ * Amendment A2 §9/§26 — the abort mode-normalization observer. Store-free by
+ * construction (A2 §17: the derived condition is never persisted; RI-23:
+ * Abort authority was already committed by the MCP transaction): the commit
+ * fact comes from the delivered tool_response (Phase 9 §9 host fact), the
+ * mode fact from the hook input's permission_mode. A positive plan-mode
+ * observation injects the frozen A2 notice; anything else — absent mode,
+ * non-plan mode, non-success response — injects nothing.
+ */
+export function handleAbortModePostToolUse(input: PostToolUseInput): HookOutput {
+  if (!isSuccessfulAbortToolResponse(input.toolResponse)) {
+    return emptyOutput(); // deny/error produced no success path — nothing to observe
+  }
+  if (input.permissionMode !== "plan") {
+    return emptyOutput(); // host left Plan Mode (or mode unobservable) — no mismatch to expose
+  }
+  return contextOutput("PostToolUse", ABORT_MODE_NORMALIZATION_NOTICE);
+}
+
 /** Canonical blob root derived from the canonical store layout (`<root>/blobs`). */
 function blobsForDeps(deps: HookHandlerDeps): BlobStore {
   if (deps.blobs !== undefined) return deps.blobs;
@@ -407,6 +472,12 @@ export async function handlePostToolUse(deps: HookHandlerDeps, input: PostToolUs
   // matching exact delivery attempt can complete the transition (§93).
   if (logicalToolName(input.toolName) === "handoff") {
     return handleHandoffDeliveryPostToolUse(deps, input);
+  }
+  // Amendment A2 §26 — abort's PostToolUse is the host-mode observer only;
+  // it never touches the Store (the abort itself committed in the MCP
+  // transaction) and takeover_run has no mode semantics at all.
+  if (logicalToolName(input.toolName) === "abort_run") {
+    return handleAbortModePostToolUse(input);
   }
   if (observationClassForTool(input.toolName) === null) {
     return emptyOutput(); // §8: unknown tools are never guessed; debug-only skip
@@ -1162,12 +1233,15 @@ export function handlePermissionRequest(deps: HookHandlerDeps, input: Permission
   }
 
   if (logical === "abort_run") {
-    // Phase 16 §37/§38 — probe path: re-verify the FULL authorization facts
+    // Phase 16 §37 + Amendment A2 §7 — re-verify the FULL authorization facts
     // from the Store BEFORE attaching the session-scoped plan→default exit to
     // this allow decision (the host must never switch modes and then discover
     // an unauthorized abort). requiresUserInteraction=true must still surface
-    // the mandatory dialog on top of this allow; if the host lets the allow
-    // suppress it, the §38 probe fails and directive §40 applies.
+    // the mandatory dialog on top of this allow. Per A2 the setMode here is a
+    // BEST-EFFORT host normalization request, never an Abort correctness
+    // prerequisite: a host that drops updatedPermissions on the interactive
+    // path leaves the Abort fully authoritative (RI-23) and the mismatch is
+    // exposed fail-visibly by the PostToolUse observer (A2 §9).
     const rawHostContext = input.toolInput._hostContext;
     if (typeof rawHostContext !== "string" || rawHostContext === "") {
       return emptyOutput();
@@ -1218,8 +1292,9 @@ export function handlePermissionRequest(deps: HookHandlerDeps, input: Permission
           "ABORT_NOT_AVAILABLE: the current session does not own an active PlanningRun free of execution-handoff state",
         );
       }
-      // §37 — abort exits planning mode but never begins Build: session-scoped
-      // only, never a settings write (§8/E44/E45).
+      // A2 §7 — best-effort session-scoped normalization request, never a
+      // settings write (CC-12); whether the host applies it is observed
+      // separately by the abort PostToolUse observer.
       return allowWithPermissions([{ type: "setMode", mode: "default", destination: "session" }]);
     } catch (err) {
       const code = err instanceof RuntimeError ? err.code : "HOST_CONTEXT_INVALID";
