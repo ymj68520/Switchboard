@@ -992,7 +992,9 @@ describe("deterministic approval presentation (§18/§19)", () => {
 
     const ask = asks[0];
     expect(ask?.always).toEqual([]);
-    expect(ask?.patterns).toEqual([]);
+    // RF-01: patterns MUST be non-empty — the host skips permission evaluation
+    // entirely for an empty list (implicit allow under every configuration).
+    expect(ask?.patterns).toEqual([`${prepared.proposal.id}@1`]);
     expect(ask?.permission).toContain(`ultraplan.approval:${prepared.proposal.id}@1`);
     expect(ask?.permission).toContain(prepared.hash.slice(0, 16));
     expect(ask?.metadata["proposalHash"]).toBe(prepared.hash);

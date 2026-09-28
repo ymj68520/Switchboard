@@ -62,6 +62,17 @@ export const ULTRA_PLAN_TOOL_NAMES = [
   "ultraplan_prepare_final_plan",
 ] as const;
 
+/** Structural subset of the SDK AgentConfig used by applyToConfig (cast site for RF-01). */
+type AgentConfigLike = {
+  mode?: "primary" | "subagent" | "all";
+  description?: string;
+  tools?: { [key: string]: boolean };
+  model?: string;
+  permission?:
+    | string
+    | { [key: string]: "ask" | "allow" | "deny" | { [key: string]: "ask" | "allow" | "deny" } };
+};
+
 export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
   readonly capabilities: RuntimeCapabilities = {
     registerCommand: true,
@@ -92,21 +103,49 @@ export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
         ...(this.spec.planningModel ? { model: this.spec.planningModel } : {}),
       },
     };
+    // RF-01: the planning agent definition carries the forced approval rule;
+    // the SDK's AgentConfig type omits the wildcard permission key (the 1.18.32
+    // runtime schema explicitly allows additional permission properties), so
+    // the definition is cast through the structural AgentConfigLike shape.
+    const planningAgent: AgentConfigLike = {
+      mode: "primary",
+      description: "Ultra Plan planning agent (frontier reasoning tier)",
+      // Defense-in-depth exposure (Phase 2A.1 §5): explicitly enable the
+      // Ultra Plan tool surface on the planning agent. OpenCode's per-agent
+      // tool maps are overrides, not allowlists, so this narrows but cannot
+      // fully hide the tools from other agents — which is exactly why the
+      // controller still requires explicit command admission for planning
+      // entry. Exposure is never the authorization mechanism.
+      tools: Object.fromEntries(ULTRA_PLAN_TOOL_NAMES.map((name) => [name, true])),
+      // RF-01 (approval authority fail-closed): force the Proposal-approval
+      // permission to "ask" on the planning agent itself. The host resolves
+      // an ask against the running agent's ruleset (last matching rule
+      // wins), so the agent-scoped rule makes the approval ask pend for a
+      // real user decision even under the default `"*": "allow"` baseline.
+      // The key is exact-scoped to Ultra Plan's approval permission — every
+      // other permission keeps its user/host configuration untouched.
+      permission: {
+        "ultraplan.approval:*": "ask",
+      },
+      ...(this.spec.planningModel ? { model: this.spec.planningModel } : {}),
+    };
     config.agent = {
       ...config.agent,
-      [this.spec.agentName]: {
-        mode: "primary",
-        description: "Ultra Plan planning agent (frontier reasoning tier)",
-        // Defense-in-depth exposure (Phase 2A.1 §5): explicitly enable the
-        // Ultra Plan tool surface on the planning agent. OpenCode's per-agent
-        // tool maps are overrides, not allowlists, so this narrows but cannot
-        // fully hide the tools from other agents — which is exactly why the
-        // controller still requires explicit command admission for planning
-        // entry. Exposure is never the authorization mechanism.
-        tools: Object.fromEntries(ULTRA_PLAN_TOOL_NAMES.map((name) => [name, true])),
-        ...(this.spec.planningModel ? { model: this.spec.planningModel } : {}),
-      },
+      [this.spec.agentName]: planningAgent as NonNullable<OpenCodeConfig["agent"]>[string],
     };
+    // RF-01 (second layer): the same narrow rule in the resolved global
+    // permission config, so the approval ask pends regardless of which
+    // ruleset the host consults. Because rule resolution is last-match, the
+    // key is re-appended LAST (delete + re-add) so it outranks any earlier
+    // wildcard — including a user-level `"*": "allow"` — while every OTHER
+    // user permission (bash, edit, webfetch, external_directory, …) is
+    // preserved verbatim. No unrelated permission is rewritten.
+    const permissions: Record<string, unknown> = { ...(config.permission ?? {}) };
+    delete permissions["ultraplan.approval:*"];
+    config.permission = {
+      ...permissions,
+      "ultraplan.approval:*": "ask",
+    } as OpenCodeConfig["permission"];
   }
 
   async activatePlanningRuntime(input: RuntimeActivationInput): Promise<RuntimeActivationResult> {

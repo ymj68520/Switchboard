@@ -590,10 +590,20 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
             // the permission string and metadata; the rendered view is a
             // deterministic projection of the FROZEN proposal (§19), never
             // model-generated approval prose.
+            //
+            // RF-01: `patterns` MUST be non-empty. The host's ask() evaluates
+            // permission rules ONLY inside its loop over `patterns` — an empty
+            // list skips evaluation entirely and resolves immediately, an
+            // IMPLICIT ALLOW under every configuration (observed live on
+            // 1.18.32: 5 approvals auto-granted in 52 seconds with no human).
+            // The single pattern is the exact approval target, so the host
+            // raises its dialog for precisely this proposal, and the forced
+            // "ultraplan.approval:*"→"ask" rule (see applyToConfig) is what
+            // makes the request wait for a real user decision.
             const approvalView = renderProposalForApproval(begun.proposal);
             await context.ask({
               permission: `ultraplan.approval:${begun.request.proposalID}@${begun.request.proposalRevision}:${begun.request.proposalHash.slice(0, 16)}`,
-              patterns: [],
+              patterns: [`${begun.request.proposalID}@${begun.request.proposalRevision}`],
               always: [],
               metadata: {
                 kind: "ultraplan.proposal-approval",

@@ -769,7 +769,9 @@ describe("structured approval gateway (tests 37-39)", () => {
     expect(captured).toHaveLength(1);
     const ask = captured[0] as CapturedAsk;
     expect(ask.always).toEqual([]); // (38) no persistent authorization
-    expect(ask.patterns).toEqual([]);
+    // RF-01: non-empty pattern = the exact approval target (an empty list
+    // would skip host-side permission evaluation entirely — implicit allow).
+    expect(ask.patterns).toEqual([`${fresh.proposal.id}@1`]);
     expect(ask.metadata).toMatchObject({
       kind: "ultraplan.proposal-approval",
       oneShot: true,
