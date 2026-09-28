@@ -28,7 +28,7 @@ import {
 } from "./phase17-helpers.js";
 import { discoverAndRegisterWorkspace } from "../src/workspace/identity.js";
 import { hostToken } from "./context-helpers.js";
-import { hostTokenV2, VALIDATOR_AGENT } from "./phase12-helpers.js";
+import { hostTokenV2, VALIDATOR_AGENT, toolContextOf } from "./phase12-helpers.js";
 import { createBlobStore, blobHashOf } from "../src/store/blob-store.js";
 import { executionToken } from "./phase14-helpers.js";
 
@@ -417,6 +417,122 @@ describe("Phase 17 §41/§42 — store consistency audit and blob CAS audit (E42
       }
     } finally {
       world.close();
+    }
+  });
+});
+
+describe("Phase 17 §55 fix — awaiting-proposal revision route (live-found deadlock)", () => {
+  /**
+   * Live-found in the golden run: after evidence invalidation, an awaiting
+   * proposal pinning the stale revision could never be approved
+   * (EVIDENCE_NEEDS_VALIDATION) and a fresh prepare was refused
+   * (PROPOSAL_ALREADY_AWAITING) — the frozen recovery ("revalidate and
+   * freeze a new Proposal revision") was unreachable from the MCP surface.
+   * Fix: optional `proposal_id` on prepare_proposal routes to the frozen
+   * reviseProposal path (same gates, §83 replay included).
+   */
+  it("prepare_proposal with proposal_id revises the awaiting proposal in place; replay is idempotent; different input conflicts", async () => {
+    const root = makeTempPluginDataRoot("phase-plan-p17rev-");
+    try {
+      const { makeProposalFixture, prepareCheckpoint, DECISION_1 } = await import("./proposal-helpers.js");
+      const fixture = await makeProposalFixture(root, { stage: "architecture", sessionId: "S1" });
+      const prepared = prepareCheckpoint(fixture, [{ op: "ADD_DECISION", content: { ...DECISION_1 }, compactProjection: "d1" }]);
+      const ctx = toolContextOf(fixture);
+      const ids = { sessionId: "S1", workspaceId: fixture.workspaceId, runId: fixture.runId, generation: fixture.generation };
+      const business = {
+        proposal_id: prepared.proposal.proposalId,
+        proposal_type: "design_checkpoint",
+        scope: { kind: "architecture" },
+        title: "url-sentinel architecture checkpoint (revised)",
+        summary: "revised after evidence invalidation",
+        changes: [{ op: "ADD_DECISION", content: { ...DECISION_1 }, compactProjection: "d1" }],
+      };
+      const token = (useId: string) => hostToken(ctx.secret, "prepare_proposal", business, ids, { toolUseId: useId });
+      const revised = executePhasePlanTool(ctx, "prepare_proposal", { ...business, _hostContext: token("P17-REV-1") }) as {
+        status: string;
+        proposal: { proposal_id: string; revision: number; proposal_hash: string };
+      };
+      expect(revised.status).toBe("awaiting_approval");
+      expect(revised.proposal.proposal_id).toBe(prepared.proposal.proposalId);
+      expect(revised.proposal.revision).toBe(prepared.proposal.revision + 1);
+      // §83 replay: the SAME signed revise replays the revision it produced.
+      const replay = executePhasePlanTool(ctx, "prepare_proposal", { ...business, _hostContext: token("P17-REV-1") }) as {
+        proposal: { revision: number };
+      };
+      expect(replay.proposal.revision).toBe(revised.proposal.revision);
+      // Same id + different input → IDEMPOTENCY_CONFLICT (the token is
+      // signed over the DIFFERENT input so the HMAC gate passes and the
+      // §83 fingerprint comparison inside the service is what refuses).
+      const conflictingBusiness = { ...business, summary: "different input" };
+      const conflictingToken = hostToken(ctx.secret, "prepare_proposal", conflictingBusiness, ids, { toolUseId: "P17-REV-1" });
+      expect(
+        codeOf(() =>
+          executePhasePlanTool(ctx, "prepare_proposal", {
+            ...conflictingBusiness,
+            _hostContext: conflictingToken,
+          }),
+        ),
+      ).toBe("IDEMPOTENCY_CONFLICT");
+      // Exactly one awaiting revision exists, and it is the NEW one.
+      const states = fixture.store.withRead((tx) =>
+        tx.prepare("SELECT revision, status FROM proposal_states WHERE run_id = ? AND proposal_id = ? ORDER BY revision").all(fixture.runId, prepared.proposal.proposalId) as Array<{ revision: number; status: string }>,
+      );
+      expect(states[states.length - 1]).toMatchObject({ revision: revised.proposal.revision, status: "awaiting_approval" });
+      expect(states.filter((s) => s.status === "awaiting_approval")).toHaveLength(1);
+      // The new revision approves cleanly (the frozen happy path resumes).
+      const approveBusiness = {
+        proposal_id: revised.proposal.proposal_id,
+        proposal_revision: revised.proposal.revision,
+        proposal_hash: revised.proposal.proposal_hash,
+      };
+      const approveToken = hostToken(ctx.secret, "approve_proposal", approveBusiness, ids, { toolUseId: "P17-REV-APP" });
+      const approval = executePhasePlanTool(ctx, "approve_proposal", { ...approveBusiness, _hostContext: approveToken }) as { approved: boolean; commit_id: string };
+      expect(approval.approved).toBe(true);
+      fixture.store.close();
+    } finally {
+      try {
+        removeTempPluginDataRoot(root);
+      } catch {
+        // Windows may briefly lock freshly written DB files.
+      }
+    }
+  });
+
+  it("prepare_proposal with proposal_id on a non-awaiting proposal fails closed (PROPOSAL_NOT_AWAITING_APPROVAL)", async () => {
+    const root = makeTempPluginDataRoot("phase-plan-p17rev2-");
+    try {
+      const { makeProposalFixture, prepareCheckpoint, DECISION_1 } = await import("./proposal-helpers.js");
+      const fixture = await makeProposalFixture(root, { stage: "architecture", sessionId: "S1" });
+      void prepareCheckpoint(fixture, [{ op: "ADD_DECISION", content: { ...DECISION_1 }, compactProjection: "d1" }]);
+      const ctx = toolContextOf(fixture);
+      // Approve the awaiting proposal so nothing is awaiting anymore.
+      const awaiting = fixture.store.withRead((tx) =>
+        tx.prepare("SELECT proposal_id AS id, revision FROM proposal_states WHERE run_id = ? AND status = 'awaiting_approval'").get(fixture.runId) as { id: string; revision: number },
+      );
+      const rev = fixture.store.withRead((tx) =>
+        tx.prepare("SELECT proposal_hash AS hash FROM proposal_revisions WHERE run_id = ? AND proposal_id = ? AND revision = ?").get(fixture.runId, awaiting.id, awaiting.revision) as { hash: string },
+      );
+      const approveBusiness = { proposal_id: awaiting.id, proposal_revision: awaiting.revision, proposal_hash: rev.hash };
+      const approveToken = hostToken(ctx.secret, "approve_proposal", approveBusiness, { sessionId: "S1", workspaceId: fixture.workspaceId, runId: fixture.runId, generation: fixture.generation }, { toolUseId: "P17-REV2-APP" });
+      executePhasePlanTool(ctx, "approve_proposal", { ...approveBusiness, _hostContext: approveToken });
+      // Now a revise attempt must fail closed.
+      const business = {
+        proposal_id: awaiting.id,
+        proposal_type: "design_checkpoint",
+        scope: { kind: "architecture" },
+        title: "t",
+        summary: "s",
+        changes: [{ op: "ADD_DECISION", content: { ...DECISION_1 }, compactProjection: "d1" }],
+      };
+      const token = hostToken(ctx.secret, "prepare_proposal", business, { sessionId: "S1", workspaceId: fixture.workspaceId, runId: fixture.runId, generation: fixture.generation }, { toolUseId: "P17-REV2-1" });
+      expect(codeOf(() => executePhasePlanTool(ctx, "prepare_proposal", { ...business, _hostContext: token }))).toBe("PROPOSAL_NOT_AWAITING_APPROVAL");
+      fixture.store.close();
+    } finally {
+      try {
+        removeTempPluginDataRoot(root);
+      } catch {
+        // Windows may briefly lock freshly written DB files.
+      }
     }
   });
 });

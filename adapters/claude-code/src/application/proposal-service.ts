@@ -111,7 +111,7 @@ export interface PrepareProposalInput {
   prepareRequestId?: string;
 }
 
-export interface ReviseProposalInput extends Omit<PrepareProposalInput, "prepareRequestId"> {
+export interface ReviseProposalInput extends PrepareProposalInput {
   proposalId: string;
 }
 
@@ -881,7 +881,64 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
     },
 
     reviseProposal(input: ReviseProposalInput): PreparedProposal {
+      const fingerprint = rawRequestFingerprint(input);
       return store.withWrite((tx) => {
+        // §83 — revise replay: the same signed revise request replays the
+        // revision it produced (no state change); the same id with different
+        // input is a conflict. Phase 17 fix: the recovery path "revalidate
+        // and freeze a new Proposal revision" after evidence invalidation is
+        // ONLY reachable through revise, so it must carry the same replay
+        // contract as prepare.
+        if (input.prepareRequestId !== undefined) {
+          const existing = tx
+            .prepare(
+              "SELECT proposal_id AS proposalId, prepare_request_input_json AS inputJson FROM proposals WHERE prepare_request_id = ?",
+            )
+            .get(input.prepareRequestId) as { proposalId: string; inputJson: string | null } | undefined;
+          if (existing !== undefined) {
+            if (existing.proposalId !== input.proposalId || existing.inputJson !== fingerprint) {
+              throw new RuntimeError("IDEMPOTENCY_CONFLICT", "prepare request id was already used with different input", {
+                detail: { prepareRequestId: input.prepareRequestId, proposalId: existing.proposalId },
+              });
+            }
+            const replayRunId = (
+              tx.prepare("SELECT run_id AS runId FROM proposals WHERE proposal_id = ?").get(existing.proposalId) as {
+                runId: string;
+              }
+            ).runId;
+            const awaitingReplay = findAwaitingProposalStateInTx(tx, replayRunId);
+            const targetRevision =
+              awaitingReplay !== null && awaitingReplay.proposalId === existing.proposalId
+                ? awaitingReplay.revision
+                : (
+                    tx
+                      .prepare(
+                        "SELECT revision AS revision FROM proposal_revisions WHERE run_id = ? AND proposal_id = ? ORDER BY revision DESC LIMIT 1",
+                      )
+                      .get(replayRunId, existing.proposalId) as { revision: number } | undefined
+                  )?.revision;
+            if (targetRevision === undefined) {
+              throw new RuntimeError("STORE_SCHEMA_INVALID", "prepare request references a missing proposal revision", {
+                detail: { proposalId: existing.proposalId },
+              });
+            }
+            const replayView = getProposalRevisionInTx(tx, {
+              runId: replayRunId,
+              proposalId: existing.proposalId,
+              revision: targetRevision,
+            });
+            const replayStatus = getProposalStateInTx(tx, { runId: replayRunId, proposalId: existing.proposalId, revision: targetRevision });
+            if (replayView === null || replayStatus === null) {
+              throw new RuntimeError("STORE_SCHEMA_INVALID", "prepare request references a missing proposal state", {
+                detail: { proposalId: existing.proposalId },
+              });
+            }
+            return {
+              proposal: { ...replayView, status: replayStatus },
+              candidateRefs: candidateRefsInTx(tx, { ...replayView, status: replayStatus }),
+            };
+          }
+        }
         const run = gateProposalMutationInTx(tx, input);
         gateTypeAndStage(run, input.type, input.scope);
         const { head, baseRefs, successor } = baseWorldInTx(tx, input.runId);
@@ -954,6 +1011,15 @@ export function createProposalService(store: PlanStore, clock: StoreClock): Prop
           ),
           impact: canonicalImpact(input.impact),
         });
+        // §83 — the revise request becomes the proposal's idempotency
+        // binding (the identity row is mutable working state; only the
+        // revisions/approvals/commits/audit history is immutable), so a
+        // retried revise finds its own fingerprint and replays.
+        if (input.prepareRequestId !== undefined) {
+          tx
+            .prepare("UPDATE proposals SET prepare_request_id = ?, prepare_request_input_json = ? WHERE run_id = ? AND proposal_id = ?")
+            .run(input.prepareRequestId, fingerprint, input.runId, input.proposalId);
+        }
         appendAuditEventInTx(
           tx,
           {

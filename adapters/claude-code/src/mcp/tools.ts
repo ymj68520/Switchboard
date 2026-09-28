@@ -342,11 +342,14 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       + "PlanCommit). Everything authoritative is server-derived: ids, revisions, base run revision, and HEAD. "
       + "proposal_type: design_checkpoint | architecture_completion | section_completion | amendment. scope.kind: architecture | "
       + "detail | section. Changing a completed section requires an explicit REOPEN_SECTION change in the same proposal. "
+      + "proposal_id (optional): revise the run's AWAITING proposal to a new revision (@N superseded, @N+1 frozen) — the "
+      + "sanctioned recovery when its required evidence went stale and approval is refused EVIDENCE_NEEDS_VALIDATION. "
       + "This tool is NOT the human approval — call approve_proposal afterwards.",
     inputSchema: {
       type: "object",
       properties: {
         proposal_type: { type: "string", enum: ["design_checkpoint", "architecture_completion", "section_completion", "amendment"] },
+        proposal_id: { type: "string", description: "Optional: revise THIS awaiting proposal instead of preparing a new one." },
         scope: {
           type: "object",
           properties: {
@@ -1733,7 +1736,11 @@ export function handleSelectSection(ctx: PhasePlanToolContext, rawArgs: Record<s
 const PROPOSAL_TYPE_VALUES = ["design_checkpoint", "architecture_completion", "section_completion", "amendment"] as const;
 
 export function handlePrepareProposal(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
-  assertExactBusinessFields(rawArgs, ["proposal_type", "scope", "title", "summary", "changes", "required_evidence"]);
+  // Phase 17 fix: `proposal_id` (optional) revises the AWAITING proposal
+  // instead of preparing a new one — the sanctioned "freeze a new Proposal
+  // revision" recovery after required evidence goes stale (the frozen
+  // revise path with the same gates; §83 replay included).
+  assertExactBusinessFields(rawArgs, ["proposal_type", "scope", "title", "summary", "changes", "required_evidence", "proposal_id"]);
   const token = requireHostContext(rawArgs);
   const envelope = assertHostContextForTool(ctx.secret, token, { tool: "prepare_proposal", businessInput: rawArgs });
 
@@ -1802,20 +1809,37 @@ export function handlePrepareProposal(ctx: PhasePlanToolContext, rawArgs: Record
   }
   const service = createProposalService(ctx.store, ctx.clock);
   // §60 — the operation id derives from the SIGNED HostContext tool use.
-  const prepared = service.prepareProposal({
-    runId: envelope.runId,
-    workspaceId: envelope.workspaceId,
-    sessionId: envelope.sessionId,
-    bindingGeneration: envelope.bindingGeneration,
-    expectedRunRevision: current.revision,
-    type: rawArgs.proposal_type as ProposalType,
-    scope,
-    title: rawArgs.title as string,
-    summary: rawArgs.summary as string,
-    changes,
-    requiredEvidence,
-    prepareRequestId: `prepare:${envelope.toolUseId}`,
-  });
+  const reviseProposalId = rawArgs.proposal_id === undefined ? undefined : (rawArgs.proposal_id as string);
+  const prepared = reviseProposalId === undefined
+    ? service.prepareProposal({
+        runId: envelope.runId,
+        workspaceId: envelope.workspaceId,
+        sessionId: envelope.sessionId,
+        bindingGeneration: envelope.bindingGeneration,
+        expectedRunRevision: current.revision,
+        type: rawArgs.proposal_type as ProposalType,
+        scope,
+        title: rawArgs.title as string,
+        summary: rawArgs.summary as string,
+        changes,
+        requiredEvidence,
+        prepareRequestId: `prepare:${envelope.toolUseId}`,
+      })
+    : service.reviseProposal({
+        runId: envelope.runId,
+        workspaceId: envelope.workspaceId,
+        sessionId: envelope.sessionId,
+        bindingGeneration: envelope.bindingGeneration,
+        expectedRunRevision: current.revision,
+        proposalId: reviseProposalId,
+        type: rawArgs.proposal_type as ProposalType,
+        scope,
+        title: rawArgs.title as string,
+        summary: rawArgs.summary as string,
+        changes,
+        requiredEvidence,
+        prepareRequestId: `prepare:${envelope.toolUseId}`,
+      });
   const sectionIds = [...new Set(prepared.candidateRefs.filter((ref) => ref.kind === "section").map((ref) => ref.id))].sort();
   return {
     status: "awaiting_approval",

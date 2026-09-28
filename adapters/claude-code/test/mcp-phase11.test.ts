@@ -132,9 +132,16 @@ describe("Phase 11 MCP surface (§74)", () => {
     expect(Object.keys(select.inputSchema.properties as Record<string, unknown>).sort()).toEqual(["_hostContext", "section_id"]);
     const prepare = PHASE_PLAN_TOOLS.find((tool) => tool.name === "prepare_proposal")!;
     const properties = Object.keys(prepare.inputSchema.properties as Record<string, unknown>).sort();
-    expect(properties).toEqual(["_hostContext", "changes", "proposal_type", "required_evidence", "scope", "summary", "title"]);
+    // Phase 17 §55 fix: optional `proposal_id` revises the AWAITING proposal
+    // (the frozen revise recovery; no new tool, no authority change).
+    expect(properties).toEqual(["_hostContext", "changes", "proposal_id", "proposal_type", "required_evidence", "scope", "summary", "title"]);
     // E19 — no model-authoritative identity anywhere in the schema.
-    for (const banned of ["run_id", "workspace_id", "session_id", "binding_generation", "base_run_revision", "base_head", "proposal_id", "proposal_hash", "force"]) {
+    // Phase 17 §55 fix: `proposal_id` is the ONE exception — it only NAMES
+    // the run's awaiting proposal for the frozen revise path; the service
+    // re-derives the awaiting state server-side and a non-awaiting target
+    // fails closed (PROPOSAL_NOT_AWAITING_APPROVAL), so it carries no
+    // authority. Everything model-authoritative stays banned.
+    for (const banned of ["run_id", "workspace_id", "session_id", "binding_generation", "base_run_revision", "base_head", "proposal_hash", "force"]) {
       expect(properties).not.toContain(banned);
     }
   });
