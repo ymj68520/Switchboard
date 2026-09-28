@@ -99,3 +99,11 @@ procedure forbids and attestation covers).
 ```
 
 Only after this PASS did the acceptance vertical continue (see `v0.1-rc-manual-acceptance.md`).
+
+---
+
+## Addendum (2026-09-28 late — scope note from the Final RC completion brief)
+
+Re-auditing the ask sites during the completion brief surfaced one remaining `patterns: []` call: the **abort confirmation** (`ultraplan_request_abort` → `context.ask({ permission: gate.permission, patterns: [], always: [], … })`, kind `ultraplan.run-abort`). By audit finding §2.1 this ask skips rule evaluation entirely — an implicit allow under every configuration — and the plugin's forced `ultraplan.approval:* → ask` does not match the abort permission prefix, so the abort ask is NOT covered by the RF-01 hardening.
+
+It was deliberately left unchanged: the completion brief forbids approval-surface changes ("No approval changes") and this closure's scope is the validator provider gate, so altering a second authority-bearing ask without its own audit/fix/live-proof cycle would be exactly the kind of partial hardening this report exists to prevent. Authority impact is lower than Proposal approval (abort only terminates the user's own active run; it commits nothing and mutates nothing), but the confirmation is still an authority interaction and should receive the identical fail-closed treatment (`ultraplan.abort:* → ask`, non-empty pattern) as the first v0.2 item.
