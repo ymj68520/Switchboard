@@ -37,6 +37,7 @@ const GOAL = `Validator live acceptance ${Date.now()}`;
 const MAX_ATTEMPTS = 3; // 1 + 2 disclosed provider-cooperation retries
 
 const results = [];
+const serverLog = [];
 function report(step, ok, detail = "") {
   results.push({ step, ok });
   console.log(`${ok ? "PASS" : "FAIL"}  ${step}${detail ? ` — ${detail}` : ""}`);
@@ -44,12 +45,19 @@ function report(step, ok, detail = "") {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function spawnServer(fixtureDir, port, dataDir) {
-  return spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1", "--print-logs"], {
+  const proc = spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1", "--print-logs"], {
     cwd: fixtureDir,
     shell: true,
     env: { ...process.env, ULTRA_PLAN_DATA_DIR: dataDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  // Drain --print-logs output. An undrained pipe fills its 64KB buffer and
+  // BLOCKS the server mid-turn on Windows, which surfaces as assistant replies
+  // with zero parts ("output is empty"). The other live smokes drain; this one
+  // must too. Captured for post-run diagnostics.
+  proc.stdout.on("data", (d) => serverLog.push(String(d)));
+  proc.stderr.on("data", (d) => serverLog.push(String(d)));
+  return proc;
 }
 async function waitReady(base) {
   for (let i = 0; i < 60; i++) {
