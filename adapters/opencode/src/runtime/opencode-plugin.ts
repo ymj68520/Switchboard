@@ -124,8 +124,13 @@ export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
       // real user decision even under the default `"*": "allow"` baseline.
       // The key is exact-scoped to Ultra Plan's approval permission — every
       // other permission keeps its user/host configuration untouched.
+      // RF-02: the identical treatment for the terminal-abort confirmation
+      // (the host sees `ultraplan.abort.<PlanID>` asks) under its own narrow
+      // namespace, so an abort can never resolve without a real user
+      // decision either.
       permission: {
         "ultraplan.approval:*": "ask",
+        "ultraplan.abort.*": "ask",
       },
       ...(this.spec.planningModel ? { model: this.spec.planningModel } : {}),
     };
@@ -133,18 +138,20 @@ export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
       ...config.agent,
       [this.spec.agentName]: planningAgent as NonNullable<OpenCodeConfig["agent"]>[string],
     };
-    // RF-01 (second layer): the same narrow rule in the resolved global
-    // permission config, so the approval ask pends regardless of which
-    // ruleset the host consults. Because rule resolution is last-match, the
-    // key is re-appended LAST (delete + re-add) so it outranks any earlier
-    // wildcard — including a user-level `"*": "allow"` — while every OTHER
-    // user permission (bash, edit, webfetch, external_directory, …) is
+    // RF-01 (second layer): the same narrow rules in the resolved global
+    // permission config, so the approval and abort asks pend regardless of
+    // which ruleset the host consults. Because rule resolution is last-match,
+    // the keys are re-appended LAST (delete + re-add) so they outrank any
+    // earlier wildcard — including a user-level `"*": "allow"` — while every
+    // OTHER user permission (bash, edit, webfetch, external_directory, …) is
     // preserved verbatim. No unrelated permission is rewritten.
     const permissions: Record<string, unknown> = { ...(config.permission ?? {}) };
     delete permissions["ultraplan.approval:*"];
+    delete permissions["ultraplan.abort.*"];
     config.permission = {
       ...permissions,
       "ultraplan.approval:*": "ask",
+      "ultraplan.abort.*": "ask",
     } as OpenCodeConfig["permission"];
   }
 

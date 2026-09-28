@@ -737,9 +737,18 @@ export function createUltraPlanTools(controller: UltraPlanController): Record<st
           // validates abortability; the USER decides via the one-shot ask.
           const gate = await controller.beginAbort(context.sessionID);
           try {
+            // RF-02 (abort authority fail-closed): the pattern list MUST be
+            // non-empty — the host evaluates permission rules only inside its
+            // loop over patterns, so `patterns: []` skips evaluation entirely
+            // and resolves as an implicit allow under EVERY configuration.
+            // The exact active run identity is the pattern, binding this
+            // confirmation to the one run being terminated (the Harness
+            // derives it; the model supplies nothing). `always` stays EMPTY —
+            // one abort confirmation must never become standing abort
+            // authority.
             await context.ask({
               permission: gate.permission,
-              patterns: [],
+              patterns: [gate.planID],
               always: [],
               metadata: {
                 kind: "ultraplan.run-abort",

@@ -33,8 +33,10 @@ describe("RF-01 — applyToConfig forces the approval permission to ask", () => 
     adapter().applyToConfig(config);
     expect(config.permission).toBeDefined();
     expect((config.permission as Record<string, unknown>)["ultraplan.approval:*"]).toBe("ask");
+    // RF-02 added the abort rule alongside; the approval rule is unchanged.
     expect(config.agent?.[DEFAULT_PLANNING_RUNTIME_SPEC.agentName]?.permission).toEqual({
       "ultraplan.approval:*": "ask",
+      "ultraplan.abort.*": "ask",
     });
   });
 
@@ -83,10 +85,13 @@ describe("RF-01 — applyToConfig forces the approval permission to ask", () => 
     const permission = config.permission as Record<string, unknown>;
     expect(permission["*"]).toBe("allow");
     const keys = Object.keys(permission);
-    // The host resolves rules with findLast — the forced rule must be the
-    // LAST entry so it outranks the earlier "*": "allow".
-    expect(keys[keys.length - 1]).toBe("ultraplan.approval:*");
+    // The host resolves rules with findLast — the forced rules must be the
+    // LAST entries so they outrank the earlier "*": "allow" (RF-02 appended
+    // the abort rule after the approval rule; both stay terminal).
+    expect(keys[keys.length - 2]).toBe("ultraplan.approval:*");
+    expect(keys[keys.length - 1]).toBe("ultraplan.abort.*");
     expect(permission["ultraplan.approval:*"]).toBe("ask");
+    expect(permission["ultraplan.abort.*"]).toBe("ask");
   });
 
   it("is idempotent and keeps the forced rule last across repeated application", () => {
@@ -95,7 +100,8 @@ describe("RF-01 — applyToConfig forces the approval permission to ask", () => 
     runtime.applyToConfig(config);
     runtime.applyToConfig(config);
     const keys = Object.keys(config.permission as Record<string, unknown>);
-    expect(keys[keys.length - 1]).toBe("ultraplan.approval:*");
+    expect(keys[keys.length - 2]).toBe("ultraplan.approval:*");
+    expect(keys[keys.length - 1]).toBe("ultraplan.abort.*");
     expect((config.permission as Record<string, unknown>)["ultraplan.approval:*"]).toBe("ask");
   });
 
