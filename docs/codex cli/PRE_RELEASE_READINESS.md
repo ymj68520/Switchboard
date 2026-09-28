@@ -16,19 +16,23 @@ Status: **pre-alpha, locally installable — NOT publicly released.**
 | Platform | Build | Offline tests | Process cleanup | Real Codex | Managed TUI E2E |
 | --- | --- | --- | --- | --- | --- |
 | Windows 10 21H2 (10.0.19044), Node 22.23.2, codex-cli 0.156.1, ConPTY/console | PASS | PASS (193/193) | PASS (real children, suite + probes) | PASS (4 probes, see below) | PASS (11/11) |
-| Linux | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED |
+| Linux — WSL2: Ubuntu 24.04, kernel 6.18.33.2-microsoft-standard-WSL2, Node 22.23.2, codex-cli 0.156.1, native ext4 checkout | PASS | PASS (193/193) | **PASS (release gate 6/6)** | PARTIAL: Phase 1 smoke PASS; Phase 3/4/5 probes NOT EXECUTED (Codex auth unavailable in WSL — see WSL2-POSIX-VALIDATION.md) | NOT EXECUTED (auth-blocked) |
 | macOS | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED |
 
-Linux/macOS were not executed: this machine has no Docker, no VM, and WSL
-is present but both required Windows features (`VirtualMachinePlatform`,
-`Microsoft-Windows-Subsystem-Linux`) are disabled — enabling them requires
-a system reboot, which was not performed autonomously. **Blocker level:**
-POSIX process-group cleanup validation is a **release blocker for any
-public distribution** of 0.0.1 (the POSIX terminate path — detached
-process groups, SIGTERM→SIGKILL — is implemented and code-reviewed but has
-never executed on a real POSIX host). Per the phase classification this is
-a documented pre-alpha limitation for local readiness, and macOS runtime
-validation is explicitly NOT EXECUTED (not assumed PASS).
+Linux (WSL2, 2026-09-28) was validated on a freshly initialized WSL2 distro
+using the real Linux kernel and real POSIX process semantics, on a native
+ext4 checkout at this baseline. The dedicated POSIX process-cleanup release
+gate — six termination/failure cases (normal exit, SIGINT, SIGTERM,
+app-server crash, force-kill fallback, bootstrap failure after spawn) with
+per-PID/PPID/PGID/SID evidence and zero-survivor assertions, including a
+native-binary `git` grandchild reached by the process-group kill — is
+documented in [WSL2-POSIX-VALIDATION.md](WSL2-POSIX-VALIDATION.md) and
+reproducible via `scripts/codex-posix-process-gate.mjs`. Linux live
+model-turn probes (Phase 3/4/5) are NOT EXECUTED because Codex cannot
+authenticate inside this WSL/network environment (OpenAI endpoints
+unreachable; the working Windows relay configuration is user-secret and is
+not copied autonomously). macOS remains NOT EXECUTED — a documented
+pre-alpha limitation, not assumed PASS.
 
 ## Test counts (Windows, this baseline)
 
@@ -77,9 +81,17 @@ validation is explicitly NOT EXECUTED (not assumed PASS).
 
 ## Release blockers (for any public release)
 
-1. POSIX process-cleanup validation NOT EXECUTED (see above) — must run on
-   at least one real Linux/macOS host before public distribution.
+1. ~~POSIX process-cleanup validation NOT EXECUTED~~ **CLOSED for Linux
+   (WSL2) 2026-09-28** — six-case gate PASS with zero survivors on a real
+   Linux kernel (see WSL2-POSIX-VALIDATION.md). macOS runtime validation
+   remains NOT EXECUTED (documented pre-alpha limitation; required before
+   any macOS-specific claim).
 2. No CI: offline suites must be wired into a runner or verified per release.
+
+Non-blocking follow-up opened by the WSL2 validation: Linux live
+model-turn probes (Phase 3/4/5) require Codex authentication inside the
+WSL environment (see WSL2-POSIX-VALIDATION.md §1 for the precise network
+and secret constraints).
 
 ## Non-blocking pre-alpha limitations
 
