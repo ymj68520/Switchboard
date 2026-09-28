@@ -137,3 +137,85 @@ missing until the host applies `updatedPermissions` alongside
 No OAuth/token/HostContext signatures/private transcript content is recorded
 here. No settings/account changes, no nested Claude, no simulated modes; the
 forbidden §40 workarounds were never used.
+
+---
+
+# A2 closure (2026-09-28) — Amendment A2 adopted, blocker resolved by architecture adaptation
+
+The §38 blocker above is PRESERVED verbatim as the original evidence. It is resolved by
+`spec/amendments/A2-abort-host-mode-normalization.md` (RI-23/CC-12): the Abort lifecycle
+and the host permission mode are distinct authorities; the unapplied `setMode` is a
+best-effort normalization request, and the mismatch is exposed fail-visibly. Nothing in
+this A2 section rewrites the 2.1.283 probe facts above.
+
+## A2 implementation under live test
+
+- `hooks/hooks.json` gained a `PostToolUse` matcher for `mcp__…__abort_run` (live-found
+  before the run: without it the A2 observer would silently never fire — same bug class
+  as the Phase 16 PermissionRequest matcher gap; assets-test pin added).
+- `abort_run` response now carries `mode_exit: "requested"` and never claims a mode
+  change (A2 §27); the old "the session has left Plan Mode" wording is gone.
+- PostToolUse observer: successful abort response + positive `permission_mode=plan`
+  observation → the frozen 415-char A2 notice via `additionalContext`; store-free.
+
+## Real-host A2 run (Claude Code 2.1.283, real TUI, session `7a2e1c9d-3f0b-4e8a-9c1d-5b6f2a8e4d70`)
+
+- Host version re-checked at run time: **still 2.1.283** → A2 §30 branch B applies
+  (automatic normalization unsupported; the fallback must fire).
+- Run 1 `plan_11e7e4bc-f129-4441-96fd-e3ded0955712` (goal: URL health-check service,
+  discovery, revision 1, binding attached gen 1):
+  - `/phase-plan` entry → PermissionRequest hook allow + `setMode(plan, session)` →
+    status line `plan mode on` (the non-interactive path applies mode normally).
+  - mandatory abort dialog appeared — `1. Yes` / `2. No` only (probe A fact holds);
+    operator pressed Yes → handler executed (probe C holds).
+  - Store after commit: run `aborted`, revision 2; binding `detached`, generation 2;
+    control row `ctrl_474f5301-d740-4f37-b8b0-e98881e560dc`, operation_id
+    `abort:call_5058eabb65b04b4aa6129327`, reason recorded.
+  - **PostToolUse input captured verbatim (live instrumentation)**:
+    `permission_mode: "plan"`, `has_permission_mode_field: true`, tool_response = the
+    bare content array with `{"ok":true,"status":"aborted",…}` — the host DOES send
+    `permission_mode` on PostToolUse for MCP tools.
+  - **A2 fallback fired**: debug log `Hook PostToolUse … provided additionalContext
+    (415 chars)` with the exact frozen notice text; the host did NOT leave Plan Mode
+    (status line kept `plan mode on` — probe B fact holds), the mismatch was exposed
+    fail-visibly, and the model reported the A2 framing verbatim ("the session is still
+    in Plan Mode — the abort tool doesn't switch Claude Code's permission mode itself…
+    switch back … with the normal permission-mode control").
+  - `mode_exit: "requested"` semantics confirmed in the delivered response.
+- Operator normalization: Shift+Tab cycled the status line to `⏵⏵ auto mode on` —
+  the host's own control, no settings write.
+- Second abort attempt after normalization (no run attached): PreToolUse signed nothing
+  (`_hostContext: ""`), host dialog shown, Yes → MCP failed closed
+  `HOST_CONTEXT_REQUIRED` ("model-supplied context is never authority"), zero mutation.
+  Host fact: PostToolUse does NOT fire for MCP error results on 2.1.283, so no capture
+  line and no notice — the §28 "no success path" behavior confirmed live.
+- Run 2 `plan_4bc80e13-f9d9-40de-8078-7e52f5a3f24a` (throwaway folder-watcher goal):
+  created while normalized (auto mode) → `/phase-plan` re-entry applied
+  `setMode(plan, session)` again (mode recovery, A1 chain) → second mandatory abort
+  dialog → Yes → run `aborted` revision 2, binding detached generation 2, control row
+  `ctrl_a7927ef8-677e-46d5-a894-0d2dadae005a`; PostToolUse capture line #2 again
+  `permission_mode: "plan"` → second 415-char A2 notice emission. Reproducible.
+- **Drift-guard observation (stronger-than-planned mode evidence)**: with run 2
+  attached and the host normalized OUT of plan mode, the UserPromptSubmit drift guard
+  blocked the abort prompt itself (`DRIFT_GUARD_REASON`, A1 frozen behavior) — a real
+  hook POSITIVELY observing `permission_mode != plan` with an attached run. Consequence
+  recorded: "abort while the host is not in plan mode" is unreachable BY DESIGN — the
+  attached-run mode mismatch is forced through `/phase-plan` recovery before any
+  operation, so an abort's PostToolUse observation can only legally observe `plan`
+  (the A2 fallback condition) or fire after recovery restored plan.
+- Post-closure confirmations: both runs unchanged (`aborted`, rev 2, detached gen 2);
+  zero `execution_handoffs` / `execution_bindings` / `final_plans` rows for both A2
+  runs (no Build authority artifacts); user settings sha256
+  `def5d0df9e653e122abe9a868976d31d910a32d7b3ef2e927644a2170c4d7b4c` byte-identical
+  to the Phase 16 record (no settings writes, CC-12); no ExitPlanMode automation.
+
+## A2 verdict
+
+E43-A2 PASS (fallback branch): Abort requests session-scoped normalization without
+weakening mandatory authorization; when the host drops it, the Abort stays terminal and
+`abort_mode_exit_required` is exposed fail-visibly with no settings writes and no silent
+workaround. E71-A2 PASS (branch B): the real host proves the drop, the detection, the
+fail-visible exposure, the preserved terminal Abort, and explicit user normalization
+without Build authority.
+
+**PHASE 16 — FROZEN / PASS under Architecture Amendment A2.**

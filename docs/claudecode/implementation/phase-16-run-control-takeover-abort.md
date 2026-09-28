@@ -1,9 +1,10 @@
 # Phase 16 — PlanningRun ownership control & explicit abort (takeover_run / abort_run)
 
-Status: IMPLEMENTATION COMPLETE + LIVE CLOSURE COMPLETE WITH ONE DOCUMENTED
-HOST BLOCKER (`ARCHITECTURE_BLOCKER_ABORT_HOST_AUTH_MODE_TRANSITION`, §38/§40
-probe result — see the validation record). Frozen baseline: Phase 15
-(`332df97` + `75fe3d3` + `a237588` + `6e9c08a` + `b80db6c`).
+Status: IMPLEMENTATION COMPLETE + LIVE CLOSURE COMPLETE; the §38 probe's
+`updatedPermissions` host fact is resolved by **Architecture Amendment A2**
+(`spec/amendments/A2-abort-host-mode-normalization.md` — authoritative Abort vs host
+permission-mode normalization, RI-23/CC-12, fail-visible PostToolUse observer). Frozen
+baseline: Phase 15 (`332df97` + `75fe3d3` + `a237588` + `6e9c08a` + `b80db6c`).
 
 ## Schema v13 (`013-run-control-authorizations`)
 
@@ -111,6 +112,26 @@ written:
 - SessionEnd after abort is idempotent — the abort already detached, so the
   SessionEnd loop finds only a detached row and does not bump again (§69).
 
+## Abort host-mode normalization (Amendment A2)
+
+Three distinct things (A2 §32 wording discipline):
+
+1. **Authoritative Abort** — the MCP transaction: `active → aborted`, `revision +1`
+   exactly once, binding detach `generation +1`, durable authorization row. Its success
+   is the tool response; it never depends on the host mode.
+2. **Host normalization request** — the PermissionRequest allow carries
+   `setMode(default, destination=session)` as a BEST-EFFORT request (A2 §7), never an
+   Abort correctness prerequisite.
+3. **Observed host normalization result** — the `abort_run` PostToolUse observer (A2
+   §9/§26): a successful abort response plus a positive `permission_mode=plan`
+   observation injects the frozen fail-visible notice; anything else injects nothing.
+   The observer is store-free (the derived condition is never persisted, A2 §17).
+
+The `abort_run` response reports `mode_exit: "requested"` and never claims the mode
+changed (A2 §27). No ExitPlanMode automation (A2 §11); a later manual plan → default
+switch by the user through Claude's own UI is host-mode normalization only — not a
+second authorization, and never Build authority (A2 §12–§14).
+
 ## Mandatory human interaction
 
 Both tools carry `anthropic/requiresUserInteraction: true` (real JSON
@@ -139,11 +160,14 @@ Live probe result (Claude Code 2.1.283, real TUI, see the validation record):
 - C. handler only after authorization: YES.
 - D. deny → handler never executes, zero mutation: YES.
 
-Per §40 this is reported as `ARCHITECTURE_BLOCKER_ABORT_HOST_AUTH_MODE_TRANSITION`
-and NOT worked around (no settings writes, no bypassPermissions, no fake
-approval, no raw DB mutation, no silent auto-allow). The abort remains fully
-safe and human-authorized; only the mode-exit leg (E43/E71) is blocked on the
-host.
+Per §40 the probe result was reported as
+`ARCHITECTURE_BLOCKER_ABORT_HOST_AUTH_MODE_TRANSITION` and NOT worked around (no
+settings writes, no bypassPermissions, no fake approval, no raw DB mutation, no silent
+auto-allow). **Amendment A2 resolves it by architecture adaptation**: probe B is a
+documented version-specific host fact, not an Abort failure. The Abort remains fully
+safe, human-authorized, and terminal regardless of the host mode (RI-23); the
+unapplied mode exit is exposed fail-visibly by the PostToolUse observer, and E43/E71
+are reinterpreted as E43-A2/E71-A2 (see the amendment).
 
 Live-found adapter fix: the plugin `PermissionRequest` matcher did not yet
 match the new tool names, so the hook silently never fired (`fix(claude)`

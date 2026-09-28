@@ -1327,7 +1327,11 @@ Abort invalidates writable session ownership and does not create:
 - ExecutionHandoff;
 - ExecutionBinding.
 
-Abort exits planning mode but does not automatically begin Build.
+Abort terminates Phase Plan authority immediately (Amendment A2).
+
+The Claude adapter requests a session-scoped transition out of Plan Mode. When the host cannot apply that transition on the mandatory-interaction path, the Abort remains authoritative and the adapter reports that host-mode normalization is still required.
+
+Leaving Plan Mode after Abort does not create Build authority and does not create an ExecutionHandoff or ExecutionBinding.
 
 Aborted runs are never reactivated; continuing the goal requires a new PlanningRun.
 
@@ -2055,6 +2059,12 @@ The v0.1 architecture freezes the following cross-cutting invariants.
 RI-22. PlanningRun recovery and Claude permission-mode recovery are distinct operations. An exact-session resume may recover/reattach authoritative PlanningRun state even when the host does not restore Plan Mode. If the current host permission mode is not plan, no planning continuation or planning mutation is authorized until the user explicitly invokes `/phase-plan` and the documented session-scoped Plan Mode transition succeeds.
 
 CC-11. Phase Plan never persists Claude Plan Mode into user, project, or local settings solely to survive session resume. Where the host cannot restore Plan Mode, explicit `/phase-plan` re-entry is the recovery mechanism.
+
+### Amendment A2 (Abort host-mode normalization — see `amendments/A2-abort-host-mode-normalization.md`)
+
+RI-23. PlanningRun abort and Claude permission-mode normalization are distinct operations. A human-authorized Abort becomes authoritative when the Core commits lifecycle=aborted and invalidates writable ownership. If the host cannot apply the requested session-scoped transition out of Plan Mode on the mandatory-interaction path, Phase Plan must preserve the Abort, expose the host-mode mismatch, and must not weaken the human-authorization boundary to repair it.
+
+CC-12. Phase Plan never persists Claude permission settings merely to normalize the host after Abort. When the current Claude host cannot atomically combine mandatory MCP interaction with session-scoped setMode(default), Abort remains terminal and the remaining host-mode transition is an explicit host UX action.
 
 ---
 
