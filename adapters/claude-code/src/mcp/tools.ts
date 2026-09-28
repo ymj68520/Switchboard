@@ -1809,7 +1809,9 @@ export function handlePrepareProposal(ctx: PhasePlanToolContext, rawArgs: Record
   }
   const service = createProposalService(ctx.store, ctx.clock);
   // §60 — the operation id derives from the SIGNED HostContext tool use.
-  const reviseProposalId = rawArgs.proposal_id === undefined ? undefined : (rawArgs.proposal_id as string);
+  const reviseProposalId = rawArgs.proposal_id === undefined
+    ? undefined
+    : trimStrayTrailingBackslash(rawArgs.proposal_id as string);
   const prepared = reviseProposalId === undefined
     ? service.prepareProposal({
         runId: envelope.runId,
@@ -1865,12 +1867,35 @@ export function handlePrepareProposal(ctx: PhasePlanToolContext, rawArgs: Record
 // approve_proposal (directive §27–§32) — the Formal Approval bridge
 // ---------------------------------------------------------------------------
 
+/**
+ * Phase 17 live finding: some model relays append a stray literal trailing
+ * backslash to long identifier values copied into JSON arguments. Identity
+ * fields can never legitimately end in one, so the stray character is
+ * trimmed before use; the exact-hash checks keep every real corruption
+ * failing closed.
+ */
+function trimStrayTrailingBackslash(value: string): string {
+  return value.endsWith("\\") ? value.slice(0, -1) : value;
+}
+
 export function handleApproveProposal(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   // §27/§29 — exact business schema; model-supplied authority fields rejected.
   assertExactBusinessFields(rawArgs, ["proposal_id", "proposal_revision", "proposal_hash"]);
-  const args = rawArgs;
-  const token = requireHostContext(args);
-  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "approve_proposal", businessInput: args });
+  // The signed context is verified over the RAW input exactly as the hook
+  // emitted it; the stray-backslash trim below happens strictly afterwards.
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "approve_proposal", businessInput: rawArgs });
+  // Gateway escaping defect (Phase 17 live finding): some model relays append
+  // a literal trailing backslash when the model copies long identifier values
+  // into JSON arguments. Identity fields never legitimately end in a
+  // backslash, so the stray character is trimmed after the signed-context
+  // verification — the exact-hash approval check below still fails closed on
+  // any real corruption.
+  const args: Record<string, unknown> = {
+    ...rawArgs,
+    ...(typeof rawArgs.proposal_id === "string" ? { proposal_id: trimStrayTrailingBackslash(rawArgs.proposal_id) } : {}),
+    ...(typeof rawArgs.proposal_hash === "string" ? { proposal_hash: trimStrayTrailingBackslash(rawArgs.proposal_hash) } : {}),
+  };
 
   if (typeof args.proposal_id !== "string" || args.proposal_id === "") {
     throw inputInvalid("proposal_id must be a non-empty string");

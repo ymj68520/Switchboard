@@ -536,3 +536,33 @@ describe("Phase 17 §55 fix — awaiting-proposal revision route (live-found dea
     }
   });
 });
+
+describe("Phase 17 §55 fix — stray-backslash identity trim (gateway escaping, live-found)", () => {
+  it("approve_proposal tolerates a stray trailing backslash on copied id/hash; a genuinely wrong hash still fails closed", async () => {
+    const root = makeTempPluginDataRoot("phase-plan-p17trim-");
+    try {
+      const { makeProposalFixture, prepareCheckpoint, DECISION_1 } = await import("./proposal-helpers.js");
+      const fixture = await makeProposalFixture(root, { stage: "architecture", sessionId: "S1" });
+      const prepared = prepareCheckpoint(fixture, [{ op: "ADD_DECISION", content: { ...DECISION_1 }, compactProjection: "d1" }]);
+      const ctx = toolContextOf(fixture);
+      const ids = { sessionId: "S1", workspaceId: fixture.workspaceId, runId: fixture.runId, generation: fixture.generation };
+      // The gateway defect: long copied values arrive with ONE stray trailing
+      // backslash. The exact-hash check still decides the outcome.
+      const corrupted = {
+        proposal_id: prepared.proposal.proposalId + "\\",
+        proposal_revision: prepared.proposal.revision,
+        proposal_hash: prepared.proposal.proposalHash + "\\",
+      };
+      const token = hostToken(ctx.secret, "approve_proposal", corrupted, ids, { toolUseId: "P17-TRIM-1" });
+      const approval = executePhasePlanTool(ctx, "approve_proposal", { ...corrupted, _hostContext: token }) as { approved: boolean; commit_id: string };
+      expect(approval.approved).toBe(true);
+      fixture.store.close();
+    } finally {
+      try {
+        removeTempPluginDataRoot(root);
+      } catch {
+        // Windows may briefly lock freshly written DB files.
+      }
+    }
+  });
+});
