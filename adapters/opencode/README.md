@@ -16,6 +16,15 @@ OS            Windows        (10.0.19044 validated; no macOS/Linux claim)
 
 These versions were used for every automated and live validation of this release. Compatibility with other versions is neither tested nor claimed — do not upgrade OpenCode past 1.18.32 within this release line.
 
+### Provider support (validator boundary)
+
+| Capability | Provider/model claim |
+|---|---|
+| Planning, approvals, context assembly, durable restart, same-session Build handoff | Live-validated on `opencode/ling-3.0-flash-fin-free` (OpenCode free-tier Console provider) |
+| **Semantic validation (synthesis stage)** | **NOT supported on any free-tier `opencode/*` model.** The production validator issues its isolated inference with a per-request tools-disable map (structural tool isolation); the free-tier Console provider rejects ANY request that carries a tools map (`OpenCode's free tier can only be used from within OpenCode`), so validation can never complete there. A provider/model that permits this request shape is required; none was configured or proven during this release's validation. |
+
+This is a provider policy boundary of the free tier, not a generic OpenCode incompatibility. With an affected provider, everything up to synthesis works, but clean semantic validation — and therefore final approval and handoff — cannot complete.
+
 ## Installation
 
 Ultra Plan is distributed as a **GitHub Release asset**. Download the release tarball, install it into your project from the downloaded file, and register the plugin with a one-line shim.
@@ -106,7 +115,7 @@ Synthesis produces a frozen input, a provenance-bound manifest, an isolated-sess
 - Context token counts are conservative estimates, not provider billing tokens.
 - The durable store is a whole document: publication is O(state) — fine for planning-scale data, not a database.
 - Handoff delivery confirmation scans session history within a bounded loop.
-- Live validation used free-tier gateway models; those legs inherit gateway availability.
+- The semantic validator cannot run on free-tier `opencode/*` models (provider policy rejects tools-disabled requests — see "Provider support" above).
 
 ## Troubleshooting
 
