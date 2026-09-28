@@ -32,7 +32,7 @@
  * node-pty resolvable (NODE_PATH). Without node-pty the script SKIPs.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -93,10 +93,17 @@ async function discoverModels() {
   const execution = process.env.CODEX_TEST_EXECUTION_MODEL ?? null;
   if (planning && execution) return { planning, execution };
   const runtime = await import(pathToFileURL(distEntry).href);
-  const session = new runtime.CodexSessionRuntime({
-    command: process.env.ComSpec ?? "cmd.exe",
-    args: ["/d", "/s", "/c", "codex", "app-server", "--listen", "ws://127.0.0.1:0"],
-  });
+  // Windows needs the cmd.exe wrapper (node cannot spawn the codex.cmd shim
+  // directly); POSIX resolves plain `codex` from PATH — same branch as the
+  // production resolveCodexCommand().
+  const pickerConfig =
+    process.platform === "win32"
+      ? {
+          command: process.env.ComSpec ?? "cmd.exe",
+          args: ["/d", "/s", "/c", "codex", "app-server", "--listen", "ws://127.0.0.1:0"],
+        }
+      : { command: "codex", args: ["app-server", "--listen", "ws://127.0.0.1:0"] };
+  const session = new runtime.CodexSessionRuntime(pickerConfig);
   let driver = null;
   try {
     const endpoint = await session.start();
@@ -663,18 +670,50 @@ try {
   await sleep(1_500);
   let orphans = [];
   try {
-    const tasklist = execFileSync("tasklist", { encoding: "utf8" });
-    orphans = tasklist
-      .split("\n")
-      .filter((line) => /codex\.exe/i.test(line))
-      .map((line) => line.trim().split(/\s+/)[0]);
+    if (process.platform === "win32") {
+      const tasklist = execFileSync("tasklist", { encoding: "utf8" });
+      orphans = tasklist
+        .split("\n")
+        .filter((line) => /codex\.exe/i.test(line))
+        .map((line) => line.trim().split(/\s+/)[0]);
+    } else {
+      // POSIX: sweep /proc for any surviving codex/phase-model process
+      // (same matching discipline as the POSIX process-cleanup gate;
+      // this script's own process is excluded — its cmdline matches).
+      orphans = readdirSync("/proc")
+        .filter((entry) => /^\d+$/.test(entry))
+        .map((entry) => {
+          let cmd = "";
+          try {
+            cmd = readFileSync(`/proc/${entry}/cmdline`, "utf8")
+              .split("\0")
+              .filter(Boolean)
+              .join(" ");
+          } catch {
+            return null; // vanished mid-sweep
+          }
+          return { pid: Number(entry), cmd };
+        })
+        .filter(
+          (proc) =>
+            proc !== null &&
+            proc.pid !== process.pid &&
+            proc.cmd !== "" &&
+            /codex|phase-model/.test(proc.cmd),
+        )
+        .map((proc) => `pid=${proc.pid} ${proc.cmd.slice(0, 60)}`);
+    }
   } catch {
-    orphans = ["tasklist-unavailable"];
+    orphans = ["process-sweep-unavailable"];
   }
   report(
     "11. no orphan codex processes after exit (P5-E47/E48)",
     orphans.length === 0,
-    orphans.length === 0 ? "tasklist clean" : `found: ${orphans.join(", ")}`,
+    orphans.length === 0
+      ? process.platform === "win32"
+        ? "tasklist clean"
+        : "process sweep clean"
+      : `found: ${orphans.join(", ")}`,
   );
 
   console.log(`\n(diagnostics: ${echoes.length} settings echoes observed)`);
@@ -689,7 +728,15 @@ try {
   // Ensure nothing survives a failed run.
   try {
     if (launcher.pid) {
-      execFileSync("taskkill", ["/pid", String(launcher.pid), "/T", "/F"], { stdio: "ignore" });
+      if (process.platform === "win32") {
+        execFileSync("taskkill", ["/pid", String(launcher.pid), "/T", "/F"], { stdio: "ignore" });
+      } else {
+        // node-pty makes the launcher a session/process-group leader on
+        // POSIX (forkpty); a group SIGKILL mirrors the Windows tree kill.
+        try {
+          process.kill(-launcher.pid, "SIGKILL");
+        } catch {}
+      }
     }
   } catch {}
 }
