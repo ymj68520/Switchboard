@@ -18,14 +18,19 @@ These versions were used for every automated and live validation of this release
 
 ## Installation
 
-Install the package into your project, then register the plugin with a one-line shim.
+Ultra Plan is distributed as a **GitHub Release asset**. Download the release tarball, install it into your project from the downloaded file, and register the plugin with a one-line shim.
 
 ```text
-1. npm install @switchboard/opencode          (or: npm install <path-or-tarball>)
-2. create .opencode/plugin/ultra-plan.js containing exactly:
+1. download switchboard-opencode-0.1.0.tgz
+   from the GitHub Release assets
+2. npm install ./switchboard-opencode-0.1.0.tgz
+3. create .opencode/plugin/ultra-plan.js containing exactly:
       export { default } from "@switchboard/opencode";
-3. start OpenCode normally
+4. start OpenCode normally
+5. invoke /ultra-plan <goal>
 ```
+
+The package is not published to the npm registry; the GitHub Release tarball is the only supported installation source.
 
 On startup the plugin registers the `/ultra-plan` command, the `ultraplan` planning agent, and the `ultraplan_*` tool family. Pin the session model in `opencode.json` as usual — Ultra Plan uses the session's configured model for planning and OpenCode's native `build` agent for execution.
 
@@ -113,6 +118,10 @@ Synthesis produces a frozen input, a provenance-bound manifest, an isolated-sess
 | `context_budget_exceeded` | Required planning context exceeded the configured budget (`overflow=fail`), or rendered complete with a warning (default). | Raise `ULTRA_PLAN_CONTEXT_BUDGET_TOKENS`. |
 | `start_not_authorized` | `ultraplan_start` was invoked without the `/ultra-plan` command. | Use `/ultra-plan`. |
 | `capability_not_available` | The operation is not valid in the current stage/substate. | Check the status block / L5 checklist. |
+
+## License
+
+MIT — see the included [LICENSE](LICENSE) file.
 
 ---
 
