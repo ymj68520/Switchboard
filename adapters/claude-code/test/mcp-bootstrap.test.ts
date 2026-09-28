@@ -44,7 +44,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         );
         expect(parsed).toHaveLength(2);
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
-          serverInfo: { name: "phase-plan", version: "0.1.0" },
+          serverInfo: { name: "phase-plan", version: "0.1.1" },
         });
         // Phase 13 (§87): fourteen tools — the Phase 12 set plus
         // request_finalization; approve_proposal keeps the flag.

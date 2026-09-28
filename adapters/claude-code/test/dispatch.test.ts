@@ -269,7 +269,7 @@ function makeReport(overrides: {
   const pluginDataStatus = overrides.pluginDataStatus ?? "PASS";
   return {
     schema: "phase-plan.doctor-report/1",
-    runtime: { name: "phase-plan", version: "0.1.0" },
+    runtime: { name: "phase-plan", version: "0.1.1" },
     overall: nodeStatus === "PASS" ? "READY" : "NOT_READY",
     hostIntegration: claudeCliStatus === "PASS" ? "ACTIVE" : "NOT_READY",
     checks: {

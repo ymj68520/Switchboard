@@ -301,7 +301,7 @@ describe("doctor integration (injected probes)", () => {
     expect(first).toBe(second);
     const parsed = JSON.parse(first);
     expect(parsed.schema).toBe("phase-plan.doctor-report/1");
-    expect(parsed.runtime).toEqual({ name: "phase-plan", version: "0.1.0" });
+    expect(parsed.runtime).toEqual({ name: "phase-plan", version: "0.1.1" });
     expect(Object.keys(parsed.checks)).toEqual([
       "node",
       "sqlite",
