@@ -18,19 +18,18 @@ validation NOT EXECUTED — must run on at least one real POSIX host"*
 semantics actually measured — WSL2 uses the real Linux kernel and real
 POSIX process semantics).
 
-What this does NOT cover (honest classification):
+Live model-turn coverage (closed same day): after the process gate passed,
+the user **explicitly authorized** copying the Windows `~/.codex/config.toml`
+(inline relay bearer token) into the WSL home plus an equivalent placeholder
+API-key login (the same synthetic control-plane key documented since Phase 5;
+no secret value is printed or committed). With Codex authenticated, the full
+live probe suite was re-run on Linux: Phase 1 smoke 4/4, **Phase 3 probe
+9/9, Phase 4 probe 11/11, Phase 5 managed-TUI E2E 11/11 — all PASS**, so
+real Codex phase switching is now verified end to end on Linux, not only on
+Windows.
 
-- **Real Codex phase switching on Linux (P3/P4/P5 live probes): NOT
-  EXECUTED — auth-blocked.** Codex is not logged in inside WSL
-  (`codex login status` → Not logged in); the OpenAI endpoints are
-  unreachable from this network (`api.openai.com`/`chatgpt.com` connect
-  fail, `auth.openai.com` 403), and the working Windows setup relies on a
-  relay bearer token stored inline in Windows `~/.codex/config.toml` which
-  must not be copied without explicit user authorization. The switching
-  logic itself is platform-independent TypeScript, re-verified offline on
-  Linux (193/193) and live on Windows (Phase 6).
-- **macOS: still NOT EXECUTED** — remains a documented pre-alpha
-  limitation, not assumed PASS.
+Remaining uncovered (honest classification): **macOS is still NOT
+EXECUTED** — a documented pre-alpha limitation, not assumed PASS.
 
 ## 1. Environment
 
@@ -44,7 +43,7 @@ What this does NOT cover (honest classification):
 | nvm | 0.40.8 (`/root/.nvm`) |
 | Node / npm | v22.23.2 / 10.9.8 — both from `$HOME/.nvm/.../bin` (same Node minor as Windows) |
 | Codex CLI | codex-cli **0.156.1** via `npm install -g @openai/codex@0.156.1` (same pin as Windows) |
-| Codex auth | **Not logged in** (see NOT EXECUTED classification above) |
+| Codex auth | Logged in (user-authorized copy of Windows `config.toml` + placeholder API-key login; token never printed) |
 | Claude Code config | `settings.json`, `plugins/`, `.claude.json` (chmod 600) copied from the Windows profile; both JSON files parse; runtime/cache dirs intentionally NOT copied |
 
 ### Environment bootstrap deviations (recorded, none product-related)
@@ -78,9 +77,9 @@ What this does NOT cover (honest classification):
 | Installed bin `--help` | PASS (exit 0) |
 | Installed bin error paths | reserved-arg conflict → exit 2; missing config → exit 2 with remediation text |
 | Phase 1 live app-server smoke | **PASS 4/4** (endpoint discovery 2297 ms, readyz 200, state transitions, clean shutdown) |
-| Phase 3 subscription probe | **NOT EXECUTED — auth-blocked** (requires a real model turn) |
-| Phase 4 model-switch probe | **NOT EXECUTED — auth-blocked** (requires real turns) |
-| Phase 5 managed-TUI E2E | **NOT EXECUTED — auth-blocked** (requires real turns) |
+| Phase 3 subscription probe | **PASS 9/9** (real turns: pending→automatic convergence, default→plan→default observed, passive-subscriber non-interference, clean cleanup) |
+| Phase 4 model-switch probe | **PASS 11/11** (model/list discovery gpt-6-sol/gpt-6-astra; initial no-op branch; Plan→planningModel echo-verified; manual `/model` survives; Plan→Default reapply; effort untouched) |
+| Phase 5 managed-TUI E2E | **PASS 11/11** after the harness portability fix below (real TUI turns; initial executionModel + effort xhigh, plan→planningModel, manual /model + manual effort uncorrected, exit code propagation, /proc orphan sweep clean) |
 | POSIX process-cleanup gate | **PASS 6/6** (below) |
 
 ## 3. POSIX process-cleanup release gate (the core evidence)
@@ -125,14 +124,46 @@ this gate verifies — is fully real. Case E validates the kernel mechanism
 pinned by the offline suite's fake stubborn-child tests. Case F proves
 cleanup of an already-ready app-server when bootstrap fails after spawn.
 
-## 4. Release-blocker status after this validation
+## 4. Live-probe harness portability fix (the only code change)
+
+The Linux run exposed **one test-harness portability defect** (directive
+§19-20 scope: test harness portability; no product code touched). The Phase 5
+smoke `scripts/codex-managed-tui-smoke.mjs` hard-coded three Windows-only
+behaviors; each got a minimal platform branch mirroring the product's own
+`resolveCodexCommand()`:
+
+1. `discoverModels()` spawned its throwaway model-picker app-server via
+   `process.env.ComSpec ?? "cmd.exe"` + cmd argv — on Linux this resolved to
+   `/mnt/c/Windows/system32/cmd.exe` (appended Windows PATH) and died with
+   the PE bytes interpreted as a shell script → `exited_before_endpoint`.
+2. The failure-path cleanup invoked `taskkill /T /F` unconditionally —
+   POSIX now uses a process-group `SIGKILL` (node-pty makes the launcher a
+   session/group leader).
+3. The orphan check ran `tasklist` — POSIX now sweeps `/proc/*/cmdline` for
+   surviving codex/phase-model processes (excluding this script's own PID),
+   the same discipline as the release gate.
+
+With the fix: Linux Phase 5 smoke **PASS 11/11**. Because the changed file
+is cross-platform, the same smoke was re-run on Windows: **PASS 11/11**
+(first attempt failed on a pre-existing local environment issue — the nvm
+24/22 switching had deleted the global `codex` binary; reinstalling the
+pinned `@openai/codex@0.156.1` restored it, matching the known environment
+gotcha recorded for this machine). No Linux-focused unit regression was
+added because the defect lived entirely in a live-probe script; the offline
+suite (193/193) covers the product code paths.
+
+## 5. Release-blocker status after this validation
 
 | Blocker (Phase 6) | Status |
 | --- | --- |
 | POSIX process-cleanup validation NOT EXECUTED | **CLOSED for Linux/WSL2** (this document). macOS remains NOT EXECUTED — documented pre-alpha limitation; required before any *macOS* claim, not for the POSIX gate criterion. |
 | No CI | **Still open** — unchanged by this task (directive §23: no scope expansion). |
 
-## 5. Reproducing this gate
+The Linux live-switching follow-up is also **CLOSED**: all four live probes
+pass on Linux (§2), with the auth question settled by explicit user
+authorization (§1).
+
+## 6. Reproducing this gate
 
 On a Linux host with the repo built and (ideally) the tarball installed
 into a scratch project:

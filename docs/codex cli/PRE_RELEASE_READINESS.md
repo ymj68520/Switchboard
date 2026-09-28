@@ -16,7 +16,7 @@ Status: **pre-alpha, locally installable — NOT publicly released.**
 | Platform | Build | Offline tests | Process cleanup | Real Codex | Managed TUI E2E |
 | --- | --- | --- | --- | --- | --- |
 | Windows 10 21H2 (10.0.19044), Node 22.23.2, codex-cli 0.156.1, ConPTY/console | PASS | PASS (193/193) | PASS (real children, suite + probes) | PASS (4 probes, see below) | PASS (11/11) |
-| Linux — WSL2: Ubuntu 24.04, kernel 6.18.33.2-microsoft-standard-WSL2, Node 22.23.2, codex-cli 0.156.1, native ext4 checkout | PASS | PASS (193/193) | **PASS (release gate 6/6)** | PARTIAL: Phase 1 smoke PASS; Phase 3/4/5 probes NOT EXECUTED (Codex auth unavailable in WSL — see WSL2-POSIX-VALIDATION.md) | NOT EXECUTED (auth-blocked) |
+| Linux — WSL2: Ubuntu 24.04, kernel 6.18.33.2-microsoft-standard-WSL2, Node 22.23.2, codex-cli 0.156.1, native ext4 checkout | PASS | PASS (193/193) | **PASS (release gate 6/6)** | **PASS (all 4 probes, see below)** | **PASS (11/11)** |
 | macOS | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED | NOT EXECUTED |
 
 Linux (WSL2, 2026-09-28) was validated on a freshly initialized WSL2 distro
@@ -27,11 +27,13 @@ app-server crash, force-kill fallback, bootstrap failure after spawn) with
 per-PID/PPID/PGID/SID evidence and zero-survivor assertions, including a
 native-binary `git` grandchild reached by the process-group kill — is
 documented in [WSL2-POSIX-VALIDATION.md](WSL2-POSIX-VALIDATION.md) and
-reproducible via `scripts/codex-posix-process-gate.mjs`. Linux live
-model-turn probes (Phase 3/4/5) are NOT EXECUTED because Codex cannot
-authenticate inside this WSL/network environment (OpenAI endpoints
-unreachable; the working Windows relay configuration is user-secret and is
-not copied autonomously). macOS remains NOT EXECUTED — a documented
+reproducible via `scripts/codex-posix-process-gate.mjs`. After the user
+explicitly authorized copying the Windows Codex relay configuration into
+the WSL home (placeholder API-key login; no secret printed or committed),
+all four live probes were re-run on Linux and **PASS** (Phase 1 smoke 4/4,
+Phase 3 probe 9/9, Phase 4 probe 11/11, Phase 5 managed-TUI E2E 11/11 —
+the latter after a POSIX-portability fix to the probe script itself,
+re-verified on Windows 11/11). macOS remains NOT EXECUTED — a documented
 pre-alpha limitation, not assumed PASS.
 
 ## Test counts (Windows, this baseline)
@@ -88,10 +90,9 @@ pre-alpha limitation, not assumed PASS.
    any macOS-specific claim).
 2. No CI: offline suites must be wired into a runner or verified per release.
 
-Non-blocking follow-up opened by the WSL2 validation: Linux live
-model-turn probes (Phase 3/4/5) require Codex authentication inside the
-WSL environment (see WSL2-POSIX-VALIDATION.md §1 for the precise network
-and secret constraints).
+The Linux live-probe follow-up opened by the WSL2 validation is CLOSED:
+Codex authentication was settled by explicit user authorization and all
+four live probes pass on Linux (see WSL2-POSIX-VALIDATION.md §1-2).
 
 ## Non-blocking pre-alpha limitations
 
