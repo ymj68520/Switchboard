@@ -87,6 +87,7 @@ import {
 import { getFinalPlanInTx } from "../store/finalization.js";
 import { countOpenExecutionIssuesInTx } from "../store/execution-issues.js";
 import { parsePlanningRunRow } from "../core/planning-run.js";
+import { assertWritableBindingInTx } from "../store/session-bindings.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
 import { assembleContext } from "../context/assembler.js";
 import { deriveContextEpochFromSource } from "../context/epoch.js";
@@ -150,7 +151,9 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "request_reopen" ||
     logical === "request_finalization" ||
     logical === "handoff" ||
-    logical === "report_execution_issue"
+    logical === "report_execution_issue" ||
+    logical === "takeover_run" ||
+    logical === "abort_run"
   );
 }
 
@@ -168,6 +171,10 @@ const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>([
   // Phase 14 §33 — handoff is main-session only; the attested agent fields
   // let the MCP handler deny subagent initiation (VALIDATOR_MUTATION_FORBIDDEN).
   "handoff",
+  // Phase 16 §46/§47 — run control is main-session only; subagents (including
+  // the validator) can never take over or abort a PlanningRun.
+  "takeover_run",
+  "abort_run",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -758,6 +765,68 @@ async function handlePhasePlanPreToolUse(
     );
   }
 
+  // Phase 16 §11 — takeover is the control-plane path for a session that owns
+  // NO attached run: workspace identity comes from the caller's cwd, the
+  // target run stays model input revalidated by the MCP handler and the Store.
+  // A session already owning planning or execution authority is denied here
+  // (§15) — ownership conflicts are never resolved by dropping authority.
+  if (logical === "takeover_run") {
+    if (findAttachedActiveRun(deps.store, input.sessionId) !== null) {
+      return deny(
+        eventName,
+        "SESSION_ALREADY_BOUND",
+        "this session already owns an active PlanningRun; resume it or abort it (phase_plan.abort_run) before taking over another run",
+      );
+    }
+    const execAttached = deps.store.withRead((tx) =>
+      findAttachedExecutionBindingForSessionInTx(tx, input.sessionId),
+    );
+    if (execAttached !== null) {
+      return deny(
+        eventName,
+        "SESSION_ALREADY_BOUND",
+        "this session is bound to a delivered execution contract; planning takeover is unavailable",
+      );
+    }
+    if (input.cwd === undefined || input.cwd.trim() === "") {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; workspace cannot be discovered");
+    }
+    try {
+      const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
+      // Phase 12 §6 — V2 attestation: a subagent call is signed WITH its agent
+      // identity so the MCP handler can deny it (§47), a main call by absence.
+      const takeoverAgent =
+        input.agentId === undefined && input.agentType === undefined
+          ? undefined
+          : {
+              ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+              ...(input.agentType === undefined ? {} : { agentType: input.agentType }),
+            };
+      const takeoverToken = encodeHostContextTokenV2(
+        deps.secret,
+        buildHostContextEnvelopeV2({
+          sessionId: input.sessionId,
+          ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+          workspaceId: registration.workspace.workspaceId,
+          permissionMode: input.permissionMode ?? "unknown",
+          toolUseId: input.toolUseId,
+          toolName: input.toolName,
+          businessInputHash: businessInputHashOf(toolInput),
+          ...(takeoverAgent === undefined ? {} : { agent: takeoverAgent }),
+        }),
+      );
+      // §2 — the mandatory human dialog is the authorization (_meta
+      // requiresUserInteraction); the hook never allows and never decides.
+      return askWithUpdatedInput(
+        eventName,
+        { ...toolInput, _hostContext: takeoverToken },
+        "takeover_run transfers ownership of an active PlanningRun to this session and requires explicit user authorization.",
+      );
+    } catch (err) {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", err instanceof Error ? err.message : String(err));
+    }
+  }
+
   // approve_proposal, promote_evidence, revalidate_evidence, select_section,
   // prepare_proposal, submit_synthesis, submit_validation, request_reopen,
   // request_finalization, and handoff require an owned active run for their
@@ -878,7 +947,10 @@ async function handlePhasePlanPreToolUse(
     logical === "submit_validation" ||
     logical === "request_reopen" ||
     logical === "request_finalization" ||
-    logical === "handoff";
+    logical === "handoff" ||
+    // Phase 16 — run control mutates durable state (ownership/lifecycle) and
+    // stays inside the bound workspace like every other mutation context.
+    logical === "abort_run";
   if (isMutationTool && !cwdInsideWorkspace(input.cwd, workspace)) {
     return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the bound workspace; re-enter it to mutate Plan Memory");
   }
@@ -974,6 +1046,16 @@ async function handlePhasePlanPreToolUse(
     // §29 — never "allow": the mandatory human prompt must still happen.
     return askWithUpdatedInput(eventName, updatedInput, "approve_proposal requires explicit user approval.");
   }
+  if (logical === "abort_run") {
+    // Phase 16 §2/§37 — mandatory human authorization; PermissionRequest
+    // re-verifies from the Store and (host probe §38) attaches the
+    // session-scoped plan→default exit to the SAME decision.
+    return askWithUpdatedInput(
+      eventName,
+      updatedInput,
+      "abort_run terminates the active PlanningRun (terminal; history preserved; no Build authority) and requires explicit user authorization.",
+    );
+  }
   return updatedInputNoDecision(eventName, updatedInput);
 }
 
@@ -1065,6 +1147,79 @@ export function handlePermissionRequest(deps: HookHandlerDeps, input: Permission
       }
       // §6/§88 — the session-scoped execution-mode transition (mirrors the
       // Phase 7 Plan Mode entry; never a user/project/local settings write, §8).
+      return allowWithPermissions([{ type: "setMode", mode: "default", destination: "session" }]);
+    } catch (err) {
+      const code = err instanceof RuntimeError ? err.code : "HOST_CONTEXT_INVALID";
+      return denyPermissionRequest(`${code}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (logical === "takeover_run") {
+    // Phase 16 §2/§39 — the mandatory host dialog IS the authorization; this
+    // hook never allows (auto-allow may never impersonate it) and takeover
+    // performs no host-mode transition.
+    return emptyOutput();
+  }
+
+  if (logical === "abort_run") {
+    // Phase 16 §37/§38 — probe path: re-verify the FULL authorization facts
+    // from the Store BEFORE attaching the session-scoped plan→default exit to
+    // this allow decision (the host must never switch modes and then discover
+    // an unauthorized abort). requiresUserInteraction=true must still surface
+    // the mandatory dialog on top of this allow; if the host lets the allow
+    // suppress it, the §38 probe fails and directive §40 applies.
+    const rawHostContext = input.toolInput._hostContext;
+    if (typeof rawHostContext !== "string" || rawHostContext === "") {
+      return emptyOutput();
+    }
+    try {
+      const envelope = assertHostContextForTool(deps.secret, rawHostContext, {
+        tool: "abort_run",
+        businessInput: input.toolInput,
+      });
+      if (envelope.sessionId !== input.sessionId) {
+        return denyPermissionRequest("HOST_CONTEXT_INVALID: host context is bound to a different session");
+      }
+      if (envelope.promptId !== undefined && input.promptId !== undefined && envelope.promptId !== input.promptId) {
+        return denyPermissionRequest("HOST_CONTEXT_INVALID: host context is bound to a different prompt");
+      }
+      if (envelope.runId === undefined || envelope.bindingGeneration === undefined) {
+        return denyPermissionRequest("STALE_SESSION_BINDING: host context carries no run binding");
+      }
+      const signedRunId: string = envelope.runId;
+      const signedGeneration: number = envelope.bindingGeneration;
+      const eligible = deps.store.withRead((tx) => {
+        const runRow = tx
+          .prepare(
+            "SELECT run_id AS runId, workspace_id AS workspaceId, lifecycle, stage, revision, goal, "
+            + "created_at AS createdAt, updated_at AS updatedAt FROM planning_runs WHERE run_id = ?",
+          )
+          .get(signedRunId) as Record<string, unknown> | undefined;
+        if (runRow === undefined) return false;
+        const run = parsePlanningRunRow(runRow);
+        if (run.workspaceId !== envelope.workspaceId) return false;
+        if (run.lifecycle !== "active") return false;
+        if (getExecutionHandoffInTx(tx, run.runId) !== null) return false;
+        if (getExecutionBindingInTx(tx, run.runId) !== null) return false;
+        try {
+          assertWritableBindingInTx(tx, {
+            runId: run.runId,
+            workspaceId: envelope.workspaceId,
+            sessionId: envelope.sessionId,
+            generation: signedGeneration,
+          });
+        } catch {
+          return false;
+        }
+        return true;
+      });
+      if (!eligible) {
+        return denyPermissionRequest(
+          "ABORT_NOT_AVAILABLE: the current session does not own an active PlanningRun free of execution-handoff state",
+        );
+      }
+      // §37 — abort exits planning mode but never begins Build: session-scoped
+      // only, never a settings write (§8/E44/E45).
       return allowWithPermissions([{ type: "setMode", mode: "default", destination: "session" }]);
     } catch (err) {
       const code = err instanceof RuntimeError ? err.code : "HOST_CONTEXT_INVALID";

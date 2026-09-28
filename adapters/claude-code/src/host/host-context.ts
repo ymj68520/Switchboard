@@ -79,7 +79,9 @@ export type HostContextLogicalTool =
   | "request_reopen"
   | "request_finalization"
   | "handoff"
-  | "report_execution_issue";
+  | "report_execution_issue"
+  | "takeover_run"
+  | "abort_run";
 
 export interface BuildHostContextInput {
   sessionId: string;

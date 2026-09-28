@@ -12,6 +12,10 @@ import { createObservationEvidenceMigration } from "../src/store/migrations/006-
 import { createEvidenceFreshnessMigration } from "../src/store/migrations/007-evidence-freshness-foundation.js";
 import { createSectionWorkflowMigration } from "../src/store/migrations/008-section-workflow.js";
 import { createSynthesisValidationMigration } from "../src/store/migrations/009-synthesis-validation-foundation.js";
+import { createFinalizationFinalPlanMigration } from "../src/store/migrations/010-finalization-final-plan.js";
+import { createExecutionHandoffMigration } from "../src/store/migrations/011-execution-handoff-foundation.js";
+import { createExecutionIssueSuccessorBaselineMigration } from "../src/store/migrations/012-execution-issue-successor-baseline.js";
+import { createRunControlAuthorizationsMigration } from "../src/store/migrations/013-run-control-authorizations.js";
 import type { StoreMigration } from "../src/store/migrations/index.js";
 import { runWrite } from "../src/store/transaction.js";
 import { initializePlanStore, inspectPlanStore } from "../src/store/sqlite-store.js";
@@ -138,6 +142,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
 	  { version: 10, name: "finalization-final-plan" },
 	  { version: 11, name: "execution-handoff-foundation" },
 			{ version: 12, name: "execution-issue-successor-baseline" },
+		{ version: 13, name: "run-control-authorizations" },
         ]);
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get())).toEqual({ n: 1 });
         expect(store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs WHERE run_id = ?").get(runId))).toEqual({ n: 1 });
@@ -152,7 +157,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-12-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-3-13-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -197,6 +202,10 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
             createEvidenceFreshnessMigration(),
             createSectionWorkflowMigration(),
             createSynthesisValidationMigration(),
+            createFinalizationFinalPlanMigration(),
+            createExecutionHandoffMigration(),
+            createExecutionIssueSuccessorBaselineMigration(),
+            createRunControlAuthorizationsMigration(),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED" });
@@ -219,7 +228,7 @@ describe("migration 3 → 4 plan-memory-foundation (E1/E2/E35/§51)", () => {
         raw.close();
       }
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(12);
+      expect(retry.getSchemaVersion()).toBe(13);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

@@ -26,6 +26,10 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
    - `started` / `resumed` — proceed with the returned run state.
    - `selection_required` — present the listed run metadata to the user and
      ask them to choose. Never attach to another session's run yourself.
+     If /phase-plan reports another session owns an active run:
+     present the exact candidate and ask the user which run they want.
+     Use `takeover_run` only after the user selects it; takeover itself
+     requires mandatory authorization.
 4. After entry, follow the returned stage and stay within Phase Plan's
    planning workflow until the run's state says otherwise.
 
@@ -74,6 +78,9 @@ You are entering Phase Plan because the user explicitly invoked `/phase-plan`.
   entry creates a successor PlanningRun from the immutable FinalPlan
   baseline (`started_successor`). Never reactivate the completed run; rework
   only the reopened (needs_review) scope — inherited sections stay approved.
+- If the user explicitly asks to terminate the current Phase Plan:
+  call `abort_run`. Abort is terminal, preserves history, and never
+  starts Build.
 - After a resume or compaction, rely on the injected Phase Plan Recovery
   Capsule (planning) or the injected Phase Plan Execution Contract (Build)
   for authoritative state. If exact artifact detail is needed, call

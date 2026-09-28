@@ -326,6 +326,23 @@ const SCHEMA_V12_INDEXES = [
   "idx_planning_run_baseline_scopes_state",
 ] as const;
 
+/** Run-control authorization table required at schema v13 (Phase 16 §4). */
+const SCHEMA_V13_TABLES = [
+  "run_control_authorizations",
+] as const;
+
+/** Immutability triggers required at schema v13: the durable control
+ * authorization is append-only history (§5 — NO UPDATE, NO DELETE). */
+const SCHEMA_V13_TRIGGERS = [
+  "run_control_authorizations_no_update",
+  "run_control_authorizations_no_delete",
+] as const;
+
+/** Constraint index backing the v13 per-run control lookups. */
+const SCHEMA_V13_INDEXES = [
+  "idx_run_control_authorizations_run",
+] as const;
+
 function tableNames(db: StoreConnection | StoreTx): Set<string> {
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -1351,6 +1368,112 @@ function validateSchemaV12(db: StoreConnection | StoreTx, problems: string[]): v
 }
 
 /**
+ * Structural + data checks for schema v13 (Phase 16 §51): the control
+ * authorization table, immutability triggers, and lookup index exist; every
+ * authorization names an existing run of the SAME workspace; the operation
+ * vocabulary is exact; a takeover/abort lineage shows resulting binding
+ * generation = expected + 1 (the only legal ownership step, §16); an abort's
+ * resulting run revision refers to the same run and is one it actually
+ * reached; and the idempotency/proof identities are unique. Bounded LIMIT-1
+ * probes only — store open NEVER replays binding history (§51).
+ */
+function validateSchemaV13(db: StoreConnection | StoreTx, problems: string[]): void {
+  const objectNames = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','trigger','index')").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const table of SCHEMA_V13_TABLES) {
+    if (!objectNames.has(table)) {
+      problems.push(`${table} table missing for schema version >= 13`);
+    }
+  }
+  for (const trigger of SCHEMA_V13_TRIGGERS) {
+    if (!objectNames.has(trigger)) {
+      problems.push(`constraint trigger ${trigger} missing for schema version >= 13`);
+    }
+  }
+  for (const index of SCHEMA_V13_INDEXES) {
+    if (!objectNames.has(index)) {
+      problems.push(`constraint index ${index} missing for schema version >= 13`);
+    }
+  }
+  if (SCHEMA_V13_TABLES.some((table) => !objectNames.has(table))) {
+    return;
+  }
+  if (!objectNames.has("planning_runs")) {
+    return;
+  }
+  // An authorization must name an existing run of the same workspace (§51).
+  const controlRunDrift = db
+    .prepare(
+      "SELECT c.control_id AS controlId FROM run_control_authorizations c "
+      + "LEFT JOIN planning_runs r ON r.run_id = c.run_id "
+      + "WHERE r.run_id IS NULL OR r.workspace_id != c.workspace_id LIMIT 1",
+    )
+    .get() as { controlId?: string } | undefined;
+  if (controlRunDrift !== undefined) {
+    problems.push(
+      `run control authorization '${controlRunDrift.controlId}' names a missing run or a foreign workspace`,
+    );
+  }
+  // Operation vocabulary is CHECK-enforced; re-derive from data anyway (§51).
+  const badOperations = db
+    .prepare("SELECT count(*) AS n FROM run_control_authorizations WHERE operation NOT IN ('takeover', 'abort')")
+    .get() as { n: number } | undefined;
+  if ((badOperations?.n ?? 0) > 0) {
+    problems.push("run_control_authorizations contains unknown operation values");
+  }
+  // The only legal ownership lineage: resulting generation = expected + 1 (§16).
+  const generationDrift = db
+    .prepare(
+      "SELECT control_id AS controlId FROM run_control_authorizations "
+      + "WHERE resulting_binding_generation IS NULL "
+      + "OR resulting_binding_generation != expected_binding_generation + 1 LIMIT 1",
+    )
+    .get() as { controlId?: string } | undefined;
+  if (generationDrift !== undefined) {
+    problems.push(
+      `run control authorization '${generationDrift.controlId}' does not advance the binding generation by exactly one`,
+    );
+  }
+  // An abort's resulting run revision must refer to the same run and be a
+  // revision that run actually reached (§51).
+  const abortRevisionDrift = db
+    .prepare(
+      "SELECT c.control_id AS controlId FROM run_control_authorizations c "
+      + "JOIN planning_runs r ON r.run_id = c.run_id "
+      + "WHERE c.operation = 'abort' AND (c.resulting_run_revision IS NULL OR c.resulting_run_revision > r.revision) LIMIT 1",
+    )
+    .get() as { controlId?: string } | undefined;
+  if (abortRevisionDrift !== undefined) {
+    problems.push(
+      `abort authorization '${abortRevisionDrift.controlId}' names a resulting run revision the run never reached`,
+    );
+  }
+  // The idempotency/proof identities are UNIQUE-enforced; probe anyway so a
+  // hand-mangled store fails closed (§51).
+  const duplicateOperation = db
+    .prepare(
+      "SELECT operation_id AS operationId FROM run_control_authorizations GROUP BY operation_id HAVING count(*) > 1 LIMIT 1",
+    )
+    .get() as { operationId?: string } | undefined;
+  if (duplicateOperation !== undefined) {
+    problems.push(`run control operation id '${duplicateOperation.operationId}' is not unique`);
+  }
+  const duplicateRequest = db
+    .prepare(
+      "SELECT authorization_request_id AS requestId FROM run_control_authorizations GROUP BY authorization_request_id HAVING count(*) > 1 LIMIT 1",
+    )
+    .get() as { requestId?: string } | undefined;
+  if (duplicateRequest !== undefined) {
+    problems.push(`run control authorization request id '${duplicateRequest.requestId}' is not unique`);
+  }
+}
+
+/**
  * Validate full schema state. For version 0 the store may legitimately have
  * no tables at all (fresh or legacy pre-store database); for version N >= 1
  * the migration history must contain exactly rows 1..N and store_metadata
@@ -1416,6 +1539,9 @@ export function inspectSchemaState(db: StoreConnection | StoreTx): SchemaState {
   }
   if (version >= 12) {
     validateSchemaV12(db, problems);
+  }
+  if (version >= 13) {
+    validateSchemaV13(db, problems);
   }
 
   return { version, history, consistent: problems.length === 0, problems };

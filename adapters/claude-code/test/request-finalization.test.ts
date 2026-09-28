@@ -204,8 +204,8 @@ describe("request_finalization (§26–§29/§98)", () => {
     expect(Object.keys(tool.inputSchema.properties as Record<string, unknown>).sort()).toEqual(["_hostContext"]);
   });
 
-  it("request_finalization is the 14th tool (§87)", () => {
-    expect(PHASE_PLAN_TOOLS).toHaveLength(16);
+  it("request_finalization is a registered tool (§87); Phase 16 completes the 18-tool surface", () => {
+    expect(PHASE_PLAN_TOOLS).toHaveLength(18);
   });
 
   it("the model can never prepare a final_plan proposal (§38/§97/E30)", async () => {

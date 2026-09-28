@@ -1,7 +1,8 @@
 /**
- * Phase 13 MCP tool surface (Phase 12 §95 + Phase 13 §87).
+ * Phase 16 MCP tool surface (Phase 16 §48 — the frozen v0.1 logical surface
+ * completed; earlier phases §87/§95).
  *
- * Exactly fourteen tools — the Phase 12 set plus request_finalization:
+ * The surface, in registration order:
  *   start_or_resume  (entry, requires a signed EntryIntent from /phase-plan)
  *   get_state        (read-only, session-scoped; final-stage FinalPlan +
  *                     handoff authorization projection, §61)
@@ -24,6 +25,17 @@
  *                     §59–§67/§65)
  *   request_finalization (main-agent deterministic FinalizationGate + frozen
  *                     FinalPlanCandidate + final Proposal, Phase 13 §26–§29)
+ *   handoff         (sole Plan → Build delivery of the approved FinalPlan,
+ *                     Phase 14)
+ *   report_execution_issue (Build's sole defect report against the delivered
+ *                     contract, Phase 15 §12)
+ *   takeover_run    (explicit human-authorized ownership transfer of another
+ *                     session's ACTIVE run, G → G+1, Phase 16 §8–§26)
+ *   abort_run       (explicit human-authorized terminal abort of the current
+ *                     session's active run; history preserved, never Build,
+ *                     Phase 16 §27–§42)
+ *
+ * Exactly eighteen tools — the frozen v0.1 logical surface (Phase 16 §48).
  *
  * Authority model: every handler verifies the hook-signed HostContext first
  * (signature → tool binding → business-input hash). The MCP process's own
@@ -71,7 +83,9 @@ import {
 } from "../core/execution-issue.js";
 import { getExecutionHandoffInTx, getExecutionHandoffStateInTx, findAttachedExecutionBindingForSessionInTx } from "../store/execution.js";
 import { assertExecutionHostContextForTool, parseSignedHostContext, type ExecutionHostContextV1 } from "../host/execution-context.js";
-import { assertWritableBindingInTx } from "../store/session-bindings.js";
+import { assertWritableBindingInTx, getBinding } from "../store/session-bindings.js";
+import { createRunControlService } from "../application/run-control-service.js";
+import { runControlRequestHash } from "../store/run-control.js";
 import {
   getLatestSynthesisInputInTx,
   getSynthesisManifestByInputInTx,
@@ -557,6 +571,49 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "takeover_run",
+    description:
+      "Take over an active PlanningRun owned by another (lost/other) session in this workspace, after the user explicitly "
+      + "selects the exact run from selection_required. Ownership moves to this session with binding generation G → G+1 and "
+      + "the previous owner is fenced immediately — even while still alive (no liveness checks exist). Control-plane only: "
+      + "the run's revision, stage, HEAD, Plan Memory, Proposals, and Evidence are untouched and no new run is created. "
+      + "This tool always requires explicit human approval and cannot be pre-authorized.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "The exact active run id from selection_required (plan_…)." },
+        expected_binding_generation: {
+          type: "integer",
+          minimum: 1,
+          description: "The binding generation reported in selection_required; a stale-precondition fence, never authority.",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["run_id", "expected_binding_generation", "_hostContext"],
+      additionalProperties: false,
+    },
+    _meta: REQUIRES_USER_INTERACTION_META,
+  },
+  {
+    name: "abort_run",
+    description:
+      "Terminate the CURRENT session's active PlanningRun at the user's explicit request. The run becomes terminal (aborted): "
+      + "the run revision advances exactly once, the planning binding detaches, every Proposal/Approval/Commit/Memory/Evidence "
+      + "is preserved as immutable history, and NO Build authority is created (an approved FinalPlan stays unused history). "
+      + "The session leaves Plan Mode; a later /phase-plan starts a NEW ordinary run. This tool always requires explicit human "
+      + "approval and cannot be pre-authorized.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reason: { type: "string", description: "Optional audit note; never affects legality." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+    _meta: REQUIRES_USER_INTERACTION_META,
+  },
 ];
 
 function inputInvalid(message: string, cause?: string): RuntimeError {
@@ -763,14 +820,32 @@ export function handleStartOrResume(ctx: PhasePlanToolContext, rawArgs: Record<s
 
   // Case D — auto never guesses among other sessions' runs.
   if (otherSessionRuns.length > 0) {
+    // Phase 16 §13 — safe selection metadata: the exact run identity plus the
+    // facts the user needs to choose (goal, binding epoch, HEAD summary).
+    // NEVER another session's session id, host-context data, or plugin paths.
+    const candidates = otherSessionRuns.map((run) => {
+      const binding = getBinding(ctx.store, run.runId);
+      const head = getHeadCommitRecord(ctx.store, run.runId);
+      return {
+        ...selectableRunView(run),
+        goal: run.goal,
+        binding: binding === null ? null : bindingView(binding),
+        head:
+          head === null
+            ? null
+            : { commit_id: head.commitId, snapshot_id: head.resultingSnapshotId },
+      };
+    });
     return {
       status: "selection_required",
       code: "RUN_SELECTION_REQUIRED",
-      runs: otherSessionRuns.map(selectableRunView),
+      runs: candidates,
       takeover_required: true,
       message:
         "This workspace has active planning runs owned by other sessions. Phase Plan never attaches to them automatically; "
-        + "takeover is a separate human-authorized operation (TAKEOVER_REQUIRED), or pass action=start_new with a goal to begin a new run.",
+        + "present the candidates to the user, and after they select one call phase_plan.takeover_run with the exact "
+        + "run_id and expected_binding_generation (takeover requires explicit user authorization), or pass action=start_new "
+        + "with a goal to begin a new run.",
     };
   }
 
@@ -986,6 +1061,17 @@ export function handleGetContext(ctx: PhasePlanToolContext, rawArgs: Record<stri
     return executionBuildContext(ctx, exec);
   }
   const envelope = assertHostContextForTool(ctx.secret, token, { tool: "get_context", businessInput: rawArgs });
+
+  // Phase 14 §59 / Phase 16 §66 — the Execution Contract projection exists
+  // ONLY under the signed execution authority of a delivered handoff;
+  // planning authority — including after an explicit abort — never reaches
+  // Build context (abort is not a handoff).
+  if (detail === "build") {
+    throw domainError(
+      "EXECUTION_CONTEXT_NOT_AVAILABLE",
+      'detail="build" requires the execution authority of a delivered handoff; planning authority never reaches Build context',
+    );
+  }
 
   const preferred = resolveCurrentRun(ctx, envelope.sessionId, envelope.workspaceId);
   if (preferred === null || preferred.run === null) {
@@ -2375,6 +2461,132 @@ export function handleReportExecutionIssue(ctx: PhasePlanToolContext, rawArgs: R
 }
 
 // ---------------------------------------------------------------------------
+// takeover_run / abort_run (Phase 16 §8–§26/§27–§42) — the 17th/18th tools:
+// explicit human-authorized control-plane operations (never design facts)
+// ---------------------------------------------------------------------------
+
+function controlRequestHashOf(
+  operation: Parameters<typeof runControlRequestHash>[0]["operation"],
+  args: { runId: string; workspaceId: string; expectedBindingGeneration: number },
+): string {
+  return runControlRequestHash({
+    operation,
+    runId: args.runId,
+    workspaceId: args.workspaceId,
+    expectedBindingGeneration: args.expectedBindingGeneration,
+  });
+}
+
+/** Main-session attestation check shared by both control tools (§46/§47). */
+function assertMainSessionControl(envelope: { version: number; agent?: unknown }, tool: string): void {
+  if (envelope.version === 2 && envelope.agent !== undefined) {
+    throw domainError(
+      "VALIDATOR_MUTATION_FORBIDDEN",
+      `${tool} is a main-session capability; subagents (including the validator) can never take over or abort a PlanningRun`,
+    );
+  }
+}
+
+export function handleTakeoverRun(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  // §12 — the model supplies ONLY run_id + expected_binding_generation. No
+  // workspace/session/force/owner_is_dead/new_generation field exists to accept.
+  assertExactBusinessFields(rawArgs, ["run_id", "expected_binding_generation"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "takeover_run", businessInput: rawArgs });
+  assertMainSessionControl(envelope, "takeover_run");
+
+  if (typeof rawArgs.run_id !== "string" || rawArgs.run_id.trim() === "") {
+    throw inputInvalid("run_id must be a non-empty string");
+  }
+  if (
+    typeof rawArgs.expected_binding_generation !== "number"
+    || !Number.isInteger(rawArgs.expected_binding_generation)
+    || rawArgs.expected_binding_generation < 1
+  ) {
+    throw inputInvalid("expected_binding_generation must be a positive integer");
+  }
+
+  const workspace = getWorkspaceById(ctx.store, envelope.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
+  }
+
+  const service = createRunControlService(ctx.store, ctx.clock);
+  const result = service.takeoverRun({
+    runId: rawArgs.run_id,
+    workspaceId: envelope.workspaceId,
+    callerSessionId: envelope.sessionId,
+    expectedBindingGeneration: rawArgs.expected_binding_generation,
+    authorization: {
+      authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
+      operationId: `takeover:${envelope.toolUseId}`,
+      requestHash: controlRequestHashOf("takeover", {
+        runId: rawArgs.run_id,
+        workspaceId: envelope.workspaceId,
+        expectedBindingGeneration: rawArgs.expected_binding_generation,
+      }),
+    },
+  });
+  // §4/§13 — session identities stay in the durable record, never in the
+  // model-visible response.
+  return {
+    status: "taken_over",
+    idempotent: result.idempotent,
+    control_id: result.control.controlId,
+    run: runView(result.run),
+    binding: bindingView(result.binding),
+    next:
+      "Ownership transferred (binding generation advanced by exactly one); the previous owner is fenced immediately. "
+      + "Continue planning this exact run: the stage, HEAD, awaiting proposal, and active section carried over unchanged.",
+  };
+}
+
+export function handleAbortRun(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  // §27 — zero-to-one business fields: at most an audit-only reason.
+  assertExactBusinessFields(rawArgs, ["reason"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "abort_run", businessInput: rawArgs });
+  assertMainSessionControl(envelope, "abort_run");
+
+  if (rawArgs.reason !== undefined && (typeof rawArgs.reason !== "string" || rawArgs.reason.trim() === "")) {
+    throw inputInvalid("reason must be a non-empty string when present");
+  }
+
+  const workspace = getWorkspaceById(ctx.store, envelope.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
+  }
+
+  const service = createRunControlService(ctx.store, ctx.clock);
+  const result = service.abortRun({
+    workspaceId: envelope.workspaceId,
+    callerSessionId: envelope.sessionId,
+    bindingGeneration: envelope.bindingGeneration as number,
+    reason: typeof rawArgs.reason === "string" ? rawArgs.reason : undefined,
+    authorization: {
+      authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
+      operationId: `abort:${envelope.toolUseId}`,
+      requestHash: runControlRequestHash({
+        operation: "abort",
+        runId: envelope.runId as string,
+        workspaceId: envelope.workspaceId,
+        expectedBindingGeneration: envelope.bindingGeneration as number,
+      }),
+    },
+  });
+  return {
+    status: "aborted",
+    idempotent: result.idempotent,
+    control_id: result.control.controlId,
+    run: runView(result.run),
+    binding: bindingView(result.binding),
+    next:
+      "The PlanningRun is terminal (aborted); the session has left Plan Mode. All planning history is preserved and no Build "
+      + "authority exists. A later /phase-plan starts a NEW ordinary PlanningRun — the aborted run is never resumed or reused.",
+  };
+}
+
+// ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
   switch (name) {
@@ -2410,6 +2622,10 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleHandoff(ctx, rawArgs);
     case "report_execution_issue":
       return handleReportExecutionIssue(ctx, rawArgs);
+    case "takeover_run":
+      return handleTakeoverRun(ctx, rawArgs);
+    case "abort_run":
+      return handleAbortRun(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

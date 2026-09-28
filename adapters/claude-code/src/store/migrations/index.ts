@@ -17,6 +17,7 @@ import { createSynthesisValidationMigration } from "./009-synthesis-validation-f
 import { createFinalizationFinalPlanMigration } from "./010-finalization-final-plan.js";
 import { createExecutionHandoffMigration } from "./011-execution-handoff-foundation.js";
 import { createExecutionIssueSuccessorBaselineMigration } from "./012-execution-issue-successor-baseline.js";
+import { createRunControlAuthorizationsMigration } from "./013-run-control-authorizations.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -77,7 +78,8 @@ export interface ProductionMigrationDeps {
  * `7→8 section-workflow`,
  * `8→9 synthesis-validation-foundation`,
  * `9→10 finalization-final-plan`, `10→11 execution-handoff-foundation`,
- * `11→12 execution-issue-successor-baseline`.
+ * `11→12 execution-issue-successor-baseline`,
+ * `12→13 run-control-authorizations`.
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
   return [
@@ -93,5 +95,6 @@ export function createProductionMigrations(deps: ProductionMigrationDeps): Store
     createFinalizationFinalPlanMigration(),
     createExecutionHandoffMigration(),
     createExecutionIssueSuccessorBaselineMigration(),
+    createRunControlAuthorizationsMigration(),
   ];
 }

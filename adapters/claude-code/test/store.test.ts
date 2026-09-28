@@ -32,7 +32,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
       try {
         expect(store.getSchemaVersion()).toBe(SUPPORTED_SCHEMA_VERSION);
         const metadata = store.getStoreMetadata();
-        expect(metadata.schemaVersion).toBe(12);
+        expect(metadata.schemaVersion).toBe(13);
         expect(metadata.storeId).toBe("store-uuid-1");
         expect(metadata.protocolVersion).toBe(1);
         expect(metadata.createdAt).toBe("2026-09-24T12:00:00.000Z");
@@ -76,6 +76,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
           "proposal_states",
           "proposals",
           "repositories",
+          "run_control_authorizations",
           "schema_migrations",
           "section_workflow_events",
           "section_workflow_states",
@@ -110,7 +111,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
       const reopened = openPlanStore({ pluginDataRoot: root });
       try {
         expect(reopened.getStoreMetadata().storeId).toBe(storeId);
-        expect(reopened.getSchemaVersion()).toBe(12);
+        expect(reopened.getSchemaVersion()).toBe(13);
       } finally {
         reopened.close();
       }
@@ -155,6 +156,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
 	  { version: 10, name: "finalization-final-plan" },
 	  { version: 11, name: "execution-handoff-foundation" },
 			{ version: 12, name: "execution-issue-successor-baseline" },
+		{ version: 13, name: "run-control-authorizations" },
         ]);
       } finally {
         second.close();
@@ -211,7 +213,7 @@ describe("existing schema-0 databases (E11/E12/E13)", () => {
       createSchema0Database(databasePath, "pre-migration-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(12);
+        expect(store.getSchemaVersion()).toBe(13);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -222,7 +224,7 @@ describe("existing schema-0 databases (E11/E12/E13)", () => {
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
       expect(backups[0]).toMatch(
-        /^phase-plan-pre-schema-0-12-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/,
+        /^phase-plan-pre-schema-0-13-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/,
       );
       // The published backup holds the pre-migration state (schema 0).
       const db = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
@@ -308,7 +310,7 @@ describe("schema fencing against newer stores (E17/E18)", () => {
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
         // Simulate a NEWER binary migrating the store under the old process.
-        rawSetSchemaVersion(storePathsFor(root).databasePath, 13);
+        rawSetSchemaVersion(storePathsFor(root).databasePath, 14);
 
         let writeRan = false;
         expect(() =>
@@ -327,7 +329,7 @@ describe("schema fencing against newer stores (E17/E18)", () => {
         expect(() => openPlanStore({ pluginDataRoot: root })).toThrowError(
           expect.objectContaining({ code: "STORE_SCHEMA_TOO_NEW" }),
         );
-        expect(rawSchemaVersion(storePathsFor(root).databasePath)).toBe(13);
+        expect(rawSchemaVersion(storePathsFor(root).databasePath)).toBe(14);
       } finally {
         store.close();
       }

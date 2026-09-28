@@ -143,7 +143,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       const { backupsDir } = ensureStoreDir(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(12);
+        expect(store.getSchemaVersion()).toBe(13);
         const read = (sql: string, ...params: unknown[]): unknown =>
           (store.withRead((tx) => tx.prepare(sql).get(...params)) as Record<string, unknown>);
         // Old rows survive EXACTLY (E2).
@@ -178,7 +178,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
         const history = store
           .withRead((tx) => tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
           .map((row) => row.version);
-        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        expect(history).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         expect(publishedBackups(backupsDir)).toHaveLength(1);
       } finally {
         store.close();
@@ -247,7 +247,7 @@ describe("migration 6 → 7 evidence-freshness-foundation (§9/§54, E1–E6)", 
       rewindToSchema6(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(12);
+        expect(store.getSchemaVersion()).toBe(13);
         const { assertWriteCompat } = await import("../src/store/transaction.js");
         let writeRan = false;
         expect(() =>

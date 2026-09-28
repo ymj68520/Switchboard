@@ -134,7 +134,22 @@ export function pendingBackups(backupsDir: string): string[] {
  * even on raw test connections) so legacy-store fixtures can present a genuine
  * pre-v12 world after a full initialization.
  */
+/**
+ * Phase 16 — surgically remove the schema-13 run-control objects so
+ * legacy-store fixtures can present a genuine pre-v13 world after a full
+ * initialization.
+ */
+export function dropSchema13Objects(raw: StoreConnection): void {
+  raw.exec("DROP TABLE IF EXISTS run_control_authorizations");
+  raw.exec("DROP TRIGGER IF EXISTS run_control_authorizations_no_update");
+  raw.exec("DROP TRIGGER IF EXISTS run_control_authorizations_no_delete");
+  raw.exec("DROP INDEX IF EXISTS idx_run_control_authorizations_run");
+}
+
 export function dropSchema12Objects(raw: StoreConnection): void {
+  // Phase 16: rewinding below 12 must also strip everything NEWER than 12,
+  // otherwise re-running migration 013 collides with leftover v13 objects.
+  dropSchema13Objects(raw);
   for (const table of [
     "planning_run_baseline_materializations",
     "planning_run_baseline_scopes",

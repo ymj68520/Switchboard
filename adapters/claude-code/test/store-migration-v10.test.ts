@@ -106,7 +106,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       const history = (rawConnection(databasePath, 5000));
       try {
         const rows = history.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
       } finally {
         history.close();
       }
@@ -174,7 +174,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
           migrations: [
             ...createProductionMigrations({ generateStoreId: clock.newId, nowIso: clock.nowIso }).filter((m) => m.to <= 10),
             failing,
-            ...createProductionMigrations({ generateStoreId: clock.newId, nowIso: clock.nowIso }).filter((m) => m.to === 12),
+            ...createProductionMigrations({ generateStoreId: clock.newId, nowIso: clock.nowIso }).filter((m) => m.to >= 12),
           ],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED", causeText: expect.stringContaining("injected 011 failure") });
@@ -188,7 +188,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       // A normal open migrates it forward again.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(12);
+        expect(store.getSchemaVersion()).toBe(13);
       } finally {
         store.close();
       }

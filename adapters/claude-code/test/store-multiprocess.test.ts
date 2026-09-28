@@ -102,7 +102,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // Every caller ends in a valid state reporting the SAME store identity.
       for (const result of results) {
         expect(result.ok, JSON.stringify(result)).toBe(true);
-        expect(result.schemaVersion).toBe(12);
+        expect(result.schemaVersion).toBe(13);
       }
       const storeIds = new Set(results.map((r) => r.storeId));
       expect(storeIds.size).toBe(1);
@@ -111,7 +111,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // sentinel preserved, integrity clean, exactly one published backup.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(12);
+        expect(store.getSchemaVersion()).toBe(13);
         expect(store.getStoreMetadata().storeId).toBe(results[0]?.storeId);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
@@ -129,6 +129,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
 	  { version: 10, name: "finalization-final-plan" },
 	  { version: 11, name: "execution-handoff-foundation" },
 			{ version: 12, name: "execution-issue-successor-baseline" },
+		{ version: 13, name: "run-control-authorizations" },
         ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
@@ -183,6 +184,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "proposal_states",
         "proposals",
         "repositories",
+        "run_control_authorizations",
         "schema_migrations",
         "section_workflow_events",
         "section_workflow_states",
@@ -211,13 +213,13 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 13);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, 14);
 
       const worker = await bundleWorker(bundledDir);
       const result = await runWorker(worker, root, 2000);
       expect(result).toMatchObject({ ok: false, code: "STORE_SCHEMA_TOO_NEW" });
       // Untouched.
-      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(13);
+      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(14);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });

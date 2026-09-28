@@ -70,8 +70,17 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
           "request_finalization",
       "handoff",
           "report_execution_issue",
+          "takeover_run",
+          "abort_run",
         ]);
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
+          "anthropic/requiresUserInteraction": true,
+        });
+        // Phase 16 §2 — both control tools always require explicit human approval.
+        expect(tools.find((tool) => tool.name === "takeover_run")?._meta).toEqual({
+          "anthropic/requiresUserInteraction": true,
+        });
+        expect(tools.find((tool) => tool.name === "abort_run")?._meta).toEqual({
           "anthropic/requiresUserInteraction": true,
         });
         expect(result.stderr).toContain("[phase-plan]");
@@ -106,9 +115,9 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       const { databasePath } = storePathsFor(pluginDataRoot);
       await fs.mkdir(path.dirname(databasePath), { recursive: true });
       await fs.writeFile(databasePath, "");
-      // Leave a schema-2 marker via raw connection (test-only manipulation).
+      // Leave a future-schema marker via raw connection (test-only manipulation).
       const raw = rawConnection(databasePath, 500);
-      raw.exec("PRAGMA user_version = 13");
+      raw.exec("PRAGMA user_version = 14");
       raw.close();
 
       const result = await runMcpSmoke(process.execPath, BUNDLE, {
@@ -122,7 +131,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       expect(result.stderr).toContain("STORE_SCHEMA_TOO_NEW");
       expect(result.stdoutLines).toEqual([]);
       // Untouched: still the too-new marker, never downgraded.
-      expect(rawConnectionQueried(databasePath)).toBe(13);
+      expect(rawConnectionQueried(databasePath)).toBe(14);
     } finally {
       removeTempPluginDataRoot(pluginDataRoot);
     }

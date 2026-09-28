@@ -110,6 +110,8 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
       "request_finalization",
       "handoff",
       "report_execution_issue",
+      "takeover_run",
+      "abort_run",
     ]);
     const approve = PHASE_PLAN_TOOLS.find((tool) => tool.name === "approve_proposal")!;
     expect(approve._meta).toBe(REQUIRES_USER_INTERACTION_META);
@@ -122,9 +124,9 @@ describe("tools/list metadata (E27/E37/E38; Phase 9 §58 seven-tool surface)", (
     );
     // no Phase-12+ surfaces and no raw state setters (Phase 11 §74)
     const joinedTools = PHASE_PLAN_TOOLS.map((tool) => tool.name).join(",");
-    // Phase 15 — report_execution_issue is now the 16th surface; takeover/abort
-    // stay deferred to the operational-control phase (Phase 15 §87).
-    for (const banned of ["takeover_run", "abort_run", "set_section_status", "set_active_work"]) {
+    // Phase 16 — takeover_run/abort_run complete the frozen v0.1 surface;
+    // raw state setters remain banned forever.
+    for (const banned of ["set_section_status", "set_active_work"]) {
       expect(joinedTools).not.toContain(banned);
     }
   });
@@ -564,7 +566,7 @@ describe("schema stays frozen through the whole Phase 7 flow (E45; Phase 9 §61:
       const raw = rawConnection(storePathsFor(h.root).databasePath);
       try {
         const row = raw.prepare("PRAGMA user_version").get() as Record<string, unknown>;
-        expect(Object.values(row)[0]).toBe(12);
+        expect(Object.values(row)[0]).toBe(13);
       } finally {
         raw.close();
       }

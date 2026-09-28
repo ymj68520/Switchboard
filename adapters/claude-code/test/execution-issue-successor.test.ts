@@ -193,13 +193,13 @@ describe("migration 11 → 12 execution-issue-successor-baseline (§5, E1/E67/E6
     expect(ctx.store.withRead((tx) => getFinalPlanInTx(tx, f.runId))!.finalPlanHash).toBe(f.finalPlanHash);
     ctx.store.withRead((tx) => {
       const history = tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-      expect(history.map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+      expect(history.map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
       for (const table of ["execution_issues", "planning_run_baselines", "execution_issue_adoptions", "planning_run_baseline_materializations"]) {
         const row = tx.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
         expect(row.n).toBe(0);
       }
     });
-    expect(SUPPORTED_SCHEMA_VERSION).toBe(12);
+    expect(SUPPORTED_SCHEMA_VERSION).toBe(13);
   });
 
   it("no execution progress tables ever exist (§6, E63)", async () => {
@@ -354,8 +354,8 @@ describe("ExecutionIssue identity, exact refs, immutability (§7–§11, E2–E7
 // ---------------------------------------------------------------------------
 
 describe("report_execution_issue MCP surface (§12–§14, E8, E66)", () => {
-  it("is exactly the 16th tool and carries no approval meta (§87/§14, E66)", () => {
-    expect(PHASE_PLAN_TOOLS).toHaveLength(16);
+  it("is a registered tool, carries no approval meta, and is followed by the two Phase 16 control tools (§87/§14/E66, Phase 16 §48)", () => {
+    expect(PHASE_PLAN_TOOLS).toHaveLength(18);
     const tool = PHASE_PLAN_TOOLS[15]!;
     expect(tool.name).toBe("report_execution_issue");
     expect(tool._meta).toBeUndefined();
