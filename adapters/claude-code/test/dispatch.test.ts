@@ -4,6 +4,9 @@ import { RuntimeError, type RuntimeErrorCode } from "../src/runtime/errors.js";
 import { EXIT_CODES, exitCodeForError } from "../src/runtime/exit-codes.js";
 import { createLogger } from "../src/runtime/logger.js";
 import { executeCommand, parseRuntimeCommand, RESERVED_HOOK_EVENTS, usage } from "../src/runtime/dispatch.js";
+import { RUNTIME_VERSION } from "../src/runtime/version.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
+import { REQUIRED_NODE_VERSION } from "../src/runtime/node-version.js";
 import { HOOK_EVENTS } from "../src/hooks/run.js";
 import type { DoctorReport } from "../src/doctor/report.js";
 
@@ -269,7 +272,7 @@ function makeReport(overrides: {
   const pluginDataStatus = overrides.pluginDataStatus ?? "PASS";
   return {
     schema: "phase-plan.doctor-report/1",
-    runtime: { name: "phase-plan", version: "0.1.1" },
+    runtime: { name: "phase-plan", version: RUNTIME_VERSION },
     overall: nodeStatus === "PASS" ? "READY" : "NOT_READY",
     hostIntegration: claudeCliStatus === "PASS" ? "ACTIVE" : "NOT_READY",
     checks: {
@@ -335,3 +338,29 @@ function makeReport(overrides: {
     },
   };
 }
+
+describe("version command (Phase 18 §37)", () => {
+  it("parses --version, -v, and the version positional from any position", () => {
+    expect(parseRuntimeCommand(["--version"])).toEqual({ ok: true, command: { kind: "version" } });
+    expect(parseRuntimeCommand(["-v"])).toEqual({ ok: true, command: { kind: "version" } });
+    expect(parseRuntimeCommand(["version"])).toEqual({ ok: true, command: { kind: "version" } });
+    // Release identity wins over any other command (Unix convention).
+    expect(parseRuntimeCommand(["doctor", "--version"])).toEqual({ ok: true, command: { kind: "version" } });
+    expect(parseRuntimeCommand(["--version", "mcp"])).toEqual({ ok: true, command: { kind: "version" } });
+  });
+
+  it("prints the release identity banner and nothing else", async () => {
+    const lines: string[] = [];
+    const result = await executeCommand({ kind: "version" }, { out: (text) => lines.push(text) });
+    expect(result.exitCode).toBe(EXIT_CODES.success);
+    expect(result.longRunning).toBe(false);
+    const banner = (lines.at(-1) ?? "").split("\n");
+    expect(banner[0]).toBe(`phase-plan ${RUNTIME_VERSION}`);
+    expect(banner[1]).toBe(`schema support ${SUPPORTED_SCHEMA_VERSION}`);
+    expect(banner[2]).toBe(`required Node >=${REQUIRED_NODE_VERSION}`);
+  });
+
+  it("documents the version command in usage", () => {
+    expect(usage()).toContain("--version");
+  });
+});

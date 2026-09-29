@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { openDatabase } from "../src/store/connection.js";
+import { RUNTIME_VERSION } from "../src/runtime/version.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import {
   initializePlanStore,
@@ -195,7 +196,7 @@ describe("store lifecycle (E5/E7/E20)", () => {
           tx.prepare("SELECT applied_at AS appliedAt, runtime_version AS runtimeVersion FROM schema_migrations").all(),
         ) as { appliedAt: string; runtimeVersion: string }[];
         expect(rows[0]?.appliedAt).toBe("2000-01-02T03:04:05.000Z");
-        expect(rows[0]?.runtimeVersion).toBe("0.1.1");
+        expect(rows[0]?.runtimeVersion).toBe(RUNTIME_VERSION);
       } finally {
         store.close();
       }

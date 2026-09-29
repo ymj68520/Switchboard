@@ -282,6 +282,16 @@ export function checkPlanStore(inspection: PlanStoreInspection | null): CheckOut
         message: `STORE ABSENT — initialized on first MCP startup${versionSuffix}`,
         detail: { ...inspection },
       };
+    case "unavailable":
+      return {
+        id: "claude.plan_store",
+        label: "Plan Store",
+        tier: "host",
+        status: "UNKNOWN",
+        required: false,
+        message: `STORE INSPECTION UNAVAILABLE — ${(inspection.problems ?? []).join("; ") || "node:sqlite not loadable"}`,
+        detail: { ...inspection },
+      };
     case "too_old":
       return {
         id: "claude.plan_store",

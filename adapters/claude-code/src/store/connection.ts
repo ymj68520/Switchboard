@@ -13,10 +13,51 @@
  * Callers never construct DatabaseSync directly (frozen plan §41).
  */
 
-import { DatabaseSync, backup as sqliteBackup } from "node:sqlite";
+import { createRequire } from "node:module";
 
 import { STORE_BUSY_TIMEOUT_MS } from "./constants.js";
-import { storeError, toStoreError } from "./errors.js";
+import { storeError, toStoreError, RuntimeError } from "./errors.js";
+
+/**
+ * node:sqlite is resolved LAZILY (Phase 18 §14): the bundled artifact must
+ * load on any Node — including ones without node:sqlite — so `doctor` and
+ * `--version` can explain the problem instead of crashing with a module
+ * loader error. The builtin is captured synchronously here through
+ * createRequire (node builtins are requireable from ESM); a missing module
+ * is captured, not thrown, and every store entry re-fails closed with the
+ * stable SQLITE_UNAVAILABLE / UNSUPPORTED_NODE_VERSION codes.
+ */
+type SqliteBuiltin = typeof import("node:sqlite");
+
+const sqliteRequire = createRequire(import.meta.url);
+
+function captureSqliteBuiltin(): { module?: SqliteBuiltin; cause?: string } {
+  try {
+    return { module: sqliteRequire("node:sqlite") as SqliteBuiltin };
+  } catch (err) {
+    return {
+      cause: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    };
+  }
+}
+
+const captured = captureSqliteBuiltin();
+
+/** Stable failure when node:sqlite is not available on this Node build. */
+export function sqliteUnavailableCause(): string | undefined {
+  return captured.cause;
+}
+
+function requireSqliteBuiltin(): SqliteBuiltin {
+  if (captured.module === undefined) {
+    throw new RuntimeError(
+      "SQLITE_UNAVAILABLE",
+      "node:sqlite is unavailable on this Node build; Phase Plan requires Node >= 24.15.0",
+      { cause: captured.cause ?? "module not found" },
+    );
+  }
+  return captured.module;
+}
 
 export interface OpenDatabaseOptions {
   /** Open read-only: no WAL/journal mutation, header probe still enforced. */
@@ -27,9 +68,10 @@ export interface OpenDatabaseOptions {
 }
 
 /** Structural surface of an open SQLite connection used across the store. */
-export type StoreConnection = DatabaseSync;
+export type StoreConnection = InstanceType<SqliteBuiltin["DatabaseSync"]>;
 
 export function openDatabase(databasePath: string, options: OpenDatabaseOptions = {}): StoreConnection {
+  const { DatabaseSync } = requireSqliteBuiltin();
   const busyTimeoutMs = options.busyTimeoutMs ?? STORE_BUSY_TIMEOUT_MS;
   let db: StoreConnection;
   try {
@@ -119,16 +161,17 @@ export function readPragmaText(db: StoreConnection, pragma: string): string {
  * so the store can fail closed with a stable code instead of crashing.
  */
 export function sqliteBackupAvailable(): boolean {
-  return typeof sqliteBackup === "function";
+  return typeof requireSqliteBuiltin().backup === "function";
 }
 
 /** Typed accessor for the module-level backup(sourceDb, destination). */
 export function readBackupFn(): (sourceDb: StoreConnection, destination: string) => Promise<unknown> {
-  if (typeof sqliteBackup !== "function") {
+  const backup = requireSqliteBuiltin().backup;
+  if (typeof backup !== "function") {
     throw storeError(
       "STORE_BACKUP_FAILED",
       "node:sqlite backup() is unavailable on this Node build; refusing filesystem-copy fallback",
     );
   }
-  return sqliteBackup;
+  return backup;
 }

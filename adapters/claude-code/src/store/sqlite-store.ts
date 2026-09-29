@@ -277,7 +277,8 @@ export type PlanStoreInspectionStatus =
   | "ready"
   | "too_new"
   | "too_old"
-  | "invalid";
+  | "invalid"
+  | "unavailable";
 
 export interface PlanStoreInspection {
   status: PlanStoreInspectionStatus;

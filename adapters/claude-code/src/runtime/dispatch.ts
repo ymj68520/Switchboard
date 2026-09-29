@@ -12,13 +12,15 @@
 
 import { RuntimeError } from "./errors.js";
 import { EXIT_CODES, type ExitCode } from "./exit-codes.js";
-import { isNodeVersionSupported } from "./node-version.js";
+import { REQUIRED_NODE_VERSION, isNodeVersionSupported } from "./node-version.js";
+import { renderVersionBanner } from "./version.js";
 import { createLogger, resolveLogLevel, type Logger } from "./logger.js";
 import { runDoctor } from "../doctor/doctor.js";
 import { doctorExitCode, renderHumanReport, renderJsonReport } from "../doctor/report.js";
 import { startMcpServer } from "../mcp/bootstrap.js";
 import { preflightPluginData } from "../claude/environment.js";
 import { initializePlanStore, type PlanStore, type PlanStoreOptions } from "../store/sqlite-store.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../store/constants.js";
 import { resolveStorePaths } from "../store/paths.js";
 import { loadHostSecret } from "../host/secret.js";
 import { CAPABILITY_PROOF_VERSION, writeCapabilityProofs, type CapabilityProofs } from "../host/capability-proofs.js";
@@ -38,6 +40,7 @@ export type RuntimeCommand =
   | { kind: "mcp" }
   | { kind: "hook"; event: string }
   | { kind: "record-proof"; hooksVerified: boolean; planModeVerified: boolean; claudeVersion?: string }
+  | { kind: "version" }
   | { kind: "help" };
 
 export type ParseResult =
@@ -50,6 +53,7 @@ export function usage(): string {
     "  node phase-plan-runtime.mjs doctor [--json]   Run runtime/host preflight checks",
     "  node phase-plan-runtime.mjs mcp               Start the stdio MCP server",
     `  node phase-plan-runtime.mjs hook <event>      Hook dispatch (${HOOK_EVENTS.join(", ")})`,
+    "  node phase-plan-runtime.mjs --version         Print release identity (name, version, schema, Node floor)",
     "",
     "Environment:",
     "  PHASE_PLAN_LOG_LEVEL    debug|info|warn|error|silent (stderr diagnostics)",
@@ -64,22 +68,29 @@ export function parseRuntimeCommand(argv: readonly string[]): ParseResult {
     return {
       ok: false,
       error: new RuntimeError("INVALID_RUNTIME_COMMAND", "missing command", {
-        cause: "expected one of: doctor, mcp, hook <event>, help",
+        cause: "expected one of: doctor, mcp, hook <event>, version, help",
       }),
     };
   }
 
   const helpIndex = args.indexOf("--help") >= 0 ? args.indexOf("--help") : args.indexOf("-h");
+  const versionIndex = args.indexOf("--version") >= 0 ? args.indexOf("--version") : args.indexOf("-v");
   const positional: string[] = [];
   const flags: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--help" || arg === "-h") continue;
+    if (arg === "--version" || arg === "-v") continue;
     if (arg.startsWith("--") || (arg.startsWith("-") && arg.length > 1)) {
       flags.push(arg);
     } else {
       positional.push(arg);
     }
+  }
+  if (versionIndex >= 0) {
+    // Release identity wins over any other command (Unix convention), and it
+    // must answer on ANY Node — it reads no store and no filesystem.
+    return { ok: true, command: { kind: "version" } };
   }
   if (helpIndex >= 0) {
     if (positional.length === 0) {
@@ -94,7 +105,7 @@ export function parseRuntimeCommand(argv: readonly string[]): ParseResult {
     return {
       ok: false,
       error: new RuntimeError("INVALID_RUNTIME_COMMAND", "missing command", {
-        cause: "expected one of: doctor, mcp, hook <event>, help",
+        cause: "expected one of: doctor, mcp, hook <event>, version, help",
       }),
     };
   }
@@ -158,6 +169,8 @@ export function parseRuntimeCommand(argv: readonly string[]): ParseResult {
     }
     case "help":
       return { ok: true, command: { kind: "help" } };
+    case "version":
+      return { ok: true, command: { kind: "version" } };
     case "record-capability-proof": {
       const hooksVerified = flags.includes("--hooks-verified");
       const planModeVerified = flags.includes("--plan-mode-verified");
@@ -196,7 +209,7 @@ export function parseRuntimeCommand(argv: readonly string[]): ParseResult {
       return {
         ok: false,
         error: new RuntimeError("INVALID_RUNTIME_COMMAND", `unknown command: ${command}`, {
-          cause: "expected one of: doctor, mcp, hook <event>, help",
+          cause: "expected one of: doctor, mcp, hook <event>, version, help",
         }),
       };
   }
@@ -260,6 +273,12 @@ export async function executeCommand(
   switch (command.kind) {
     case "help":
       out(usage() + "\n");
+      return { exitCode: EXIT_CODES.success, longRunning: false };
+
+    case "version":
+      // Phase 18 §37 — release identity only: name, version, schema floor,
+      // Node floor. No plugin data, no paths, no environment facts.
+      out(renderVersionBanner(SUPPORTED_SCHEMA_VERSION, REQUIRED_NODE_VERSION) + "\n");
       return { exitCode: EXIT_CODES.success, longRunning: false };
 
     case "doctor": {

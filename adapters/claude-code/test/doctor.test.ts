@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { runDoctor, type DoctorDeps } from "../src/doctor/doctor.js";
+import { RUNTIME_VERSION } from "../src/runtime/version.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { doctorExitCode, renderHumanReport, renderJsonReport } from "../src/doctor/report.js";
 import {
   claudeVersionOutcome,
@@ -132,7 +134,9 @@ describe("doctor integration (injected probes)", () => {
   });
 
   it("fails with exit 3 when node:sqlite is unavailable", async () => {
+    const root = await makeTempDir("phase-plan-doctor-nosqlite-");
     const report = await runDoctor(baseDeps({
+      env: { CLAUDE_PLUGIN_DATA: root },
       probeSqlite: async () => ({
         available: false,
         steps: {
@@ -301,7 +305,7 @@ describe("doctor integration (injected probes)", () => {
     expect(first).toBe(second);
     const parsed = JSON.parse(first);
     expect(parsed.schema).toBe("phase-plan.doctor-report/1");
-    expect(parsed.runtime).toEqual({ name: "phase-plan", version: "0.1.1" });
+    expect(parsed.runtime).toEqual({ name: "phase-plan", version: RUNTIME_VERSION });
     expect(Object.keys(parsed.checks)).toEqual([
       "node",
       "sqlite",
@@ -348,5 +352,44 @@ describe("doctor integration (injected probes)", () => {
     }));
     expect(report.checks.sqlite.status).toBe("FAIL");
     expect(report.checks.sqlite.detail).toMatchObject({ failedStep: "module_load" });
+  });
+});
+
+describe("doctor store inspection under unavailable node:sqlite (Phase 18 §14)", () => {
+  it("reports the store as UNAVAILABLE instead of corrupt when sqlite cannot load", async () => {
+    const root = await makeTempDir("phase-plan-doctor-nosqlite-");
+    const report = await runDoctor(baseDeps({
+      env: { CLAUDE_PLUGIN_DATA: root },
+      probeSqlite: async () => ({
+        available: false,
+        steps: { module_load: "fail", open: "fail", create: "fail", insert: "fail", select: "fail", transaction: "fail", close: "fail" },
+        failedStep: "module_load",
+        cause: "SyntaxError: node:sqlite is not a module",
+      }),
+      inspectStore: () => {
+        throw new Error("openDatabase must not be reached when sqlite is unavailable");
+      },
+    }));
+    expect(report.checks.sqlite.status).toBe("FAIL");
+    expect(report.checks.planStore.status).toBe("UNKNOWN");
+    expect(report.checks.planStore.required).toBe(false);
+    expect(report.checks.planStore.message).toContain("STORE INSPECTION UNAVAILABLE");
+    // The actionable diagnosis is the node/sqlite checks; the store itself
+    // is never misreported as corrupt and overall readiness is NOT_READY.
+    expect(report.overall).toBe("NOT_READY");
+  });
+
+  it("still inspects the store normally when sqlite is available", async () => {
+    const root = await makeTempDir("phase-plan-doctor-store-ok-");
+    const report = await runDoctor(baseDeps({
+      env: { CLAUDE_PLUGIN_DATA: root },
+      inspectStore: () => ({
+        status: "ready",
+        schemaVersion: SUPPORTED_SCHEMA_VERSION,
+        supported: SUPPORTED_SCHEMA_VERSION,
+        databasePath: "C:/store/phase-plan.sqlite3",
+      }),
+    }));
+    expect(report.checks.planStore.status).toBe("PASS");
   });
 });

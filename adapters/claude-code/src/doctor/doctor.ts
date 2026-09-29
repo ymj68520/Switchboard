@@ -88,24 +88,39 @@ export async function runDoctor(deps: DoctorDeps = {}): Promise<DoctorReport> {
 
   // Read-only store inspection (never creates/migrates). Inspection errors
   // (corrupt file, unreadable header) surface as a failed check, not a crash.
+  // Phase 18 §14: on a Node build without node:sqlite the store cannot be
+  // opened at all — report the inspection as UNAVAILABLE (UNKNOWN, non-
+  // required) instead of misreporting a healthy store as corrupt; the
+  // actionable diagnosis lives in the node/sqlite checks above.
   let storeInspection: PlanStoreInspection | null = null;
   if (dataPreflight?.status === "ok") {
-    try {
-      storeInspection = deps.inspectStore
-        ? deps.inspectStore(dataPreflight.resolvedRoot)
-        : inspectPlanStore(dataPreflight.resolvedRoot);
-    } catch (err) {
-      const error = isRuntimeError(err)
-        ? err
-        : new RuntimeError("STORE_CORRUPT", "Plan Store inspection failed", {
-            cause: err instanceof Error ? err.message : String(err),
-          });
+    if (!sqliteResult.available) {
       storeInspection = {
-        status: error.code === "STORE_SCHEMA_TOO_NEW" ? "too_new" : "invalid",
+        status: "unavailable",
         supported: SUPPORTED_SCHEMA_VERSION,
         databasePath: "",
-        problems: [error.message],
+        problems: [
+          `node:sqlite not loadable${sqliteResult.cause ? ` (${sqliteResult.cause})` : ""} — store inspection skipped; see node/sqlite checks`,
+        ],
       };
+    } else {
+      try {
+        storeInspection = deps.inspectStore
+          ? deps.inspectStore(dataPreflight.resolvedRoot)
+          : inspectPlanStore(dataPreflight.resolvedRoot);
+      } catch (err) {
+        const error = isRuntimeError(err)
+          ? err
+          : new RuntimeError("STORE_CORRUPT", "Plan Store inspection failed", {
+              cause: err instanceof Error ? err.message : String(err),
+            });
+        storeInspection = {
+          status: error.code === "STORE_SCHEMA_TOO_NEW" ? "too_new" : "invalid",
+          supported: SUPPORTED_SCHEMA_VERSION,
+          databasePath: "",
+          problems: [error.message],
+        };
+      }
     }
   }
   const planStoreCheck = checkPlanStore(storeInspection);

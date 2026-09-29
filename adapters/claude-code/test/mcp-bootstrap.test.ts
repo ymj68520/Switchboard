@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { isNodeVersionSupported } from "../src/runtime/node-version.js";
+import { RUNTIME_VERSION } from "../src/runtime/version.js";
 import { runMcpSmoke, runtimeBundlePath } from "./helpers.js";
 import {
   makeTempPluginDataRoot,
@@ -44,7 +45,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         );
         expect(parsed).toHaveLength(2);
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
-          serverInfo: { name: "phase-plan", version: "0.1.1" },
+          serverInfo: { name: "phase-plan", version: RUNTIME_VERSION },
         });
         // Phase 13 (§87): fourteen tools — the Phase 12 set plus
         // request_finalization; approve_proposal keeps the flag.

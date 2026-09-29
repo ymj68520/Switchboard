@@ -19,6 +19,7 @@
     "smoke:opencode-handoff": "node scripts/opencode-handoff-smoke.mjs",
     "smoke:opencode-handoff-det": "node scripts/opencode-handoff-det-smoke.mjs",
     "smoke:opencode-validator": "node scripts/opencode-validator-live.mjs",
-    "smoke:opencode-context": "node scripts/opencode-context-smoke.mjs"
+    "smoke:opencode-context": "node scripts/opencode-context-smoke.mjs",
+    "release:claude": "node scripts/claude-release.mjs"
   }
 }
