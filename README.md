@@ -203,4 +203,8 @@ Provide a consistent Plan / Execute routing experience across all supported codi
 
 ## License
 
-License to be determined.
+The three released Switchboard adapters — Ultra Plan for OpenCode
+(`adapters/opencode`), Phase Plan for Claude Code (`adapters/claude-code`)
+and the Codex CLI Phase Model Switcher (`adapters/codex`) — are released
+under the MIT license (see the `LICENSE` file in each adapter directory).
+Repository-level licensing beyond these adapters is not established.
