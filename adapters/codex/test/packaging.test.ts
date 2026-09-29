@@ -63,7 +63,7 @@ describe("package metadata (Phase 6)", () => {
   it("has complete metadata (P6-E47)", () => {
     expect(pkg.name).toBe("@switchboard/codex");
     expect(pkg.private).toBe(true); // no accidental publish (§40)
-    expect(pkg.license).toBe("UNLICENSED"); // repo has no license file
+    expect(pkg.license).toBe("MIT"); // release licensing decision: adapter-scoped MIT, LICENSE file shipped
     expect(pkg.repository?.url).toContain("github.com/ymj68520/Switchboard");
     expect(typeof pkg.description).toBe("string");
   });

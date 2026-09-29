@@ -131,6 +131,13 @@ model.
   unmanaged (see semantics above). Note that on codex-cli 0.156.1 the
   `/model` dialog change is applied by the TUI at your next turn.
 - No transparent app-server recovery, no auto-update, no installer.
-- Validation was performed on Windows (see
-  `docs/codex cli/PRE_RELEASE_READINESS.md` in the repository); macOS and
-  Linux runtime validation is documented there as well.
+- Validation was performed on Windows and on Linux (WSL2, Ubuntu 24.04 —
+  including the POSIX process-cleanup release gate and the full live-probe
+  suite); see `docs/codex cli/PRE_RELEASE_READINESS.md` and
+  `docs/codex cli/WSL2-POSIX-VALIDATION.md` in the repository. macOS is
+  **not validated** and no macOS support is claimed.
+
+## License
+
+MIT — see the `LICENSE` file shipped with this package and the adapter
+source directory in the repository.

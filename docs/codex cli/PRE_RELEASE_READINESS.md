@@ -8,7 +8,7 @@ Status: **pre-alpha, locally installable — NOT publicly released.**
 | --- | --- |
 | Architecture | `codex-cli-phase-model-switcher-architecture-spec-v0.0.1.md` (frozen) |
 | Implementation line | `96d654c` (P1) → `0f5b4ab` (P2) → `992187d` (P3) → `923d5dc` (P4) → `8f7c4f8` (P5) → Phase 6 hardening |
-| Package | `@switchboard/codex` `0.0.1` (`private`, `license: UNLICENSED`, bin `phase-model`) |
+| Package | `@switchboard/codex` `0.0.1` (`private`, `license: MIT`, bin `phase-model`) |
 | Runtime dependencies | none (Node built-ins only; Node ≥ 22.4.0) |
 
 ## Tested environments
