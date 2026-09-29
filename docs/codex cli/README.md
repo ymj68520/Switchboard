@@ -12,3 +12,5 @@
 - **Pre-release readiness**: [PRE_RELEASE_READINESS.md](PRE_RELEASE_READINESS.md)
   — tested environments, test counts, live validation status, known
   limitations, release blockers for version 0.0.1.
+- **WSL2/POSIX validation**: [WSL2-POSIX-VALIDATION.md](WSL2-POSIX-VALIDATION.md)
+  — Ubuntu 24.04 live re-validation and the POSIX process-cleanup release gate.

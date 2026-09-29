@@ -10,7 +10,7 @@ Ultra Plan is **not** a model and **not** a router. It is a workflow layer that 
 
 ```text
 OpenCode CLI  1.18.32        (validated version — no other version is claimed)
-Node.js       24.21.0        (validated version; Node 24.x is the declared compatible family)
+Node.js       24.21.0        (validated version; the declared compatible family is >=24.21.0 <25)
 OS            Windows        (10.0.19044 validated; no macOS/Linux claim)
 ```
 
@@ -58,8 +58,8 @@ Model selection: the **planning model** is the OpenCode/session configured model
 ## Usage
 
 ```text
-/ultra-plan <goal>     start or resume the planning run for this session
-/ultra-plan            resume (never overwrites an existing goal)
+/ultra-plan <goal>     start a run with this goal; on resume, fills an EMPTY goal only — never overwrites
+/ultra-plan            start an unnamed run, or resume the existing run
 ```
 
 The run lives in your session. You progress it by talking to the planning agent; the harness moves the run through **discovery → architecture → detail → synthesis → final** and enforces what may happen at each stage.
@@ -121,7 +121,7 @@ Synthesis produces a frozen input, a provenance-bound manifest, an isolated-sess
 
 | Error | Meaning | What to do |
 |---|---|---|
-| `store_corrupt` | The durable store failed validation (invalid JSON, hash mismatch, broken reference, inconsistent conflict/provenance state). The store is never auto-repaired. | Restore your backup of `plan-store.json`; do not hand-edit. |
+| `store_corrupt` | The durable store failed validation (invalid JSON, hash mismatch, broken reference, inconsistent conflict/provenance state), or it was written by an OLDER plugin version (no downgrade migration exists). The store is never auto-repaired. | Restore your backup of `plan-store.json`; do not hand-edit. If the store is older than the plugin, reinstall the plugin version that wrote it. |
 | `store_busy` | Another writer holds the store lock (bounded 4 s wait exhausted). | Retry; after a killed process the lock self-heals within ~15 s. |
 | `store_version_unsupported` | The store was written by a NEWER plugin version. | Upgrade the plugin; the store is refused rather than misread. |
 | `context_budget_exceeded` | Required planning context exceeded the configured budget (`overflow=fail`), or rendered complete with a warning (default). | Raise `ULTRA_PLAN_CONTEXT_BUDGET_TOKENS`. |

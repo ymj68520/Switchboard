@@ -1,10 +1,10 @@
 # Phase Plan
 
 Persistent, approval-driven planning for Claude Code. Phase Plan runs a
-structured planning lifecycle — Discovery → Evidence → Architecture →
-Detail → Sections → Synthesis → Validator → Finalization → Execution
-handoff — inside your repository, with a durable store that survives
-sessions, crashes, and Claude Code restarts.
+structured planning lifecycle — Discovery → Architecture → Detail →
+Synthesis → Validation → Final approval → Execution handoff — inside your
+repository, with a durable store that survives sessions, crashes, and
+Claude Code restarts.
 
 Nothing enters the plan without a human approval: every design decision is
 frozen into an immutable proposal, shown to you in a dialog, and committed
@@ -85,9 +85,9 @@ auditable takeover path.
 ## A2 — abort UX
 
 `/phase-plan abort` (or asking the assistant to abort) requires an explicit
-human confirmation dialog and leaves an audit-recorded tombstone. Aborted
-runs are terminal: their history stays readable, but they can never be
-resumed or mutated. A follow-up plan starts a fresh run and may reference
+human confirmation dialog and records a terminal, fully auditable abort.
+Aborted runs are terminal: their history stays readable, but they can never
+be resumed or mutated. A follow-up plan starts a fresh run and may reference
 the aborted one.
 
 ## Plan Store location
@@ -97,13 +97,15 @@ All persistent state lives under the host-managed plugin data root
 
 ```
 store/phase-plan.sqlite3   durable plan store (SQLite, schema-versioned)
-store/backups/             automatic pre-migration backups
+backups/                   automatic pre-migration backups
 blobs/                     content-addressed observation payloads
+exports/                   generated plan projections
 runtime/host-context.key   per-install signing secret (created on first run)
-capability-proofs.json     recorded host capability probes
+runtime/capability-proofs.json   recorded host capability probes
 ```
 
-The store is created on the first MCP startup. Uninstalling the plugin
+The store is created on the first MCP startup or hook invocation, whichever
+runs first. Uninstalling the plugin
 leaves this data in place (removing the plugin does not delete your
 planning history); deleting the plugin data directory is the only way to
 reset it. Never edit or move store files while a session is running.

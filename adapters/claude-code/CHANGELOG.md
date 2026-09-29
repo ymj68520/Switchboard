@@ -17,8 +17,8 @@ First public release of Phase Plan v0.1 for Claude Code.
   schema-versioned SQLite store under the host-managed plugin data root,
   with automatic pre-migration backups and fail-closed corruption and
   downgrade handling.
-- **Approval-driven planning** — a full Discovery → Evidence → Architecture
-  → Detail → Sections → Synthesis → Finalization lifecycle in which every
+- **Approval-driven planning** — a full Discovery → Architecture → Detail →
+  Synthesis → Validation → Finalization lifecycle in which every
   committed change passes through a frozen proposal and a mandatory human
   approval dialog; Deny always means zero mutation.
 - **Evidence freshness** — proposals pin exact evidence revisions; file
@@ -35,8 +35,8 @@ First public release of Phase Plan v0.1 for Claude Code.
 - **Execution replanning** — execution issues can open successor planning
   runs that inherit completed work from their predecessor.
 - **Recovery and concurrency safety** — crash resume (A1), session
-  takeover, fencing, and terminal abort (A2) with audit-recorded
-  tombstones; all authority transitions are signed by the host and keyed
+  takeover, fencing, and a terminal, audit-recorded abort flow (A2);
+  all authority transitions are signed by the host and keyed
   to one canonical plugin data location.
 - **Read-only diagnostics** — `doctor` (human and `--json`) reports
   runtime, host, storage, and capability status without ever mutating the

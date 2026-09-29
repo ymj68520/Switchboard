@@ -28,6 +28,24 @@ to real collaboration-mode transitions.
   runtime (app-server `/readyz`, protocol handshake, real thread
   capability) — there is no hardcoded version gate.
 
+## Install
+
+phase-model is distributed as a GitHub Release asset
+(`switchboard-codex-0.0.1.tgz`) and is not published to the npm registry.
+Install the downloaded tarball globally:
+
+```bash
+npm install -g ./switchboard-codex-0.0.1.tgz
+```
+
+Alternatively, build and pack it from this repository (the tarball ships
+prebuilt; a source checkout needs a build first):
+
+```bash
+npm run build -w @switchboard/codex
+npm pack ./adapters/codex
+```
+
 ## Configuration
 
 Exactly three settings; both models must come from configuration — there
@@ -36,8 +54,8 @@ are no built-in model slugs.
 | Setting         | Meaning                                   | Default |
 | --------------- | ----------------------------------------- | ------- |
 | `planningModel` | model applied while Codex is in Plan mode | —       |
-| `executionModel`| model applied in Default mode and at startup | —    |
-| `reasoningEffort`| startup reasoning effort for both native Codex defaults | `xhigh` |
+| `executionModel` | model applied in Default mode and at startup | —    |
+| `reasoningEffort` | startup reasoning effort for both native Codex defaults | `xhigh` |
 
 Sources, lowest → highest precedence:
 
@@ -73,8 +91,9 @@ phase-model --no-alt-screen                  # unknown flags pass through
 
 `phase-model --help` lists everything it owns. All other arguments are
 passed through to the Codex TUI. A handful of startup arguments are
-reserved (`--remote`, `--model`/`-m`, `-c model=…`,
-`-c model_reasoning_effort=…`, `-c plan_mode_reasoning_effort=…`); passing
+reserved (`--remote`, `--model`/`-m`, and the `model`,
+`model_reasoning_effort`, and `plan_mode_reasoning_effort` config keys
+passed via `-c`/`--config`); passing
 them through fails fast with a clear conflict error instead of silently
 overriding. Runtime `/model` inside the TUI is unaffected.
 
