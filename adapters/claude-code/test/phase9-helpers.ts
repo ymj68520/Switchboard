@@ -70,7 +70,13 @@ export function sourceEvent(
   relativePath: string,
   overrides: Partial<ObservationCaptureEvent> = {},
 ): ObservationCaptureEvent {
-  const absolute = path.join(fixture.workspaceRoot, relativePath);
+  // Callers may pass an already-absolute path (e.g. the §13 outside-workspace
+  // scenario) — joining it onto the workspace root would fabricate a
+  // plausible-but-wrong in-workspace path whose platform-specific fallout
+  // masks the behavior under test.
+  const absolute = path.isAbsolute(relativePath)
+    ? relativePath
+    : path.join(fixture.workspaceRoot, relativePath);
   // Missing/unreadable files are legitimate capture scenarios (§37) — the
   // default response is only computed when the file actually exists.
   let content = "";

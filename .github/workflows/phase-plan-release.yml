@@ -1,0 +1,136 @@
+# Phase Plan for Claude Code — release-oriented CI (Phase 18 §33/§34).
+#
+# Three-platform Node 24 quality gates; the CANONICAL release artifact is
+# produced by exactly one platform (Linux) and byte-verified by the others.
+# A same-version/different-digest release is a CI failure (§25/E54).
+#
+# Live-host checks (marketplace install, approval dialogs, PostToolUse
+# captures) require an authenticated Claude Code session and are executed
+# as the real-host release validation on the validated host line — CI
+# runtime gates here never substitute for them (§60).
+name: phase-plan-release-gate
+
+on:
+  push:
+    paths:
+      - "adapters/claude-code/**"
+      - "scripts/claude-release*"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/phase-plan-release.yml"
+  pull_request:
+    paths:
+      - "adapters/claude-code/**"
+      - "scripts/claude-release*"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/phase-plan-release.yml"
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: quality (${{ matrix.os }}, Node 24)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+      - name: Install (lockfile)
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck --workspace @switchboard/claude-code
+      - name: Lint
+        run: npm run lint --workspace @switchboard/claude-code
+      - name: Full adapter test suite
+        run: npm test --workspace @switchboard/claude-code
+
+  release:
+    name: canonical release artifact (Linux producer)
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+      - name: Install (lockfile)
+        run: npm ci
+      - name: Full release build (§6 gate sequence)
+        run: npm run release:claude
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-plan-release
+          path: |
+            release/phase-plan-*.zip
+            release/phase-plan-*.zip.sha256
+            release/phase-plan-*-release.json
+
+  verify:
+    name: verify canonical artifact (${{ matrix.os }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+      - name: Install (lockfile, for the runtime smoke tooling)
+        run: npm ci
+      - name: Download canonical artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: phase-plan-release
+          path: release-download
+      - name: Verify digest and extract
+        shell: bash
+        run: |
+          ZIP=$(ls release-download/phase-plan-*.zip)
+          SHAFILE=$(ls release-download/phase-plan-*.zip.sha256)
+          cd release-download
+          sha256sum -c "$(basename "$SHAFILE")"
+          mkdir extracted
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(basename "$ZIP")' -DestinationPath 'extracted' -Force"
+          else
+            python3 -m zipfile -e "$(basename "$ZIP")" extracted/
+          fi
+      - name: Extracted-bundle runtime smoke (version, doctor, MCP handshake)
+        shell: bash
+        run: node scripts/claude-release-verify.mjs release-download/extracted
+
+  immutable-version:
+    name: same version ⇒ same digest (§25/E54)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+      - name: Install (lockfile)
+        run: npm ci
+      - name: Rebuild release twice and compare digests
+        run: |
+          npm run release:claude
+          DIGEST_A=$(cat release/phase-plan-*.zip.sha256)
+          rm -rf release
+          npm run release:claude
+          DIGEST_B=$(cat release/phase-plan-*.zip.sha256)
+          if [ "$DIGEST_A" != "$DIGEST_B" ]; then
+            echo "IMMUTABLE_RELEASE_VERSION_VIOLATION: same version produced different digests"
+            exit 1
+          fi

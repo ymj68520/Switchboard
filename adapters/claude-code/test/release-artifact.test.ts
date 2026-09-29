@@ -129,10 +129,12 @@ describe("deterministic archive (§9)", () => {
     const zip = createDeterministicZip(files);
     const outDir = await makeTempDir("phase-plan-zip-");
     await fs.writeFile(path.join(outDir, "artifact.zip"), zip);
-    const extraction = spawnSync(process.platform === "win32" ? String.raw`C:\Windows\System32\tar.exe` : "tar", ["-xf", "artifact.zip"], {
-      cwd: outDir,
-      encoding: "utf8",
-    });
+    // Windows ships bsdtar (reads zip); GNU tar does not — POSIX platforms
+    // extract via the ubiquitous python3 zipfile module.
+    const extraction =
+      process.platform === "win32"
+        ? spawnSync(String.raw`C:\Windows\System32\tar.exe`, ["-xf", "artifact.zip"], { cwd: outDir, encoding: "utf8" })
+        : spawnSync("python3", ["-m", "zipfile", "-e", "artifact.zip", "."], { cwd: outDir, encoding: "utf8" });
     expect(extraction.status).toBe(0);
     for (const file of files) {
       const extracted = await fs.readFile(path.join(outDir, ...file.relPath.split("/")));
