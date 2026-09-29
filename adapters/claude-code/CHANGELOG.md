@@ -4,6 +4,10 @@ All notable user-visible changes to the Phase Plan plugin are documented
 here. Versions follow the plugin manifest (`.claude-plugin/plugin.json`),
 which is the single release version source.
 
+## 0.1.1
+
+Re-release build of the v0.1.0 content at version 0.1.1: the release-version validation pass (Phase 18 R8) exercised the plugin-update channel (0.1.0 → 0.1.1) and confirmed plugin-data persistence across updates. No product changes.
+
 ## 0.1.0
 
 First public release of Phase Plan v0.1 for Claude Code.
