@@ -1,0 +1,408 @@
+{
+  "attempt": {
+    "startedAt": "2026-10-01T15:38:28.098Z",
+    "repository": {
+      "identity": "ultra-plan-e73-1790869108098",
+      "files": [
+        "notes.txt",
+        "check.js"
+      ],
+      "validation": "node check.js"
+    },
+    "trustedSession": "ses_f07e1f593ffeX6b2zHvQEhmjOp"
+  },
+  "host": {
+    "version": "1.18.11",
+    "inventory": [
+      "invalid",
+      "question",
+      "bash",
+      "read",
+      "glob",
+      "grep",
+      "edit",
+      "write",
+      "task",
+      "webfetch",
+      "todowrite",
+      "websearch",
+      "skill",
+      "apply_patch",
+      "ultraplan_start",
+      "ultraplan_status",
+      "plan_memory",
+      "ultraplan_record_question",
+      "ultraplan_propose_question_resolution",
+      "ultraplan_raise_conflict",
+      "ultraplan_promote_evidence",
+      "ultraplan_prepare_proposal",
+      "ultraplan_request_architecture",
+      "ultraplan_request_completion",
+      "ultraplan_request_section_focus",
+      "ultraplan_prepare_section_decomposition",
+      "ultraplan_prepare_section_checkpoint",
+      "ultraplan_request_user_approval",
+      "ultraplan_request_reopen",
+      "ultraplan_request_abort",
+      "ultraplan_prepare_architecture_amendment",
+      "ultraplan_run_semantic_validation",
+      "ultraplan_request_finalization",
+      "ultraplan_prepare_final_plan",
+      "ultraplan_request_synthesis",
+      "ultraplan_begin_synthesis",
+      "ultraplan_submit_synthesis_manifest"
+    ],
+    "port": 4173
+  },
+  "plugin": {
+    "build": "dist/index.js",
+    "sha256": "66a73520cedcc6fd…"
+  },
+  "planning": {
+    "planningRunID": "PLAN-001",
+    "lifecycle": "handoff_pending",
+    "stage": "final",
+    "handoffProtocol": "supervised_v0_2",
+    "headCommit": "COMMIT-005",
+    "finalPlan": {
+      "id": "FINAL-001",
+      "revision": 1,
+      "hash": "b130df07bdbf69903017da0535be91baae2cd23a50204a4b9cb061c43fd9fab8"
+    }
+  },
+  "execution": {
+    "entryStatus": "handoff_recovered",
+    "executionRunID": "EXEC-001",
+    "pumpOutcome": "terminal",
+    "pumpDetail": {
+      "outcome": "terminal",
+      "terminal": "completed",
+      "executionRunID": "EXEC-001",
+      "summary": {
+        "executionRunID": "EXEC-001",
+        "planID": "PLAN-001",
+        "lifecycle": "completed",
+        "finalPlan": {
+          "id": "FINAL-001",
+          "revision": 1
+        },
+        "acceptedHead": "EC-002",
+        "stages": [
+          {
+            "id": "STAGE-001",
+            "title": "Implement E73_LIVE_OK line in notes.txt",
+            "status": "completed"
+          },
+          {
+            "id": "STAGE-002",
+            "title": "Final closure: FinalPlan FINAL-001 satisfaction",
+            "status": "completed"
+          }
+        ],
+        "latestReportPerRole": [
+          {
+            "workerRole": "verifier",
+            "result": "completed",
+            "directive": "DIR-003@1"
+          },
+          {
+            "workerRole": "executor",
+            "result": "completed",
+            "directive": "DIR-001@1"
+          }
+        ],
+        "reconciliationRequired": false,
+        "unresolvedSideEffectingAttempts": 0,
+        "completionRecordID": "CMPL-001"
+      }
+    },
+    "terminalLifecycle": "completed",
+    "acceptedHead": "EC-002",
+    "binding": {
+      "ownerSessionID": "ses_f07e1f593ffeX6b2zHvQEhmjOp",
+      "generation": 1,
+      "state": "attached"
+    },
+    "runRevision": 9,
+    "stages": [
+      {
+        "id": "STAGE-001",
+        "status": "completed",
+        "title": "Implement E73_LIVE_OK line in notes.txt"
+      },
+      {
+        "id": "STAGE-002",
+        "kind": "final_closure",
+        "status": "completed",
+        "title": "Final closure: FinalPlan FINAL-001 satisfaction"
+      }
+    ],
+    "windows": [
+      {
+        "id": "WIN-001",
+        "stageID": "STAGE-001",
+        "state": "closed",
+        "candidateRevision": 1
+      },
+      {
+        "id": "WIN-002",
+        "stageID": "STAGE-002",
+        "state": "closed",
+        "candidateRevision": 0
+      }
+    ],
+    "directives": [
+      {
+        "ref": "DIR-001@1",
+        "kind": "implementation"
+      },
+      {
+        "ref": "DIR-002@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-003@1",
+        "kind": "verification"
+      }
+    ],
+    "attempts": [
+      {
+        "id": "ATT-001",
+        "directive": "DIR-001@1",
+        "role": "executor",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-002",
+        "directive": "DIR-002@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-003",
+        "directive": "DIR-003@1",
+        "role": "verifier",
+        "state": "reported"
+      }
+    ],
+    "reports": [
+      {
+        "id": "RPT-001",
+        "role": "executor",
+        "result": "completed",
+        "candidateMutation": "changed"
+      },
+      {
+        "id": "RPT-002",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-003",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      }
+    ],
+    "assessments": [
+      {
+        "id": "SA-001",
+        "disposition": "accept",
+        "scope": "stage"
+      },
+      {
+        "id": "SA-002",
+        "disposition": "accept",
+        "scope": "stage"
+      }
+    ],
+    "commits": [
+      {
+        "id": "EC-001",
+        "candidateRevision": 1,
+        "assessment": "SA-001"
+      },
+      {
+        "id": "EC-002",
+        "candidateRevision": 0,
+        "assessment": "SA-002"
+      }
+    ],
+    "completionRecord": {
+      "id": "CMPL-001",
+      "executionRunID": "EXEC-001",
+      "finalPlanRef": {
+        "id": "FINAL-001",
+        "revision": 1
+      },
+      "finalClosureStageID": "STAGE-002",
+      "finalWindowID": "WIN-002",
+      "finalCommitID": "EC-002",
+      "finalAssessmentID": "SA-002",
+      "acceptedHead": "EC-002",
+      "completedAt": "2026-10-01T15:46:26.978Z",
+      "finalCandidateRevision": 0,
+      "finalVerificationReportRefs": [
+        "RPT-003"
+      ],
+      "hash": "df33e086a526eb1568e26c3104d80a88d1dcd21c748c02df54fe4c2f511333f2"
+    },
+    "legacyDispatchCount": 0,
+    "counts": {
+      "supervisorTurns": 12,
+      "supervisorFailures": 0,
+      "workerInvocations": 3,
+      "workerFailures": 0
+    },
+    "durationsMs": {
+      "total": 478980
+    },
+    "planningRunID": "PLAN-001",
+    "handoffProtocol": "supervised_v0_2"
+  },
+  "isolation": {
+    "supervisorModel": "sensenova/deepseek-v4-flash",
+    "workerModel": "sensenova/deepseek-v4-flash",
+    "verifierModel": "sensenova/deepseek-v4-flash",
+    "budgets": {
+      "maxSupervisorTurnsPerPump": 40,
+      "maxWorkerDispatchesPerPump": 40,
+      "maxSupervisorReadOpsPerTurn": 4,
+      "supervisorTimeoutMs": 420000,
+      "workerTimeoutMs": 420000,
+      "maxConsecutiveSupervisorProtocolFailures": 6
+    },
+    "deniedHostTools": [
+      "apply_patch",
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "invalid",
+      "plan_memory",
+      "question",
+      "read",
+      "skill",
+      "task",
+      "todowrite",
+      "ultraplan_begin_synthesis",
+      "ultraplan_prepare_architecture_amendment",
+      "ultraplan_prepare_final_plan",
+      "ultraplan_prepare_proposal",
+      "ultraplan_prepare_section_checkpoint",
+      "ultraplan_prepare_section_decomposition",
+      "ultraplan_promote_evidence",
+      "ultraplan_propose_question_resolution",
+      "ultraplan_raise_conflict",
+      "ultraplan_record_question",
+      "ultraplan_request_abort",
+      "ultraplan_request_architecture",
+      "ultraplan_request_completion",
+      "ultraplan_request_finalization",
+      "ultraplan_request_reopen",
+      "ultraplan_request_section_focus",
+      "ultraplan_request_synthesis",
+      "ultraplan_request_user_approval",
+      "ultraplan_run_semantic_validation",
+      "ultraplan_start",
+      "ultraplan_status",
+      "ultraplan_submit_synthesis_manifest",
+      "webfetch",
+      "websearch",
+      "write"
+    ]
+  },
+  "checks": [
+    {
+      "name": "host up with tool inventory endpoint",
+      "ok": true,
+      "detail": "37 host tools: invalid,question,bash,read,glob,grep,edit,write,task,webfetch,todowrite,websearch,skill,apply_patch,ultraplan_start,ultraplan_status,plan_memory,ultraplan_record_question,ultraplan_propose_question_resolution,ultraplan_raise_conflict,ultraplan_promote_evidence,ultraplan_prepare_proposal,ultraplan_request_architecture,ultraplan_request_completion,ultraplan_request_section_focus,ultra"
+    },
+    {
+      "name": "real installed plugin loaded (host registered the ultraplan agent)",
+      "ok": true,
+      "detail": "build,compaction,explore,general,plan,summary,title,ultraplan"
+    },
+    {
+      "name": "production bundle built with discovered host inventory denied",
+      "ok": true,
+      "detail": "37 denied names"
+    },
+    {
+      "name": "Final Approval → handoff_pending with durable supervised_v0_2 marker (§5)",
+      "ok": true,
+      "detail": "lifecycle=handoff_pending protocol=supervised_v0_2"
+    },
+    {
+      "name": "E15/E6 ExecutionRun.lifecycle = completed",
+      "ok": true,
+      "detail": "lifecycle=completed"
+    },
+    {
+      "name": "E14 ExecutionCompletionRecord exists",
+      "ok": true,
+      "detail": "{\"id\":\"CMPL-001\",\"executionRunID\":\"EXEC-001\",\"finalPlanRef\":{\"id\":\"FINAL-001\",\"revision\":1},\"finalClosureStageID\":\"STAGE-002\",\"finalWindowID\":\"WIN-002\",\"finalCommitID\":\"EC-002\",\"finalAssessmentID\":\"SA-002\",\"acceptedHead\":\"EC-002\",\"completed"
+    },
+    {
+      "name": "E4 exactly one initial ExecutionRun",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "E5 SupervisorBinding owner = trusted session, generation 1",
+      "ok": true,
+      "detail": "owner=ses_f07e1f593ffeX6b2zHvQEhmjOp gen=1"
+    },
+    {
+      "name": "ordinary Stage acceptance + final_closure Stage exist (§6)",
+      "ok": true,
+      "detail": "stages=STAGE-001:undefined:completed,STAGE-002:final_closure:completed"
+    },
+    {
+      "name": "fresh final Verifier report in accepted history (§6)",
+      "ok": true,
+      "detail": "reports=3 verifier=2"
+    },
+    {
+      "name": "final SupervisorAssessment + final ExecutionCommit (§6)",
+      "ok": true,
+      "detail": "assessments=2 commits=EC-001,EC-002"
+    },
+    {
+      "name": "ExecutionCommit chain linear (§52.47)",
+      "ok": true,
+      "detail": "EC-001 → EC-002"
+    },
+    {
+      "name": "run.acceptedHead = final ExecutionCommit (§52.46)",
+      "ok": true,
+      "detail": "acceptedHead=EC-002 tip=EC-002"
+    },
+    {
+      "name": "E8 real repository edit landed via OpenCode tools",
+      "ok": true,
+      "detail": "notes.txt: baseline line one | E73_LIVE_OK"
+    },
+    {
+      "name": "deterministic validation passes",
+      "ok": true,
+      "detail": "validation OK"
+    },
+    {
+      "name": "E16 legacy free-Build dispatch count = 0 (§7)",
+      "ok": true,
+      "detail": "count=0"
+    },
+    {
+      "name": "E7 every Supervisor turn denied all host tools mechanically",
+      "ok": true,
+      "detail": "17/20 recorded all-deny maps"
+    },
+    {
+      "name": "E9 worker control-plane absent; repo tools per capability",
+      "ok": true,
+      "detail": "1 worker invocations"
+    }
+  ]
+}

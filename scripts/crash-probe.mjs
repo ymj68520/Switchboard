@@ -877,6 +877,12 @@ if (mode === "section-decomposition") {
     proposalID: prepared.proposal.id,
     approvalID: (await store.findApprovalForProposal(run.id, prepared.proposal.id)).id,
   });
+  // Phase 7B §103 — the stepwise windows exercise the RECOVERY-ONLY legacy
+  // workflow on a PRE-CUTOVER document: the real Final Approval now durably
+  // records supervised_v0_2; strip the marker to simulate the pre-cutover
+  // artifact (never produced by a post-cutover Final Approval).
+  const committedRunHeader = await store.getRun(run.id);
+  await store.saveRun({ ...committedRunHeader, handoffProtocol: undefined });
 
   // Stepwise handoff state with crashes on the exact windows.
   const { assembleExecutionHandoff } = ultra;

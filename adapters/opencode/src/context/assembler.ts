@@ -337,6 +337,25 @@ function buildRunStateFragment(state: PlanningContextState): ContextFragment {
     `blocking_conflicts: ${blockingConflicts.length}${blockingConflicts.length > 0 ? ` (${blockingConflicts.map((c) => c.id).join(", ")})` : ""}`,
     `open_questions: ${run.openQuestions.filter((q) => q.status === "open").length}`,
     `open_conflicts: ${run.conflicts.filter((c) => c.status === "open").length}`,
+    // Phase 7B §43/§44/§45 — the formal replan initial context: exact refs +
+    // issue facts as EVIDENCE (never Plan Memory); scope defaults to the
+    // affected refs.
+    ...(state.replan
+      ? [
+          `replan_source_issue: ${state.replan.sourceExecutionIssue.id} (execution run ${state.replan.priorExecutionRun})`,
+          `replan_prior_final_plan: ${state.replan.priorFinalPlan.id}@${state.replan.priorFinalPlan.revision}`,
+          `replan_issue_reason: ${state.replan.issue.reason}`,
+          `replan_affected_scope: ${state.replan.issue.affectedPlanRefs.join(", ") || "(none recorded)"} — start from this minimal affected normative scope`,
+          ...(state.replan.issue.acceptedHead
+            ? [`replan_accepted_execution_head: ${state.replan.issue.acceptedHead} (+${state.replan.acceptedCommitCount} accepted commit(s)) — execution EVIDENCE, not approved Plan Memory`]
+            : state.replan.acceptedCommitCount > 0
+              ? [`replan_accepted_commits: ${state.replan.acceptedCommitCount} — execution EVIDENCE, not approved Plan Memory`]
+              : []),
+          ...(state.replan.issue.candidateRevision !== undefined
+            ? [`replan_unaccepted_candidate_revision: ${state.replan.issue.candidateRevision}`]
+            : []),
+        ]
+      : []),
   ].join("\n");
   return makeFragment({
     id: "L1:run-state",

@@ -308,6 +308,33 @@ export class DurablePlanStore extends InMemoryPlanStore {
     // Phase 2J runtime handoff (additive families).
     for (const [planID, map] of this.executionHandoffs) doc.executionHandoffs![planID] = Object.fromEntries(map);
     for (const [planID, map] of this.handoffDeliveries) doc.handoffDeliveries![planID] = Object.fromEntries(map);
+    // v0.2.0 Phase 1 ExecutionRun foundation (additive families).
+    doc.executionRuns = Object.fromEntries(this.executionRuns);
+    doc.executionRunByHandoffKey = Object.fromEntries(this.executionRunByHandoffKey);
+    // v0.2.0 Phase 2 SupervisorBinding foundation (additive family).
+    doc.supervisorBindings = Object.fromEntries(this.supervisorBindings);
+    // v0.2.0 Phase 3 structural layer (additive families).
+    doc.executionStages = Object.fromEntries(this.executionStages);
+    doc.verificationWindows = Object.fromEntries(this.verificationWindows);
+    // v0.2.0 Phase 4 worker protocol (additive families).
+    doc.executionDirectives = Object.fromEntries(this.executionDirectives);
+    doc.executionAttempts = Object.fromEntries(this.executionAttempts);
+    doc.executionReports = Object.fromEntries(this.executionReports);
+    doc.executionAttemptByDirective = Object.fromEntries(this.executionAttemptByDirective);
+    // v0.2.0 Phase 5 acceptance layer (additive families).
+    doc.supervisorAssessments = Object.fromEntries(this.supervisorAssessments);
+    doc.executionCommits = Object.fromEntries(this.executionCommits);
+    doc.executionCommitByWindow = Object.fromEntries(this.executionCommitByWindow);
+    doc.executionCommitByAssessment = Object.fromEntries(this.executionCommitByAssessment);
+    // v0.2.0 Phase 6A escalation control plane (additive families).
+    doc.executionIssues = Object.fromEntries(this.executionIssues);
+    doc.issueByExecutionRun = Object.fromEntries(this.issueByExecutionRun);
+    doc.verificationConflicts = Object.fromEntries(this.verificationConflicts);
+    doc.attemptReconciliations = Object.fromEntries(this.attemptReconciliations);
+    doc.reconciliationByAttempt = Object.fromEntries(this.reconciliationByAttempt);
+    // v0.2.0 Phase 6B final closure (additive families).
+    doc.executionCompletions = Object.fromEntries(this.executionCompletions);
+    doc.completionByExecutionRun = Object.fromEntries(this.completionByExecutionRun);
     return doc;
   }
 
@@ -418,6 +445,86 @@ export class DurablePlanStore extends InMemoryPlanStore {
         planID as PlanID,
         new Map(Object.entries(family) as [import("../core/ids.js").HandoffID, import("../handoff/types.js").HandoffDelivery][]),
       );
+    }
+    this.executionRuns.clear();
+    for (const [executionRunID, executionRun] of Object.entries(doc.executionRuns ?? {})) {
+      this.executionRuns.set(executionRunID as import("../core/ids.js").ExecutionRunID, executionRun);
+    }
+    this.executionRunByHandoffKey.clear();
+    for (const [indexKey, executionRunID] of Object.entries(doc.executionRunByHandoffKey ?? {})) {
+      this.executionRunByHandoffKey.set(indexKey, executionRunID as import("../core/ids.js").ExecutionRunID);
+    }
+    this.supervisorBindings.clear();
+    for (const [executionRunID, binding] of Object.entries(doc.supervisorBindings ?? {})) {
+      this.supervisorBindings.set(executionRunID as import("../core/ids.js").ExecutionRunID, binding);
+    }
+    this.executionStages.clear();
+    for (const [stageID, stage] of Object.entries(doc.executionStages ?? {})) {
+      this.executionStages.set(stageID as import("../core/ids.js").ExecutionStageID, stage);
+    }
+    this.verificationWindows.clear();
+    for (const [windowID, window] of Object.entries(doc.verificationWindows ?? {})) {
+      this.verificationWindows.set(windowID as import("../core/ids.js").VerificationWindowID, window);
+    }
+    this.executionDirectives.clear();
+    for (const [key, directive] of Object.entries(doc.executionDirectives ?? {})) {
+      this.executionDirectives.set(key, directive);
+    }
+    this.executionAttempts.clear();
+    for (const [attemptID, attempt] of Object.entries(doc.executionAttempts ?? {})) {
+      this.executionAttempts.set(attemptID as import("../core/ids.js").ExecutionAttemptID, attempt);
+    }
+    this.executionReports.clear();
+    for (const [reportID, report] of Object.entries(doc.executionReports ?? {})) {
+      this.executionReports.set(reportID as import("../core/ids.js").ExecutionReportID, report);
+    }
+    this.executionAttemptByDirective.clear();
+    for (const [indexKey, attemptID] of Object.entries(doc.executionAttemptByDirective ?? {})) {
+      this.executionAttemptByDirective.set(indexKey, attemptID as import("../core/ids.js").ExecutionAttemptID);
+    }
+    this.supervisorAssessments.clear();
+    for (const [assessmentID, assessment] of Object.entries(doc.supervisorAssessments ?? {})) {
+      this.supervisorAssessments.set(assessmentID as import("../core/ids.js").SupervisorAssessmentID, assessment);
+    }
+    this.executionCommits.clear();
+    for (const [commitID, commit] of Object.entries(doc.executionCommits ?? {})) {
+      this.executionCommits.set(commitID as import("../core/ids.js").ExecutionCommitID, commit);
+    }
+    this.executionCommitByWindow.clear();
+    for (const [windowID, commitID] of Object.entries(doc.executionCommitByWindow ?? {})) {
+      this.executionCommitByWindow.set(windowID as import("../core/ids.js").VerificationWindowID, commitID as import("../core/ids.js").ExecutionCommitID);
+    }
+    this.executionCommitByAssessment.clear();
+    for (const [assessmentID, commitID] of Object.entries(doc.executionCommitByAssessment ?? {})) {
+      this.executionCommitByAssessment.set(assessmentID as import("../core/ids.js").SupervisorAssessmentID, commitID as import("../core/ids.js").ExecutionCommitID);
+    }
+    this.executionIssues.clear();
+    for (const [issueID, issue] of Object.entries(doc.executionIssues ?? {})) {
+      this.executionIssues.set(issueID as import("../core/ids.js").ExecutionIssueID, issue);
+    }
+    this.issueByExecutionRun.clear();
+    for (const [executionRunID, issueID] of Object.entries(doc.issueByExecutionRun ?? {})) {
+      this.issueByExecutionRun.set(executionRunID as import("../core/ids.js").ExecutionRunID, issueID as import("../core/ids.js").ExecutionIssueID);
+    }
+    this.verificationConflicts.clear();
+    for (const [conflictID, conflict] of Object.entries(doc.verificationConflicts ?? {})) {
+      this.verificationConflicts.set(conflictID as import("../core/ids.js").VerificationConflictID, conflict);
+    }
+    this.attemptReconciliations.clear();
+    for (const [reconciliationID, reconciliation] of Object.entries(doc.attemptReconciliations ?? {})) {
+      this.attemptReconciliations.set(reconciliationID as import("../core/ids.js").AttemptReconciliationID, reconciliation);
+    }
+    this.reconciliationByAttempt.clear();
+    for (const [attemptID, reconciliationID] of Object.entries(doc.reconciliationByAttempt ?? {})) {
+      this.reconciliationByAttempt.set(attemptID as import("../core/ids.js").ExecutionAttemptID, reconciliationID as import("../core/ids.js").AttemptReconciliationID);
+    }
+    this.executionCompletions.clear();
+    for (const [completionID, record] of Object.entries(doc.executionCompletions ?? {})) {
+      this.executionCompletions.set(completionID as import("../core/ids.js").ExecutionCompletionID, record);
+    }
+    this.completionByExecutionRun.clear();
+    for (const [executionRunID, completionID] of Object.entries(doc.completionByExecutionRun ?? {})) {
+      this.completionByExecutionRun.set(executionRunID as import("../core/ids.js").ExecutionRunID, completionID as import("../core/ids.js").ExecutionCompletionID);
     }
   }
 
@@ -623,11 +730,229 @@ export class DurablePlanStore extends InMemoryPlanStore {
     return this.withLock(() => super.completeHandoffRun(planID));
   }
 
+  /** Phase 7B §15 — durable supervised handoff completion: under the write lock like every mutation. */
+  override async completePlanningRunForSupervisedHandoff(
+    planID: Parameters<InMemoryPlanStore["completePlanningRunForSupervisedHandoff"]>[0],
+  ): ReturnType<InMemoryPlanStore["completePlanningRunForSupervisedHandoff"]> {
+    return this.withLock(() => super.completePlanningRunForSupervisedHandoff(planID));
+  }
+
   /** R1a §16: durable abort — under the write lock like every mutation. */
   override async abortRun(
     planID: Parameters<InMemoryPlanStore["abortRun"]>[0],
   ): ReturnType<InMemoryPlanStore["abortRun"]> {
     return this.withLock(() => super.abortRun(planID));
+  }
+
+  // -- v0.2.0 Phase 1 ExecutionRun mutations (locked + durable) ----------------
+  // Every lifecycle transition and the initial-handoff preparation run under
+  // the write lock AFTER rehydration, so concurrent/retried handoff
+  // preparation converges on ONE run (the handoff-identity index is checked
+  // against durable state in-lock) and every transition's CAS/bind checks
+  // bind to durable state.
+
+  override async prepareInitialExecutionRun(
+    input: Parameters<InMemoryPlanStore["prepareInitialExecutionRun"]>[0],
+  ): ReturnType<InMemoryPlanStore["prepareInitialExecutionRun"]> {
+    return this.withLock(() => super.prepareInitialExecutionRun(input));
+  }
+
+  override async activateExecutionRun(
+    executionRunID: Parameters<InMemoryPlanStore["activateExecutionRun"]>[0],
+    expected: Parameters<InMemoryPlanStore["activateExecutionRun"]>[1],
+  ): ReturnType<InMemoryPlanStore["activateExecutionRun"]> {
+    return this.withLock(() => super.activateExecutionRun(executionRunID, expected));
+  }
+
+  // Phase 6A: the replan transition (issue + terminal lifecycle change) is ONE
+  // locked durable mutation — a crash between the issue and the transition can
+  // never be observed, and a retry short-circuits on the issue id.
+  override async transitionExecutionRunToReplanRequired(
+    input: Parameters<InMemoryPlanStore["transitionExecutionRunToReplanRequired"]>[0],
+  ): ReturnType<InMemoryPlanStore["transitionExecutionRunToReplanRequired"]> {
+    return this.withLock(() => super.transitionExecutionRunToReplanRequired(input));
+  }
+
+  // -- v0.2.0 Phase 6B final-closure mutations (locked + durable) --------------
+  // Closure preparation (uniqueness race → ONE final_closure Stage) and the
+  // ExecutionCompletionGate (record + terminal transition in one publication)
+  // run under the write lock AFTER rehydration.
+
+  override async prepareFinalClosureStage(
+    input: Parameters<InMemoryPlanStore["prepareFinalClosureStage"]>[0],
+  ): ReturnType<InMemoryPlanStore["prepareFinalClosureStage"]> {
+    return this.withLock(() => super.prepareFinalClosureStage(input));
+  }
+
+  override async completeExecutionRunThroughGate(
+    input: Parameters<InMemoryPlanStore["completeExecutionRunThroughGate"]>[0],
+  ): ReturnType<InMemoryPlanStore["completeExecutionRunThroughGate"]> {
+    return this.withLock(() => super.completeExecutionRunThroughGate(input));
+  }
+
+  override async abortExecutionRun(
+    executionRunID: Parameters<InMemoryPlanStore["abortExecutionRun"]>[0],
+    expected: Parameters<InMemoryPlanStore["abortExecutionRun"]>[1],
+  ): ReturnType<InMemoryPlanStore["abortExecutionRun"]> {
+    return this.withLock(() => super.abortExecutionRun(executionRunID, expected));
+  }
+
+  // -- v0.2.0 Phase 2 SupervisorBinding mutations (locked + durable) -----------
+  // Attach/detach/takeover and supervised activation run under the write lock
+  // AFTER rehydration, so concurrent attach/takeover attempts on one backing
+  // document serialize into ONE current writable owner and every fencing CAS
+  // binds to durable state (directive §28).
+
+  override async attachExecutionSupervisor(
+    input: Parameters<InMemoryPlanStore["attachExecutionSupervisor"]>[0],
+  ): ReturnType<InMemoryPlanStore["attachExecutionSupervisor"]> {
+    return this.withLock(() => super.attachExecutionSupervisor(input));
+  }
+
+  override async detachExecutionSupervisor(
+    input: Parameters<InMemoryPlanStore["detachExecutionSupervisor"]>[0],
+  ): ReturnType<InMemoryPlanStore["detachExecutionSupervisor"]> {
+    return this.withLock(() => super.detachExecutionSupervisor(input));
+  }
+
+  override async takeoverExecutionSupervisor(
+    input: Parameters<InMemoryPlanStore["takeoverExecutionSupervisor"]>[0],
+  ): ReturnType<InMemoryPlanStore["takeoverExecutionSupervisor"]> {
+    return this.withLock(() => super.takeoverExecutionSupervisor(input));
+  }
+
+  override async authorizeExecutionSupervisor(
+    executionRunID: Parameters<InMemoryPlanStore["authorizeExecutionSupervisor"]>[0],
+    authority: Parameters<InMemoryPlanStore["authorizeExecutionSupervisor"]>[1],
+  ): ReturnType<InMemoryPlanStore["authorizeExecutionSupervisor"]> {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.authorizeExecutionSupervisor(executionRunID, authority);
+  }
+
+  override async activateSupervisedExecutionRun(
+    input: Parameters<InMemoryPlanStore["activateSupervisedExecutionRun"]>[0],
+  ): ReturnType<InMemoryPlanStore["activateSupervisedExecutionRun"]> {
+    return this.withLock(() => super.activateSupervisedExecutionRun(input));
+  }
+
+  // -- v0.2.0 Phase 3 structural-layer mutations (locked + durable) ------------
+  // Stage creation/activation/supersession, window opening, and candidate
+  // advancement run under the write lock AFTER rehydration, so concurrent
+  // Stage activations and Window openings on one backing document serialize
+  // into at most one active Stage / one open Window (directive §46/§49).
+
+  override async createExecutionStages(
+    input: Parameters<InMemoryPlanStore["createExecutionStages"]>[0],
+  ): ReturnType<InMemoryPlanStore["createExecutionStages"]> {
+    return this.withLock(() => super.createExecutionStages(input));
+  }
+
+  override async activateExecutionStage(
+    input: Parameters<InMemoryPlanStore["activateExecutionStage"]>[0],
+  ): ReturnType<InMemoryPlanStore["activateExecutionStage"]> {
+    return this.withLock(() => super.activateExecutionStage(input));
+  }
+
+  override async supersedeExecutionStage(
+    input: Parameters<InMemoryPlanStore["supersedeExecutionStage"]>[0],
+  ): ReturnType<InMemoryPlanStore["supersedeExecutionStage"]> {
+    return this.withLock(() => super.supersedeExecutionStage(input));
+  }
+
+  override async openVerificationWindow(
+    input: Parameters<InMemoryPlanStore["openVerificationWindow"]>[0],
+  ): ReturnType<InMemoryPlanStore["openVerificationWindow"]> {
+    return this.withLock(() => super.openVerificationWindow(input));
+  }
+
+  override async advanceCandidateRevision(
+    input: Parameters<InMemoryPlanStore["advanceCandidateRevision"]>[0],
+  ): ReturnType<InMemoryPlanStore["advanceCandidateRevision"]> {
+    return this.withLock(() => super.advanceCandidateRevision(input));
+  }
+
+  // -- v0.2.0 Phase 4 worker-protocol mutations (locked + durable) -------------
+  // Issuance/start/indeterminate/submit all run under the write lock AFTER
+  // rehydration, so concurrent attempt starts and concurrent report
+  // submissions on one backing document serialize into ONE winner with the
+  // candidate advance atomic inside the report transaction (directive
+  // sections 65-67).
+
+  override async issueExecutionDirective(
+    input: Parameters<InMemoryPlanStore["issueExecutionDirective"]>[0],
+  ): ReturnType<InMemoryPlanStore["issueExecutionDirective"]> {
+    return this.withLock(() => super.issueExecutionDirective(input));
+  }
+
+  override async startExecutionAttempt(
+    input: Parameters<InMemoryPlanStore["startExecutionAttempt"]>[0],
+  ): ReturnType<InMemoryPlanStore["startExecutionAttempt"]> {
+    return this.withLock(() => super.startExecutionAttempt(input));
+  }
+
+  override async markExecutionAttemptIndeterminate(
+    input: Parameters<InMemoryPlanStore["markExecutionAttemptIndeterminate"]>[0],
+  ): ReturnType<InMemoryPlanStore["markExecutionAttemptIndeterminate"]> {
+    return this.withLock(() => super.markExecutionAttemptIndeterminate(input));
+  }
+
+  override async submitExecutionReport(
+    input: Parameters<InMemoryPlanStore["submitExecutionReport"]>[0],
+  ): ReturnType<InMemoryPlanStore["submitExecutionReport"]> {
+    return this.withLock(() => super.submitExecutionReport(input));
+  }
+
+  // -- v0.2.0 Phase 5 acceptance mutations (locked + durable) ------------------
+  // The accept transaction runs under the write lock AFTER rehydration, so
+  // two instances racing to accept the SAME window serialize into exactly
+  // ONE ExecutionCommit with the loser failing closed (directive SS75).
+
+  override async submitSupervisorAssessment(
+    input: Parameters<InMemoryPlanStore["submitSupervisorAssessment"]>[0],
+  ): ReturnType<InMemoryPlanStore["submitSupervisorAssessment"]> {
+    return this.withLock(() => super.submitSupervisorAssessment(input));
+  }
+
+  // -- v0.2.0 Phase 6A escalation mutations (locked + durable) -----------------
+  // Conflict creation and reconciliation recording run under the write lock
+  // AFTER rehydration, so two instances racing to create the same conflict or
+  // resolve the same unresolved set serialize into ONE winner with a
+  // deterministic stale/already-reconciled loser error (§57).
+
+  override async createVerificationConflict(
+    input: Parameters<InMemoryPlanStore["createVerificationConflict"]>[0],
+  ): ReturnType<InMemoryPlanStore["createVerificationConflict"]> {
+    return this.withLock(() => super.createVerificationConflict(input));
+  }
+
+  override async recordAttemptReconciliation(
+    input: Parameters<InMemoryPlanStore["recordAttemptReconciliation"]>[0],
+  ): ReturnType<InMemoryPlanStore["recordAttemptReconciliation"]> {
+    return this.withLock(() => super.recordAttemptReconciliation(input));
+  }
+
+  /** TEST/FIXTURE ONLY (see base class). Wrapped so seeding is durable. */
+  override seedExecutionStages(
+    executionRunID: Parameters<InMemoryPlanStore["seedExecutionStages"]>[0],
+    stages: Parameters<InMemoryPlanStore["seedExecutionStages"]>[1],
+  ): void {
+    void executionRunID;
+    void stages;
+    throw new UltraPlanError(
+      "store_busy",
+      "seedExecutionStages is synchronous on the base class; use seedExecutionStagesAsync on DurablePlanStore",
+    );
+  }
+
+  /** Durable variant of the test-only seeding seam. */
+  async seedExecutionStagesAsync(
+    executionRunID: Parameters<InMemoryPlanStore["seedExecutionStages"]>[0],
+    stages: Parameters<InMemoryPlanStore["seedExecutionStages"]>[1],
+  ): Promise<void> {
+    await this.withLock(async () => {
+      super.seedExecutionStages(executionRunID, stages);
+    });
   }
 
   /** TEST/FIXTURE ONLY (see base class). Wrapped so seeding is durable. */
@@ -976,6 +1301,292 @@ export class DurablePlanStore extends InMemoryPlanStore {
     await this.ensureOpen();
     this.refreshFromDisk();
     return super.getHandoffDelivery(planID, handoffID);
+  }
+
+  // -- v0.2.0 Phase 1 ExecutionRun reads (refresh-from-disk: recovery and
+  //    handoff-identity lookups must see another instance's prepared run) ----
+
+  override async getExecutionRun(executionRunID: Parameters<InMemoryPlanStore["getExecutionRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionRun(executionRunID);
+  }
+
+  override async findInitialExecutionRun(
+    planID: Parameters<InMemoryPlanStore["findInitialExecutionRun"]>[0],
+    initialHandoffKey: Parameters<InMemoryPlanStore["findInitialExecutionRun"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findInitialExecutionRun(planID, initialHandoffKey);
+  }
+
+  override async listExecutionRunsForPlan(planID: Parameters<InMemoryPlanStore["listExecutionRunsForPlan"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionRunsForPlan(planID);
+  }
+
+  override async listExecutionRunsForFinalPlan(
+    planID: Parameters<InMemoryPlanStore["listExecutionRunsForFinalPlan"]>[0],
+    ref: Parameters<InMemoryPlanStore["listExecutionRunsForFinalPlan"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionRunsForFinalPlan(planID, ref);
+  }
+
+  override async listRecoverableExecutionRuns(
+    workspace: Parameters<InMemoryPlanStore["listRecoverableExecutionRuns"]>[0],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listRecoverableExecutionRuns(workspace);
+  }
+
+  // -- Phase 7B supervised handoff recovery reads (refresh-from-disk) --------
+
+  override async findExecutionRunsForPlan(planID: Parameters<InMemoryPlanStore["findExecutionRunsForPlan"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionRunsForPlan(planID);
+  }
+
+  // -- v0.2.0 Phase 2 SupervisorBinding / recovery reads (refresh-from-disk) --
+
+  override async findSupervisorBinding(executionRunID: Parameters<InMemoryPlanStore["findSupervisorBinding"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findSupervisorBinding(executionRunID);
+  }
+
+  override async listOpenExecutionRuns() {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listOpenExecutionRuns();
+  }
+
+  override async buildExecutionRecoveryContext(
+    executionRunID: Parameters<InMemoryPlanStore["buildExecutionRecoveryContext"]>[0],
+    viewer: Parameters<InMemoryPlanStore["buildExecutionRecoveryContext"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.buildExecutionRecoveryContext(executionRunID, viewer);
+  }
+
+  // -- v0.2.0 Phase 3 structural-layer reads (refresh-from-disk) --------------
+
+  override async getExecutionStage(stageID: Parameters<InMemoryPlanStore["getExecutionStage"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionStage(stageID);
+  }
+
+  override async listExecutionStagesForRun(executionRunID: Parameters<InMemoryPlanStore["listExecutionStagesForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionStagesForRun(executionRunID);
+  }
+
+  override async getVerificationWindow(windowID: Parameters<InMemoryPlanStore["getVerificationWindow"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getVerificationWindow(windowID);
+  }
+
+  override async listVerificationWindowsForRun(executionRunID: Parameters<InMemoryPlanStore["listVerificationWindowsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listVerificationWindowsForRun(executionRunID);
+  }
+
+  override async findOpenVerificationWindow(executionRunID: Parameters<InMemoryPlanStore["findOpenVerificationWindow"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findOpenVerificationWindow(executionRunID);
+  }
+
+  // -- v0.2.0 Phase 4 worker-protocol reads (refresh-from-disk) ----------------
+
+  override async getExecutionDirective(
+    directiveID: Parameters<InMemoryPlanStore["getExecutionDirective"]>[0],
+    revision?: Parameters<InMemoryPlanStore["getExecutionDirective"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionDirective(directiveID, revision);
+  }
+
+  override async listExecutionDirectivesForRun(executionRunID: Parameters<InMemoryPlanStore["listExecutionDirectivesForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionDirectivesForRun(executionRunID);
+  }
+
+  override async getExecutionAttempt(attemptID: Parameters<InMemoryPlanStore["getExecutionAttempt"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionAttempt(attemptID);
+  }
+
+  override async findExecutionAttemptForDirective(
+    executionRunID: Parameters<InMemoryPlanStore["findExecutionAttemptForDirective"]>[0],
+    directive: Parameters<InMemoryPlanStore["findExecutionAttemptForDirective"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionAttemptForDirective(executionRunID, directive);
+  }
+
+  override async findRunningExecutionAttempt(executionRunID: Parameters<InMemoryPlanStore["findRunningExecutionAttempt"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findRunningExecutionAttempt(executionRunID);
+  }
+
+  override async listExecutionAttemptsForRun(executionRunID: Parameters<InMemoryPlanStore["listExecutionAttemptsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionAttemptsForRun(executionRunID);
+  }
+
+  override async getExecutionReport(reportID: Parameters<InMemoryPlanStore["getExecutionReport"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionReport(reportID);
+  }
+
+  override async findExecutionReportForAttempt(attemptID: Parameters<InMemoryPlanStore["findExecutionReportForAttempt"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionReportForAttempt(attemptID);
+  }
+
+  override async listExecutionReportsForRun(executionRunID: Parameters<InMemoryPlanStore["listExecutionReportsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionReportsForRun(executionRunID);
+  }
+
+  // -- v0.2.0 Phase 5 acceptance reads (refresh-from-disk) ---------------------
+
+  override async getSupervisorAssessment(assessmentID: Parameters<InMemoryPlanStore["getSupervisorAssessment"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getSupervisorAssessment(assessmentID);
+  }
+
+  override async listSupervisorAssessmentsForRun(executionRunID: Parameters<InMemoryPlanStore["listSupervisorAssessmentsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listSupervisorAssessmentsForRun(executionRunID);
+  }
+
+  override async getExecutionCommit(commitID: Parameters<InMemoryPlanStore["getExecutionCommit"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionCommit(commitID);
+  }
+
+  override async findAcceptedHeadCommit(executionRunID: Parameters<InMemoryPlanStore["findAcceptedHeadCommit"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findAcceptedHeadCommit(executionRunID);
+  }
+
+  override async findExecutionCommitForWindow(windowID: Parameters<InMemoryPlanStore["findExecutionCommitForWindow"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionCommitForWindow(windowID);
+  }
+
+  override async listExecutionCommitsForRun(executionRunID: Parameters<InMemoryPlanStore["listExecutionCommitsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listExecutionCommitsForRun(executionRunID);
+  }
+
+  override async acceptedStageObligations(
+    executionRunID: Parameters<InMemoryPlanStore["acceptedStageObligations"]>[0],
+    stageID: Parameters<InMemoryPlanStore["acceptedStageObligations"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.acceptedStageObligations(executionRunID, stageID);
+  }
+
+  // -- v0.2.0 Phase 6A escalation reads (refresh-from-disk) --------------------
+
+  override async getExecutionIssue(issueID: Parameters<InMemoryPlanStore["getExecutionIssue"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionIssue(issueID);
+  }
+
+  override async findExecutionIssueForRun(executionRunID: Parameters<InMemoryPlanStore["findExecutionIssueForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionIssueForRun(executionRunID);
+  }
+
+  override async buildExecutionIssueReplanContext(issueID: Parameters<InMemoryPlanStore["buildExecutionIssueReplanContext"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.buildExecutionIssueReplanContext(issueID);
+  }
+
+  override async getVerificationConflict(conflictID: Parameters<InMemoryPlanStore["getVerificationConflict"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getVerificationConflict(conflictID);
+  }
+
+  override async listVerificationConflictsForRun(executionRunID: Parameters<InMemoryPlanStore["listVerificationConflictsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listVerificationConflictsForRun(executionRunID);
+  }
+
+  override async unresolvedIndeterminateAttempts(
+    executionRunID: Parameters<InMemoryPlanStore["unresolvedIndeterminateAttempts"]>[0],
+    windowID: Parameters<InMemoryPlanStore["unresolvedIndeterminateAttempts"]>[1],
+  ) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.unresolvedIndeterminateAttempts(executionRunID, windowID);
+  }
+
+  override async getAttemptReconciliation(reconciliationID: Parameters<InMemoryPlanStore["getAttemptReconciliation"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getAttemptReconciliation(reconciliationID);
+  }
+
+  override async listAttemptReconciliationsForRun(executionRunID: Parameters<InMemoryPlanStore["listAttemptReconciliationsForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.listAttemptReconciliationsForRun(executionRunID);
+  }
+
+  // -- v0.2.0 Phase 6B final-closure reads (refresh-from-disk) ------------------
+
+  override async isExecutionReadyForFinalClosure(executionRunID: Parameters<InMemoryPlanStore["isExecutionReadyForFinalClosure"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.isExecutionReadyForFinalClosure(executionRunID);
+  }
+
+  override async getExecutionCompletion(completionID: Parameters<InMemoryPlanStore["getExecutionCompletion"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.getExecutionCompletion(completionID);
+  }
+
+  override async findExecutionCompletionForRun(executionRunID: Parameters<InMemoryPlanStore["findExecutionCompletionForRun"]>[0]) {
+    await this.ensureOpen();
+    this.refreshFromDisk();
+    return super.findExecutionCompletionForRun(executionRunID);
   }
 
   /**

@@ -106,11 +106,38 @@ export interface PlanningContextState {
   constraints: Constraint[];
   openQuestions: OpenQuestion[];
   conflicts: Conflict[];
+
+  /**
+   * Phase 7B §43 — the formal REPLAN initial context of a PlanningRun created
+   * from an ExecutionIssue. Execution facts enter planning as EVIDENCE /
+   * CONTEXT only (§45) — never automatically approved Plan Memory.
+   */
+  replan?: ReplanPlanningContext;
+}
+
+/**
+ * Phase 7B §43 — the compact, exact-ref replan projection the context
+ * assembler renders as the new PlanningRun's initial context.
+ */
+export interface ReplanPlanningContext {
+  sourceExecutionIssue: { id: string; executionRunID: string; hash: string };
+  priorFinalPlan: { id: string; revision: number; hash: string };
+  priorExecutionRun: string;
+  issue: {
+    reason: string;
+    affectedPlanRefs: string[];
+    acceptedHead?: string;
+    candidateRevision?: number;
+    activeStageID?: string;
+  };
+  acceptedCommitCount: number;
 }
 
 /** Inputs the stores hand to the shared builder (their raw family state). */
 export interface PlanningContextCaptureInput {
   run: PlanningRun;
+  /** Phase 7B §43 — the resolved replan projection (stores resolve it). */
+  replan?: ReplanPlanningContext;
   headSnapshot?: Snapshot;
   architecture?: Architecture;
   sections: Section[];
@@ -264,6 +291,7 @@ export function buildPlanningContextState(input: PlanningContextCaptureInput): P
     constraints: run.constraints,
     openQuestions: run.openQuestions,
     conflicts: run.conflicts,
+    ...(input.replan ? { replan: input.replan } : {}),
   };
 }
 

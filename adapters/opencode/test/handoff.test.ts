@@ -281,6 +281,9 @@ async function handoffPendingWorld(options: { executionAgent?: string; execution
   const run = (await world.store.getRun((await world.store.findLatestRunBySession(sessionID) as PlanningRun).id))!;
   expect(run.stage).toBe("final");
   expect(run.lifecycle).toBe("handoff_pending");
+  // Phase 7B §103 — legacy compatibility coverage operates on the PRE-CUTOVER
+  // document: strip the supervised protocol marker the commit now records.
+  await world.store.saveRun({ ...run, handoffProtocol: undefined });
   return { ...world, sessionID, runID: run.id, candidate, finalProposal: prepared.proposal, run };
 }
 
@@ -714,6 +717,10 @@ describe("handoff corruption fail-closed (§122-§124)", () => {
     const { prepared, begun } = await prepareAndAwait({ controller }, sessionID);
     await controller.recordApproval(sessionID, prepared.proposal.id, begun.request);
     await controller.commitApprovedProposal(sessionID, prepared.proposal.id);
+    // Phase 7B §103 — simulate the PRE-CUTOVER legacy document on disk.
+    const rawDoc = JSON.parse(await readFile(filePath, "utf8")) as Record<string, Record<string, Record<string, unknown>>>;
+    for (const runRecord of Object.values(rawDoc["runs"] ?? {})) delete runRecord["handoffProtocol"];
+    await writeFile(filePath, JSON.stringify(rawDoc));
     store.close();
   }
 

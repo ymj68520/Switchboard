@@ -34,6 +34,17 @@ export interface RuntimeCapabilities {
   observeRepositoryTools: boolean;
   /** Observe command invocations (`command.execute.before` hook). */
   observeCommandInvocation: boolean;
+  // -- Phase 7A runtime integration facts (declared honestly, never faked) --
+  /** Fresh child sessions (`client.session.create({parentID})`) give every Worker a new inference context. */
+  freshIsolatedWorkerInvocation: boolean;
+  /** The synchronous prompt (`client.session.prompt`) returns the COMPLETE final model response. */
+  synchronousFinalResponse: boolean;
+  /** OpenCode 1.18 has NO native structured-output/schema API — the exact JSON final-response contract is used. */
+  nativeStructuredOutput: boolean;
+  /** Per-call `tools` overrides mechanically disable host tools for one invocation. */
+  perCallToolOverride: boolean;
+  /** `client.session.status` exposes per-session idle/busy/retry (liveness correlation, never authority). */
+  sessionStatusQuery: boolean;
 }
 
 /** Names/addresses of the OpenCode-native mechanisms Ultra Plan uses. */
@@ -62,6 +73,22 @@ export interface PlanningRuntimeSpec {
    * deliberately NOT reused.
    */
   executionModel?: string;
+  /**
+   * Phase 7A §14/§15 — the Execution Supervisor model as "provider/model".
+   * Defaults to the planning model (frontier reasoning tier) when absent;
+   * the Build model never defaults into the Supervisor seat.
+   */
+  supervisorModel?: string;
+  /** Phase 7A §14/§16 — the Executor Worker model. Defaults to executionModel. */
+  workerModel?: string;
+  /** Phase 7A §14/§16 — the Verifier model. Defaults to the resolved workerModel. */
+  verifierModel?: string;
+  /**
+   * Phase 7B §27/§58 — the production supervised-execution pump budgets.
+   * Validated fail-closed at instance construction (§59); omitted fields take
+   * the safe documented defaults.
+   */
+  executionBudgets?: Partial<import("./production-pump.js").ProductionExecutionBudgets>;
 }
 
 export interface RuntimeActivationInput {

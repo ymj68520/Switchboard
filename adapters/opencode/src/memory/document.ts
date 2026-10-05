@@ -40,6 +40,34 @@ import { computeFinalPlanHashFromContent, renderFinalPlanBody } from "../finaliz
 import { computeExecutionHandoffHashFromRecord } from "../handoff/hash.js";
 import { handoffDeliveryKey } from "../handoff/types.js";
 import { assertEvidenceAuditInternallyConsistent } from "../finalization/audit.js";
+import { EXECUTION_LIFECYCLES } from "../core/execution-run.js";
+import {
+  DIRECTIVE_CANDIDATE_EFFECTS,
+  EXECUTION_CAPABILITIES,
+  EXECUTION_DIRECTIVE_KINDS,
+  computeExecutionDirectiveHashFromRecord,
+} from "../core/execution-directive.js";
+import { EXECUTION_ATTEMPT_STATES, WORKER_ROLES } from "../core/execution-attempt.js";
+import {
+  CANDIDATE_MUTATIONS,
+  EXECUTION_BLOCKER_KINDS,
+  EXECUTION_REPORT_RESULTS,
+  assertConflictResolutionOutcomeVocabulary,
+  assertReconciliationObservationVocabulary,
+} from "../core/execution-report.js";
+import { ASSESSMENT_ACCEPTANCE_SCOPES, ASSESSMENT_DISPOSITIONS, computeSupervisorAssessmentHashFromRecord } from "../core/supervisor-assessment.js";
+import { computeExecutionIssueHashFromRecord } from "../core/execution-issue.js";
+import {
+  CONFLICT_RESOLUTION_OUTCOMES,
+  VERIFICATION_CONFLICT_STATUSES,
+  assertVerificationEvidenceRef,
+  neutralizedEvidenceForOutcome,
+} from "../core/verification-conflict.js";
+import { SUCCESSFUL_RECONCILIATION_OBSERVATIONS } from "../core/attempt-reconciliation.js";
+import { computeExecutionCompletionHashFromRecord } from "../core/execution-completion.js";
+import { EXECUTION_STAGE_KINDS, executionStageKindOf } from "../core/execution-stage.js";
+import { RECONCILIATION_FORBIDDEN_CAPABILITIES, VERIFICATION_PURPOSES } from "../core/execution-directive.js";
+import { validateExecutionPlanRefs } from "../core/execution-stage.js";
 
 export const STORE_SCHEMA_VERSION = 1;
 
@@ -121,6 +149,104 @@ export interface StoreDocument {
    */
   executionHandoffs?: Record<string, Record<string, import("../handoff/types.js").ExecutionHandoff>>;
   handoffDeliveries?: Record<string, Record<string, import("../handoff/types.js").HandoffDelivery>>;
+  /**
+   * v0.2.0 Phase 1 — ExecutionRun supervised-execution foundation (SPEC §11),
+   * keyed by EXEC id (globally unique; the record carries its planID), plus
+   * the `planID:initialHandoffKey` → EXEC id idempotency index. ADDITIVE for
+   * the same reason as every later family: a pre-execution document without
+   * them unambiguously means "no ExecutionRun has ever been prepared", no
+   * existing family is reinterpreted, so STORE_SCHEMA_VERSION stays 1. Load
+   * validation proves the authority binding shape (exact FinalPlan identity,
+   * non-empty workspace, known lifecycle, resolvable handoff index) — fail
+   * closed, never repaired.
+   */
+  executionRuns?: Record<string, import("../core/execution-run.js").ExecutionRun>;
+  executionRunByHandoffKey?: Record<string, string>;
+  /**
+   * v0.2.0 Phase 2 — SupervisorBindings (supervised-execution ownership),
+   * keyed by executionRunID: AT MOST ONE record per run, so a second writable
+   * owner is unrepresentable. ADDITIVE like every later family: a
+   * pre-Phase-2 document without it unambiguously means "no supervisor has
+   * ever attached", no existing family is reinterpreted, so
+   * STORE_SCHEMA_VERSION stays 1. Load validation proves the fencing shape —
+   * existing run reference, workspace equality with the run, monotonic
+   * generation, valid owner/state/timestamps — fail closed, never repaired.
+   */
+  supervisorBindings?: Record<string, import("../core/supervisor-binding.js").SupervisorBinding>;
+  /**
+   * v0.2.0 Phase 3 — the supervised-execution structural layer: ExecutionStages
+   * and VerificationWindows, each keyed by its own never-reused id. ADDITIVE
+   * like every later family: a pre-Phase-3 document without them unambiguously
+   * means "no Stage/Window was ever created", no existing family is
+   * reinterpreted, so STORE_SCHEMA_VERSION stays 1. Load validation proves the
+   * full structural graph — run/stage/window references, the single-active-
+   * Stage and single-open-Window invariants, run.activeStage/openWindow
+   * consistency, dependency acyclicity, candidateRevision shape, and the
+   * execution-start-only baseAcceptedState — fail closed, never repaired.
+   * (`completed` Stage status and `closed` Window state are legal stored
+   * values reserved for future phases; the loader must hydrate, not reject.)
+   */
+  executionStages?: Record<string, import("../core/execution-stage.js").ExecutionStage>;
+  verificationWindows?: Record<string, import("../core/verification-window.js").VerificationWindow>;
+  /**
+   * v0.2.0 Phase 4 — the worker transaction protocol families. Directives are
+   * keyed "DIR-###@REV" (EVERY revision durable; staleness against the current
+   * window is legitimate history, never corruption); attempts ATT-### with
+   * the attempt-by-directive-revision index ("runID:DIR@REV" → ATT id)
+   * enforcing one logical Attempt per exact revision; reports RPT-###.
+   * ADDITIVE like every later family; STORE_SCHEMA_VERSION stays 1. Load
+   * validation proves hash recomputation, exact run/FinalPlan/Stage/Window
+   * bindings, attempt uniqueness/state/report consistency, report provenance
+   * arithmetic, and blocker vocabulary — fail closed, never repaired.
+   */
+  executionDirectives?: Record<string, import("../core/execution-directive.js").ExecutionDirective>;
+  executionAttempts?: Record<string, import("../core/execution-attempt.js").ExecutionAttempt>;
+  executionReports?: Record<string, import("../core/execution-report.js").ExecutionReport>;
+  executionAttemptByDirective?: Record<string, string>;
+  /**
+   * v0.2.0 Phase 5 — the acceptance layer. supervisorAssessments (SA-###,
+   * immutable judgments incl. non-accept history) and the linear
+   * executionCommits chain (EC-###) with commitByWindow/commitByAssessment
+   * indexes (one commit per window; idempotent accept retry). ADDITIVE;
+   * STORE_SCHEMA_VERSION stays 1. Load validation proves the full graph —
+   * exact bindings, accept-only commits, linear parent chain, acceptedHead
+   * at the chain tip, one commit per window, obligation subsets, and
+   * completed-Stage closure provenance — fail closed, never repaired.
+   */
+  supervisorAssessments?: Record<string, import("../core/supervisor-assessment.js").SupervisorAssessment>;
+  executionCommits?: Record<string, import("../core/execution-commit.js").ExecutionCommit>;
+  executionCommitByWindow?: Record<string, string>;
+  executionCommitByAssessment?: Record<string, string>;
+  /**
+   * v0.2.0 Phase 6A — the abnormal/escalation control plane: ExecutionIssues
+   * (ISS-### + the run→issue index; a replan_required run ALWAYS carries
+   * exactly one valid terminal issue), VerificationConflicts (VCF-###, one
+   * disputed fact each with at most one bound resolver), and
+   * AttemptReconciliations (REC-###) with the attempt→reconciliation coverage
+   * index backing the canonical unresolved-indeterminate set. ADDITIVE;
+   * STORE_SCHEMA_VERSION stays 1. Load validation proves the full escalation
+   * graph — bidirectional issue↔replan_required consistency, request_replan
+   * source assessments, exact affected plan refs, accepted-history snapshots,
+   * exact evidence refs, resolver uniqueness/role/purpose/candidate binding,
+   * deterministic neutralization, reconciliation targets/observation/revision
+   * arithmetic — fail closed, never repaired.
+   */
+  executionIssues?: Record<string, import("../core/execution-issue.js").ExecutionIssue>;
+  issueByExecutionRun?: Record<string, string>;
+  verificationConflicts?: Record<string, import("../core/verification-conflict.js").VerificationConflict>;
+  attemptReconciliations?: Record<string, import("../core/attempt-reconciliation.js").AttemptReconciliation>;
+  reconciliationByAttempt?: Record<string, string>;
+  /**
+   * v0.2.0 Phase 6B — the final-closure/completion layer: ExecutionCompletions
+   * (CMPL-###, ONE per completed run via the run→completion index) make
+   * `ExecutionRun.completed` gate-provenanced rather than a bare enum value.
+   * ADDITIVE; STORE_SCHEMA_VERSION stays 1. LEGACY distinction (§50-§53): a
+   * completed run WITHOUT a record is pre-6B history and loads unchanged; a
+   * record REQUIRES a completed run and full final-closure provenance —
+   * fail closed, never repaired.
+   */
+  executionCompletions?: Record<string, import("../core/execution-completion.js").ExecutionCompletionRecord>;
+  completionByExecutionRun?: Record<string, string>;
 }
 
 export function freshStoreDocument(): StoreDocument {
@@ -145,6 +271,26 @@ export function freshStoreDocument(): StoreDocument {
     finalPlans: {},
     executionHandoffs: {},
     handoffDeliveries: {},
+    executionRuns: {},
+    executionRunByHandoffKey: {},
+    supervisorBindings: {},
+    executionStages: {},
+    verificationWindows: {},
+    executionDirectives: {},
+    executionAttempts: {},
+    executionReports: {},
+    executionAttemptByDirective: {},
+    supervisorAssessments: {},
+    executionCommits: {},
+    executionCommitByWindow: {},
+    executionCommitByAssessment: {},
+    executionIssues: {},
+    issueByExecutionRun: {},
+    verificationConflicts: {},
+    attemptReconciliations: {},
+    reconciliationByAttempt: {},
+    executionCompletions: {},
+    completionByExecutionRun: {},
   };
 }
 
@@ -316,6 +462,54 @@ export function validateStoreDocument(doc: unknown): asserts doc is StoreDocumen
       if (activeWork !== undefined) {
         throw corrupt(`run ${planID} is aborted but still carries activeWork`);
       }
+    }
+    // Phase 7B §5-§7/§97 — the handoff protocol marker fails CLOSED on any
+    // contradiction. Absence is pre-cutover history (legacy_v0_1); an unknown
+    // value is corrupt; a supervised marker may never coexist with legacy
+    // free-Build handoff artifacts; a legacy run may never carry supervised
+    // execution state.
+    const protocolValue = run["handoffProtocol"];
+    let protocol: "legacy_v0_1" | "supervised_v0_2";
+    if (protocolValue === undefined || protocolValue === null) {
+      protocol = "legacy_v0_1";
+    } else if (
+      typeof protocolValue === "string" &&
+      (["legacy_v0_1", "supervised_v0_2"] as readonly string[]).includes(protocolValue)
+    ) {
+      protocol = protocolValue as "legacy_v0_1" | "supervised_v0_2";
+    } else {
+      throw corrupt(`run ${planID} carries unknown handoffProtocol ${JSON.stringify(protocolValue)}`, {
+        planID,
+        handoffProtocol: protocolValue,
+      });
+    }
+    const replanProvenance = run["replanProvenance"];
+    if (replanProvenance !== undefined && !isRecord(replanProvenance)) {
+      throw corrupt(`run ${planID} carries a malformed replanProvenance`, { planID });
+    }
+    const legacyHandoffs = isRecord((doc as { executionHandoffs?: unknown }).executionHandoffs)
+      ? ((doc as { executionHandoffs: Record<string, Record<string, unknown>> }).executionHandoffs[planID] as Record<string, unknown> | undefined) ?? {}
+      : {};
+    const legacyDeliveries = isRecord((doc as { handoffDeliveries?: unknown }).handoffDeliveries)
+      ? ((doc as { handoffDeliveries: Record<string, Record<string, unknown>> }).handoffDeliveries[planID] as Record<string, unknown> | undefined) ?? {}
+      : {};
+    if (protocol === "supervised_v0_2" && (Object.keys(legacyHandoffs).length > 0 || Object.keys(legacyDeliveries).length > 0)) {
+      throw corrupt(
+        `run ${planID} durably selected the supervised_v0_2 handoff protocol but carries legacy free-Build handoff artifacts`,
+        { planID, handoffs: Object.keys(legacyHandoffs), deliveries: Object.keys(legacyDeliveries) },
+      );
+    }
+    const executionRunRecords = isRecord((doc as { executionRuns?: unknown }).executionRuns)
+      ? ((doc as { executionRuns: Record<string, Record<string, unknown>> }).executionRuns) as Record<string, Record<string, unknown>>
+      : {};
+    const supervisedRunsForPlan = Object.values(executionRunRecords).filter(
+      (executionRun) => executionRun["planID"] === planID,
+    );
+    if (protocol === "legacy_v0_1" && supervisedRunsForPlan.length > 0) {
+      throw corrupt(
+        `run ${planID} is a legacy (pre-marker) handoff but carries supervised execution state (${supervisedRunsForPlan.length} ExecutionRun(s))`,
+        { planID, executionRunIDs: supervisedRunsForPlan.map((executionRun) => String(executionRun["id"])) },
+      );
     }
   }
 
@@ -1282,8 +1476,11 @@ export function validateStoreDocument(doc: unknown): asserts doc is StoreDocumen
       if (!isRecord(approval) || approval["proposalID"] !== headCommit["proposalID"]) {
         throw corrupt(`run ${planID}'s final PlanCommit approval binding does not resolve`, { planID });
       }
-      // §124: a completed run REQUIRES its confirmed delivered handoff.
-      if (run["lifecycle"] === "completed") {
+      // §124: a completed LEGACY run REQUIRES its confirmed delivered
+      // handoff. Phase 7B §16: a SUPERVISED run's completion means "handed to
+      // a durable ACTIVE supervised ExecutionRun" — its proof is the
+      // executionRuns family, never a legacy delivery record.
+      if (run["lifecycle"] === "completed" && run["handoffProtocol"] !== "supervised_v0_2") {
         const deliveries = isRecord((doc as { handoffDeliveries?: unknown }).handoffDeliveries)
           ? ((doc as { handoffDeliveries: Record<string, Record<string, unknown>> }).handoffDeliveries[planID] as Record<string, unknown> | undefined) ?? {}
           : {};
@@ -1416,6 +1613,1391 @@ export function validateStoreDocument(doc: unknown): asserts doc is StoreDocumen
         // §87: a prepared/dispatching delivery must not carry a fake receipt.
         throw corrupt(`${String(state)} handoff delivery ${handoffID} carries a host receipt before confirmation`, { planID });
       }
+    }
+  }
+
+  // -- v0.2.0 Phase 1 ExecutionRun foundation (fail-closed) -------------------
+  // ADDITIVE family (pre-execution documents = "no ExecutionRun was ever
+  // prepared"). The authority binding is storage-validated: exact FinalPlan
+  // identity + hash, non-empty workspace, known lifecycle, positive revision,
+  // resolvable handoff-identity index, existing source PlanningRun. A
+  // workspace-less run, an unknown lifecycle string, or a dangling index
+  // entry fails store open — never repaired, never normalized.
+  const executionRuns = isRecord(doc.executionRuns) ? doc.executionRuns : {};
+  const executionRunByHandoffKey = isRecord(doc.executionRunByHandoffKey) ? doc.executionRunByHandoffKey : {};
+  const seenHandoffIndexKeys = new Set<string>();
+
+  for (const [executionRunID, executionRun] of Object.entries(executionRuns)) {
+    if (!isRecord(executionRun)) throw corrupt(`execution run ${executionRunID} is not an object`);
+    if (executionRun["id"] !== executionRunID) {
+      throw corrupt(`execution run key ${executionRunID} does not match its identity`);
+    }
+    const lifecycle = executionRun["lifecycle"];
+    if (typeof lifecycle !== "string" || !(EXECUTION_LIFECYCLES as readonly string[]).includes(lifecycle)) {
+      throw corrupt(`execution run ${executionRunID} carries an invalid lifecycle ${String(lifecycle)}`);
+    }
+    if (typeof executionRun["revision"] !== "number" || !Number.isInteger(executionRun["revision"]) || (executionRun["revision"] as number) < 1) {
+      throw corrupt(`execution run ${executionRunID} has a malformed revision`);
+    }
+    if (typeof executionRun["createdAt"] !== "string" || typeof executionRun["updatedAt"] !== "string") {
+      throw corrupt(`execution run ${executionRunID} is missing its timestamps`);
+    }
+    const planID = executionRun["planID"];
+    if (typeof planID !== "string" || !isRecord(runs[planID])) {
+      throw corrupt(`execution run ${executionRunID} references missing PlanningRun ${String(planID)}`);
+    }
+    const workspace = isRecord(executionRun["workspace"]) ? (executionRun["workspace"] as Record<string, unknown>) : undefined;
+    if (!workspace || typeof workspace["key"] !== "string" || workspace["key"].length === 0) {
+      throw corrupt(`execution run ${executionRunID} has no stable WorkspaceIdentity binding`);
+    }
+    const finalPlan = isRecord(executionRun["finalPlan"]) ? (executionRun["finalPlan"] as Record<string, unknown>) : undefined;
+    if (!finalPlan || typeof finalPlan["id"] !== "string" || typeof finalPlan["revision"] !== "number") {
+      throw corrupt(`execution run ${executionRunID} is missing its exact FinalPlan identity`);
+    }
+    if (typeof executionRun["finalPlanHash"] !== "string" || (executionRun["finalPlanHash"] as string).length === 0) {
+      throw corrupt(`execution run ${executionRunID} is missing its FinalPlan content hash binding`);
+    }
+    const planFamily = isRecord(finalPlans[planID]) ? (finalPlans[planID] as Record<string, unknown>) : {};
+    const planRecord = planFamily[`${finalPlan["id"]}@${finalPlan["revision"]}`];
+    if (!isRecord(planRecord) || planRecord["hash"] !== executionRun["finalPlanHash"]) {
+      throw corrupt(
+        `execution run ${executionRunID} FinalPlan binding ${String(finalPlan["id"])}@${String(finalPlan["revision"])} does not resolve to the committed plan with the bound hash`,
+      );
+    }
+    const planningBaseline = isRecord(executionRun["planningBaseline"]) ? (executionRun["planningBaseline"] as Record<string, unknown>) : undefined;
+    if (!planningBaseline || !isRecord(planningBaseline["snapshot"]) || typeof (planningBaseline["snapshot"] as Record<string, unknown>)["id"] !== "string") {
+      throw corrupt(`execution run ${executionRunID} has a malformed planning baseline`);
+    }
+    const finalCommit = planningBaseline["finalCommit"];
+    if (finalCommit !== null && typeof finalCommit !== "string") {
+      throw corrupt(`execution run ${executionRunID} planning baseline carries a malformed finalCommit`);
+    }
+    const executionStartBaseline = isRecord(executionRun["executionStartBaseline"])
+      ? (executionRun["executionStartBaseline"] as Record<string, unknown>)
+      : undefined;
+    if (!executionStartBaseline || typeof executionStartBaseline["workspaceFingerprint"] !== "string" || (executionStartBaseline["workspaceFingerprint"] as string).length === 0) {
+      throw corrupt(`execution run ${executionRunID} has no execution-start baseline`);
+    }
+    const handoffKey = executionRun["initialHandoffKey"];
+    if (typeof handoffKey !== "string" || handoffKey.length === 0) {
+      throw corrupt(`execution run ${executionRunID} is missing its initial-handoff identity`);
+    }
+    const indexKey = `${planID}:${handoffKey}`;
+    if (executionRunByHandoffKey[indexKey] !== executionRunID) {
+      throw corrupt(`execution run ${executionRunID} is not indexed under its initial-handoff identity`);
+    }
+    if (seenHandoffIndexKeys.has(indexKey)) {
+      throw corrupt(`duplicate initial-handoff ExecutionRun for ${indexKey}`);
+    }
+    seenHandoffIndexKeys.add(indexKey);
+  }
+
+  for (const [indexKey, entry] of Object.entries(executionRunByHandoffKey)) {
+    if (typeof entry !== "string" || !isRecord(executionRuns[entry])) {
+      throw corrupt(`execution handoff index ${indexKey} references missing execution run ${String(entry)}`);
+    }
+  }
+
+  // -- v0.2.0 Phase 2 SupervisorBinding foundation (fail-closed) --------------
+  // ADDITIVE family (pre-Phase-2 documents = "no supervisor ever attached").
+  // The fencing shape is storage-validated: an existing ExecutionRun
+  // reference, workspace EQUALITY with the bound run, a monotonic integer
+  // generation, a structurally valid trusted owner, and a valid attachment
+  // state. A dangling binding, generation 0/non-integer, a workspace
+  // mismatch, or an unknown state fails store open — never repaired.
+  const supervisorBindings = isRecord(doc.supervisorBindings) ? doc.supervisorBindings : {};
+  for (const [executionRunID, binding] of Object.entries(supervisorBindings)) {
+    if (!isRecord(binding)) throw corrupt(`supervisor binding ${executionRunID} is not an object`);
+    if (binding["executionRunID"] !== executionRunID) {
+      throw corrupt(`supervisor binding key ${executionRunID} does not match its identity`);
+    }
+    const run = executionRuns[executionRunID];
+    if (!isRecord(run)) {
+      throw corrupt(`supervisor binding ${executionRunID} references missing execution run`);
+    }
+    if (typeof binding["generation"] !== "number" || !Number.isInteger(binding["generation"]) || (binding["generation"] as number) < 1) {
+      throw corrupt(`supervisor binding ${executionRunID} has a malformed generation (must be an integer >= 1)`);
+    }
+    if (typeof binding["ownerSessionID"] !== "string" || (binding["ownerSessionID"] as string).length === 0) {
+      throw corrupt(`supervisor binding ${executionRunID} has no valid trusted owner session identity`);
+    }
+    const state = binding["state"];
+    if (state !== "attached" && state !== "detached") {
+      throw corrupt(`supervisor binding ${executionRunID} carries an invalid attachment state ${String(state)}`);
+    }
+    const bindingWorkspace = isRecord(binding["workspace"]) ? (binding["workspace"] as Record<string, unknown>) : undefined;
+    if (!bindingWorkspace || typeof bindingWorkspace["key"] !== "string" || (bindingWorkspace["key"] as string).length === 0) {
+      throw corrupt(`supervisor binding ${executionRunID} has no stable WorkspaceIdentity binding`);
+    }
+    const runWorkspace = isRecord(run["workspace"]) ? (run["workspace"] as Record<string, unknown>) : undefined;
+    if (!runWorkspace || stableStringifyForDoc(bindingWorkspace) !== stableStringifyForDoc(runWorkspace)) {
+      throw corrupt(`supervisor binding ${executionRunID} workspace disagrees with its ExecutionRun workspace`);
+    }
+    if (typeof binding["createdAt"] !== "string" || typeof binding["updatedAt"] !== "string") {
+      throw corrupt(`supervisor binding ${executionRunID} is missing its timestamps`);
+    }
+  }
+
+  // -- v0.2.0 Phase 3 ExecutionStage / VerificationWindow (fail-closed) -------
+  // ADDITIVE families (pre-Phase-3 documents = "no structural execution state
+  // exists"). The full structural graph is validated: references resolve, the
+  // single-active-Stage and single-open-Window invariants hold, run
+  // activeStage/openWindow refs agree with object truth, dependencies are
+  // acyclic/self/cross-run-free, candidateRevision is a non-negative integer,
+  // and baseAcceptedState anchors the window's own run (execution_start only
+  // in this schema version — there is no ExecutionCommit to anchor to).
+  const executionStages = isRecord(doc.executionStages)
+    ? (doc.executionStages as Record<string, Record<string, unknown>>)
+    : {};
+  const verificationWindows = isRecord(doc.verificationWindows)
+    ? (doc.verificationWindows as Record<string, Record<string, unknown>>)
+    : {};
+
+  /** Per-run active/open structure tallies for the invariants below. */
+  const activeStageByRun = new Map<string, string>();
+  const openWindowByRun = new Map<string, string>();
+
+  for (const [stageID, stage] of Object.entries(executionStages)) {
+    if (!isRecord(stage)) throw corrupt(`execution stage ${stageID} is not an object`);
+    if (stage["id"] !== stageID) throw corrupt(`execution stage key ${stageID} does not match its identity`);
+    const runID = stage["executionRunID"];
+    if (typeof runID !== "string" || !isRecord(executionRuns[runID])) {
+      throw corrupt(`execution stage ${stageID} references missing execution run ${String(runID)}`);
+    }
+    const status = stage["status"];
+    if (status !== "pending" && status !== "active" && status !== "completed" && status !== "superseded") {
+      throw corrupt(`execution stage ${stageID} carries an invalid status ${String(status)}`);
+    }
+    // Phase 6B §59 — kind vocabulary + the final_closure invariants. Absent
+    // kind = ordinary (legacy durability, never rewritten). A final_closure
+    // Stage can never be superseded (§11), and only ONE may exist per run.
+    if (stage["kind"] !== undefined && !(EXECUTION_STAGE_KINDS as readonly string[]).includes(stage["kind"] as string)) {
+      throw corrupt(`execution stage ${stageID} carries an invalid kind ${String(stage["kind"])}`);
+    }
+    if (typeof stage["revision"] !== "number" || !Number.isInteger(stage["revision"]) || (stage["revision"] as number) < 1) {
+      throw corrupt(`execution stage ${stageID} has a malformed revision`);
+    }
+    if (typeof stage["title"] !== "string" || typeof stage["objective"] !== "string") {
+      throw corrupt(`execution stage ${stageID} is missing its title/objective`);
+    }
+    if (!Array.isArray(stage["planRefs"])) throw corrupt(`execution stage ${stageID} has a malformed planRefs array`);
+    for (const ref of stage["planRefs"] as unknown[]) {
+      if (!isRecord(ref) || typeof ref["kind"] !== "string") {
+        throw corrupt(`execution stage ${stageID} has a malformed planRef`);
+      }
+    }
+    if (!Array.isArray(stage["dependsOn"])) throw corrupt(`execution stage ${stageID} has a malformed dependsOn array`);
+    if (typeof stage["createdAt"] !== "string" || typeof stage["updatedAt"] !== "string") {
+      throw corrupt(`execution stage ${stageID} is missing its timestamps`);
+    }
+    if (status === "active") {
+      if (activeStageByRun.has(runID)) {
+        throw corrupt(`execution run ${runID} has two active Stages (${String(activeStageByRun.get(runID))}, ${stageID})`);
+      }
+      activeStageByRun.set(runID, stageID);
+    }
+  }
+
+  // Stage dependency graph: refs resolve to same-run Stages, no cycles.
+  for (const [stageID, stage] of Object.entries(executionStages)) {
+    const runID = stage["executionRunID"] as string;
+    for (const dep of stage["dependsOn"] as unknown[]) {
+      if (typeof dep !== "string") throw corrupt(`execution stage ${stageID} has a malformed dependency ref`);
+      if (dep === stageID) throw corrupt(`execution stage ${stageID} depends on itself`);
+      const depStage = executionStages[dep];
+      if (!isRecord(depStage)) throw corrupt(`execution stage ${stageID} depends on missing Stage ${dep}`);
+      if (depStage["executionRunID"] !== runID) {
+        throw corrupt(`execution stage ${stageID} depends on Stage ${dep} from another ExecutionRun`);
+      }
+    }
+  }
+  {
+    const state = new Map<string, "visiting" | "done">();
+    const path: string[] = [];
+    const visit = (id: string): void => {
+      const current = state.get(id);
+      if (current === "done") return;
+      if (current === "visiting") {
+        const start = path.indexOf(id);
+        const cycle = start >= 0 ? [...path.slice(start), id] : [id];
+        throw corrupt(`execution stage dependency cycle: ${cycle.join(" -> ")}`);
+      }
+      state.set(id, "visiting");
+      path.push(id);
+      for (const dep of executionStages[id]!["dependsOn"] as string[]) {
+        if (isRecord(executionStages[dep])) visit(dep);
+      }
+      path.pop();
+      state.set(id, "done");
+    };
+    for (const id of Object.keys(executionStages)) visit(id);
+  }
+
+  for (const [windowID, window] of Object.entries(verificationWindows)) {
+    if (!isRecord(window)) throw corrupt(`verification window ${windowID} is not an object`);
+    if (window["id"] !== windowID) throw corrupt(`verification window key ${windowID} does not match its identity`);
+    const runID = window["executionRunID"];
+    if (typeof runID !== "string" || !isRecord(executionRuns[runID])) {
+      throw corrupt(`verification window ${windowID} references missing execution run ${String(runID)}`);
+    }
+    const stageID = window["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage)) throw corrupt(`verification window ${windowID} references missing Stage ${String(stageID)}`);
+    if (stage["executionRunID"] !== runID) {
+      throw corrupt(`verification window ${windowID} belongs to a Stage from another ExecutionRun`);
+    }
+    const state = window["state"];
+    if (state !== "open" && state !== "closed") {
+      throw corrupt(`verification window ${windowID} carries an invalid state ${String(state)}`);
+    }
+    if (
+      typeof window["candidateRevision"] !== "number" ||
+      !Number.isInteger(window["candidateRevision"]) ||
+      (window["candidateRevision"] as number) < 0
+    ) {
+      throw corrupt(`verification window ${windowID} has a malformed candidateRevision`);
+    }
+    if (typeof window["revision"] !== "number" || !Number.isInteger(window["revision"]) || (window["revision"] as number) < 1) {
+      throw corrupt(`verification window ${windowID} has a malformed revision`);
+    }
+    const base = isRecord(window["baseAcceptedState"]) ? (window["baseAcceptedState"] as Record<string, unknown>) : undefined;
+    // Shape-only here (commits parse later): execution_commit anchor existence
+    // is proven in the Phase 5 acceptance block below.
+    if (
+      !base ||
+      (base["kind"] !== "execution_start" && base["kind"] !== "execution_commit") ||
+      (base["kind"] === "execution_start" && base["executionRunID"] !== runID)
+    ) {
+      throw corrupt(`verification window ${windowID} has an invalid baseAcceptedState anchor`);
+    }
+    if (typeof window["createdAt"] !== "string" || typeof window["updatedAt"] !== "string") {
+      throw corrupt(`verification window ${windowID} is missing its timestamps`);
+    }
+    if (state === "open") {
+      if (openWindowByRun.has(runID)) {
+        throw corrupt(`execution run ${runID} has two open VerificationWindows (${String(openWindowByRun.get(runID))}, ${windowID})`);
+      }
+      openWindowByRun.set(runID, windowID);
+      // An OPEN window belongs to the ACTIVE stage — except on a terminal
+      // run, where the structure is frozen history (never cleaned up).
+      const run = executionRuns[runID];
+      const terminal = run["lifecycle"] === "completed" || run["lifecycle"] === "replan_required" || run["lifecycle"] === "aborted";
+      if (!terminal) {
+        if (stage["status"] !== "active") {
+          throw corrupt(`open verification window ${windowID} belongs to non-active Stage ${String(stageID)}`);
+        }
+      }
+    }
+  }
+
+  // run.activeStage / run.openWindow must agree with object truth in BOTH
+  // directions (terminal runs keep frozen history; consistency is still
+  // required — the refs must resolve and match status).
+  for (const [runID, runEntry] of Object.entries(executionRuns)) {
+    const runRecord = runEntry as Record<string, unknown>;
+    const terminal =
+      runRecord["lifecycle"] === "completed" || runRecord["lifecycle"] === "replan_required" || runRecord["lifecycle"] === "aborted";
+    const runActiveStage = runRecord["activeStage"];
+    if (runActiveStage !== undefined && runActiveStage !== null) {
+      if (typeof runActiveStage !== "string" || !isRecord(executionStages[runActiveStage])) {
+        throw corrupt(`execution run ${runID} activeStage references missing Stage ${String(runActiveStage)}`);
+      }
+      if (executionStages[runActiveStage]!["executionRunID"] !== runID) {
+        throw corrupt(`execution run ${runID} activeStage references a Stage from another ExecutionRun`);
+      }
+      if (executionStages[runActiveStage]!["status"] !== "active") {
+        throw corrupt(`execution run ${runID} activeStage references ${String(runActiveStage)} in status ${String(executionStages[runActiveStage]!["status"])}`);
+      }
+    }
+    const runOpenWindow = runRecord["openWindow"];
+    if (runOpenWindow !== undefined && runOpenWindow !== null) {
+      if (typeof runOpenWindow !== "string" || !isRecord(verificationWindows[runOpenWindow])) {
+        throw corrupt(`execution run ${runID} openWindow references missing Window ${String(runOpenWindow)}`);
+      }
+      if (verificationWindows[runOpenWindow]!["executionRunID"] !== runID) {
+        throw corrupt(`execution run ${runID} openWindow references a Window from another ExecutionRun`);
+      }
+      if (verificationWindows[runOpenWindow]!["state"] !== "open") {
+        throw corrupt(`execution run ${runID} openWindow references closed Window ${String(runOpenWindow)}`);
+      }
+    }
+    // Reverse direction (non-terminal runs only — a terminal run may have
+    // frozen an open window whose closure awaits the future ExecutionCommit;
+    // the openWindowByRun tally above already proved uniqueness).
+    const talliedActive = activeStageByRun.get(runID);
+    if (talliedActive !== undefined && talliedActive !== runActiveStage) {
+      if (!terminal || runActiveStage === undefined || runActiveStage === null) {
+        throw corrupt(`execution run ${runID} has active Stage ${talliedActive} but activeStage disagrees`);
+      }
+    }
+    const talliedOpen = openWindowByRun.get(runID);
+    if (talliedOpen !== undefined && talliedOpen !== runOpenWindow) {
+      if (!terminal || runOpenWindow === undefined || runOpenWindow === null) {
+        throw corrupt(`execution run ${runID} has open Window ${talliedOpen} but openWindow disagrees`);
+      }
+    }
+    // Phase 6B §59 — final_closure per-run invariants (frozen terminal history
+    // like `replan_required with an active final_closure` stays legal).
+    const runStages = Object.entries(executionStages).filter(([, stage]) => isRecord(stage) && stage["executionRunID"] === runID);
+    const closures = runStages.filter(([, stage]) => executionStageKindOf(stage as never) === "final_closure");
+    if (closures.length > 1) {
+      throw corrupt(`execution run ${runID} has ${closures.length} final_closure Stages (at most one exists)`);
+    }
+    for (const [closureID, closure] of closures) {
+      if ((closure as Record<string, unknown>)["status"] === "superseded") {
+        throw corrupt(`final_closure Stage ${closureID} is superseded (final closure can never be superseded)`);
+      }
+      // The state combination "final_closure exists + ordinary pending/active"
+      // can never arise legally (readiness gates prepare/activate) — fail closed.
+      const openOrdinary = runStages.filter(
+        ([id, stage]) =>
+          id !== closureID &&
+          executionStageKindOf(stage as never) === "ordinary" &&
+          !["superseded", "completed"].includes((stage as Record<string, unknown>)["status"] as string),
+      );
+      if (openOrdinary.length > 0) {
+        throw corrupt(
+          `execution run ${runID} carries final_closure Stage ${closureID} alongside open ordinary Stage(s) ${openOrdinary.map(([id]) => id).join(", ")} — impossible state combination`,
+        );
+      }
+    }
+  }
+
+  // -- v0.2.0 Phase 4 worker protocol (fail-closed, directive sections 46-48) -
+  // ADDITIVE families (pre-Phase-4 documents = "no directive was ever
+  // issued"). Hash recomputation, exact run/FinalPlan/Stage/Window bindings,
+  // one Attempt per exact Directive revision, one running Attempt per run,
+  // attempt/report state consistency, report provenance arithmetic, and the
+  // blocker/mutation vocabularies all fail closed. Staleness of a
+  // Directive's baseCandidateRevision against the CURRENT window is
+  // legitimate history and is deliberately NOT an error.
+  const executionDirectives = isRecord(doc.executionDirectives)
+    ? (doc.executionDirectives as Record<string, Record<string, unknown>>)
+    : {};
+  const executionAttempts = isRecord(doc.executionAttempts)
+    ? (doc.executionAttempts as Record<string, Record<string, unknown>>)
+    : {};
+  const executionReports = isRecord(doc.executionReports)
+    ? (doc.executionReports as Record<string, Record<string, unknown>>)
+    : {};
+  const executionAttemptByDirective = isRecord(doc.executionAttemptByDirective)
+    ? (doc.executionAttemptByDirective as Record<string, string>)
+    : {};
+
+  const seenDirectiveKeys = new Set<string>();
+  for (const [key, directive] of Object.entries(executionDirectives)) {
+    if (!isRecord(directive)) throw corrupt(`execution directive ${key} is not an object`);
+    const id = directive["id"];
+    const revision = directive["revision"];
+    if (typeof id !== "string" || typeof revision !== "number" || !Number.isInteger(revision) || revision < 1) {
+      throw corrupt(`execution directive ${key} has a malformed identity`);
+    }
+    if (key !== `${id}@${revision}`) throw corrupt(`execution directive key ${key} does not match its identity`);
+    if (seenDirectiveKeys.has(key)) throw corrupt(`duplicate execution directive ${key}`);
+    seenDirectiveKeys.add(key);
+    if (computeExecutionDirectiveHashFromRecord(directive as never) !== directive["hash"]) {
+      throw corrupt(`execution directive ${key} content does not recompute to its canonical hash`);
+    }
+    const runID = directive["executionRunID"];
+    const run = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (!isRecord(run)) throw corrupt(`execution directive ${key} references missing execution run ${String(runID)}`);
+    const planRef = isRecord(directive["finalPlan"]) ? (directive["finalPlan"] as Record<string, unknown>) : undefined;
+    // FinalPlans are committed per PLANNING run: resolve the execution run's source plan first.
+    const planID = isRecord(run["planID"]) ? undefined : (run["planID"] as string);
+    const planFamily = typeof planID === "string" && isRecord(finalPlans[planID]) ? (finalPlans[planID] as Record<string, unknown>) : {};
+    const planRecord =
+      planRef && typeof planRef["id"] === "string" && typeof planRef["revision"] === "number"
+        ? planFamily[`${planRef["id"]}@${planRef["revision"]}`]
+        : undefined;
+    const runFinalPlan = isRecord(run["finalPlan"]) ? (run["finalPlan"] as Record<string, unknown>) : undefined;
+    const planBindingOk =
+      !!planRef &&
+      isRecord(planRecord) &&
+      typeof directive["finalPlanHash"] === "string" &&
+      planRecord["hash"] === directive["finalPlanHash"] &&
+      !!runFinalPlan &&
+      runFinalPlan["id"] === planRef["id"] &&
+      runFinalPlan["revision"] === planRef["revision"];
+    if (!planBindingOk) {
+      throw corrupt(`execution directive ${key} FinalPlan binding disagrees with the run's exact binding`);
+    }
+    const stageID = directive["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage) || stage["executionRunID"] !== runID) {
+      throw corrupt(`execution directive ${key} references a missing/foreign Stage ${String(stageID)}`);
+    }
+    const windowID = directive["windowID"];
+    const window = typeof windowID === "string" ? verificationWindows[windowID] : undefined;
+    if (!isRecord(window) || window["executionRunID"] !== runID || window["stageID"] !== stageID) {
+      throw corrupt(`execution directive ${key} references a Window that does not belong to the bound Stage`);
+    }
+    if (stableStringifyForDoc(directive["baseAcceptedState"]) !== stableStringifyForDoc(window["baseAcceptedState"])) {
+      throw corrupt(`execution directive ${key} baseAcceptedState does not match its window's anchor`);
+    }
+    if (
+      typeof directive["baseCandidateRevision"] !== "number" ||
+      !Number.isInteger(directive["baseCandidateRevision"]) ||
+      (directive["baseCandidateRevision"] as number) < 0
+    ) {
+      throw corrupt(`execution directive ${key} has a malformed baseCandidateRevision`);
+    }
+    if (!(EXECUTION_DIRECTIVE_KINDS as readonly string[]).includes(directive["kind"] as string)) {
+      throw corrupt(`execution directive ${key} carries an invalid kind ${String(directive["kind"])}`);
+    }
+    if (!(DIRECTIVE_CANDIDATE_EFFECTS as readonly string[]).includes(directive["candidateEffect"] as string)) {
+      throw corrupt(`execution directive ${key} carries an invalid candidateEffect ${String(directive["candidateEffect"])}`);
+    }
+    if (!Array.isArray(directive["planRefs"])) throw corrupt(`execution directive ${key} has a malformed planRefs array`);
+    for (const ref of directive["planRefs"] as unknown[]) {
+      if (!isRecord(ref) || typeof ref["kind"] !== "string") throw corrupt(`execution directive ${key} has a malformed planRef`);
+    }
+    const envelope = isRecord(directive["capabilityEnvelope"]) ? (directive["capabilityEnvelope"] as Record<string, unknown>) : undefined;
+    if (!envelope || EXECUTION_CAPABILITIES.some((capability) => typeof envelope[capability] !== "boolean")) {
+      throw corrupt(`execution directive ${key} has an invalid capability envelope`);
+    }
+    // Phase 6A — purpose/conflict/reconciliation extension shapes (semantic
+    // content; deep cross-record checks run in the Phase 6A block below).
+    if (directive["verificationPurpose"] !== undefined && !(VERIFICATION_PURPOSES as readonly string[]).includes(directive["verificationPurpose"] as string)) {
+      throw corrupt(`execution directive ${key} carries an invalid verificationPurpose`);
+    }
+    if (directive["conflictID"] !== undefined && directive["verificationPurpose"] !== "conflict_resolution") {
+      throw corrupt(`execution directive ${key} carries conflictID without verificationPurpose=conflict_resolution`);
+    }
+    if (directive["reconciliationTargets"] !== undefined) {
+      const targets = directive["reconciliationTargets"];
+      if (directive["kind"] !== "inspection" || directive["candidateEffect"] !== "non_mutating" || !Array.isArray(targets)) {
+        throw corrupt(`execution directive ${key} has malformed reconciliationTargets (inspection-kind, non-mutating, array required)`);
+      }
+      if (envelope["repositoryRead"] !== true || RECONCILIATION_FORBIDDEN_CAPABILITIES.some((capability) => envelope[capability] === true)) {
+        throw corrupt(`execution directive ${key} reconciliation inspection violates the non-mutating capability constraints`);
+      }
+    }
+    if (typeof directive["createdAt"] !== "string") throw corrupt(`execution directive ${key} is missing createdAt`);
+  }
+
+  const runningByRun = new Map<string, string>();
+  const seenAttemptDirective = new Set<string>();
+  for (const [attemptID, attempt] of Object.entries(executionAttempts)) {
+    if (!isRecord(attempt)) throw corrupt(`execution attempt ${attemptID} is not an object`);
+    if (attempt["id"] !== attemptID) throw corrupt(`execution attempt key ${attemptID} does not match its identity`);
+    const runID = attempt["executionRunID"];
+    const directiveRecord = isRecord(attempt["directive"]) ? (attempt["directive"] as Record<string, unknown>) : undefined;
+    const directiveKey = directiveRecord ? `${String(directiveRecord["id"])}@${String(directiveRecord["revision"])}` : "none";
+    const directive = executionDirectives[directiveKey];
+    if (!isRecord(directive)) throw corrupt(`execution attempt ${attemptID} references missing Directive revision ${directiveKey}`);
+    if (directiveRecord!["hash"] !== directive["hash"]) throw corrupt(`execution attempt ${attemptID} Directive hash mismatch`);
+    if (
+      attempt["executionRunID"] !== directive["executionRunID"] ||
+      attempt["stageID"] !== directive["stageID"] ||
+      attempt["windowID"] !== directive["windowID"]
+    ) {
+      throw corrupt(`execution attempt ${attemptID} run/stage/window disagree with its Directive`);
+    }
+    if (!(WORKER_ROLES as readonly string[]).includes(attempt["workerRole"] as string)) {
+      throw corrupt(`execution attempt ${attemptID} carries an invalid worker role ${String(attempt["workerRole"])}`);
+    }
+    if (!(EXECUTION_ATTEMPT_STATES as readonly string[]).includes(attempt["state"] as string)) {
+      throw corrupt(`execution attempt ${attemptID} carries an invalid state ${String(attempt["state"])}`);
+    }
+    if (!(DIRECTIVE_CANDIDATE_EFFECTS as readonly string[]).includes(attempt["candidateEffect"] as string)) {
+      throw corrupt(`execution attempt ${attemptID} carries an invalid candidateEffect`);
+    }
+    if (typeof attempt["startedAt"] !== "string") throw corrupt(`execution attempt ${attemptID} is missing startedAt`);
+    const indexKey = `${String(runID)}:${directiveKey}`;
+    if (executionAttemptByDirective[indexKey] !== attemptID) {
+      throw corrupt(`execution attempt ${attemptID} is not indexed under its exact Directive revision (or duplicates it)`);
+    }
+    if (seenAttemptDirective.has(indexKey)) throw corrupt(`multiple Attempts for the same Directive revision ${directiveKey}`);
+    seenAttemptDirective.add(indexKey);
+    if (attempt["state"] === "running") {
+      if (runningByRun.has(String(runID))) {
+        throw corrupt(`execution run ${String(runID)} has multiple running Attempts`);
+      }
+      runningByRun.set(String(runID), attemptID);
+      if (attempt["endedAt"] !== undefined) throw corrupt(`a running execution attempt ${attemptID} must not carry endedAt`);
+    }
+  }
+
+  const reportByAttempt = new Map<string, string>();
+  for (const [reportID, report] of Object.entries(executionReports)) {
+    if (!isRecord(report)) throw corrupt(`execution report ${reportID} is not an object`);
+    if (report["id"] !== reportID) throw corrupt(`execution report key ${reportID} does not match its identity`);
+    const attemptID = report["attemptID"];
+    const attempt = typeof attemptID === "string" ? executionAttempts[attemptID] : undefined;
+    if (!isRecord(attempt)) throw corrupt(`execution report ${reportID} references missing Attempt ${String(attemptID)}`);
+    const reportDirective = isRecord(report["directive"]) ? (report["directive"] as Record<string, unknown>) : undefined;
+    const attemptDirective = isRecord(attempt["directive"]) ? (attempt["directive"] as Record<string, unknown>) : undefined;
+    if (
+      !reportDirective ||
+      !attemptDirective ||
+      reportDirective["id"] !== attemptDirective["id"] ||
+      reportDirective["revision"] !== attemptDirective["revision"] ||
+      reportDirective["hash"] !== attemptDirective["hash"]
+    ) {
+      throw corrupt(`execution report ${reportID} references the wrong Directive revision/hash`);
+    }
+    if (report["workerRole"] !== attempt["workerRole"]) {
+      throw corrupt(`execution report ${reportID} worker role mismatches its Attempt`);
+    }
+    if (!(EXECUTION_REPORT_RESULTS as readonly string[]).includes(report["result"] as string)) {
+      throw corrupt(`execution report ${reportID} carries an invalid result ${String(report["result"])}`);
+    }
+    const blockers = Array.isArray(report["blockers"]) ? (report["blockers"] as unknown[]) : undefined;
+    if (!blockers) throw corrupt(`execution report ${reportID} has a malformed blockers array`);
+    for (const blocker of blockers) {
+      if (!isRecord(blocker) || !(EXECUTION_BLOCKER_KINDS as readonly string[]).includes(blocker["kind"] as string)) {
+        throw corrupt(`execution report ${reportID} carries an invalid blocker entry`);
+      }
+    }
+    if (report["result"] === "blocked" && blockers.length === 0) {
+      throw corrupt(`execution report ${reportID} is blocked without a structured blocker`);
+    }
+    if (report["result"] !== "blocked" && blockers.length > 0) {
+      throw corrupt(`execution report ${reportID} carries blockers on a non-blocked result`);
+    }
+    if (!(CANDIDATE_MUTATIONS as readonly string[]).includes(report["candidateMutation"] as string)) {
+      throw corrupt(`execution report ${reportID} carries an invalid candidateMutation`);
+    }
+    const base = report["baseCandidateRevision"];
+    const resulting = report["resultingCandidateRevision"];
+    if (typeof base !== "number" || !Number.isInteger(base) || base < 0 || typeof resulting !== "number" || !Number.isInteger(resulting)) {
+      throw corrupt(`execution report ${reportID} has malformed candidate revision provenance`);
+    }
+    if (report["candidateMutation"] === "changed" && resulting !== base + 1) {
+      throw corrupt(`execution report ${reportID} provenance impossible (changed must advance exactly +1)`);
+    }
+    if (report["candidateMutation"] === "none" && resulting !== base) {
+      throw corrupt(`execution report ${reportID} provenance impossible (no mutation must keep the revision)`);
+    }
+    const directiveForBase = executionDirectives[`${String(attemptDirective!["id"])}@${String(attemptDirective!["revision"])}`];
+    if (isRecord(directiveForBase) && base < (directiveForBase["baseCandidateRevision"] as number)) {
+      throw corrupt(`execution report ${reportID} candidate revision provenance is impossible (precedes the Directive base)`);
+    }
+    // Phase 6A §32/§47 — the optional extensions are legal ONLY on matching
+    // directives, and a reconciliation inspection report MUST observe.
+    if (report["conflictResolutionOutcome"] !== undefined) {
+      if (!isRecord(directiveForBase) || directiveForBase["verificationPurpose"] !== "conflict_resolution") {
+        throw corrupt(`execution report ${reportID} carries conflictResolutionOutcome on a non-conflict-resolution Directive`);
+      }
+      assertConflictResolutionOutcomeVocabulary(report["conflictResolutionOutcome"] as string);
+    }
+    if (report["reconciliationObservation"] !== undefined) {
+      if (!isRecord(directiveForBase) || !Array.isArray(directiveForBase["reconciliationTargets"])) {
+        throw corrupt(`execution report ${reportID} carries reconciliationObservation on a non-reconciliation Directive`);
+      }
+      assertReconciliationObservationVocabulary(report["reconciliationObservation"] as string);
+    }
+    if (isRecord(directiveForBase) && Array.isArray(directiveForBase["reconciliationTargets"]) && report["reconciliationObservation"] === undefined) {
+      throw corrupt(`execution report ${reportID} answers a reconciliation inspection without a reconciliationObservation`);
+    }
+    if (typeof report["createdAt"] !== "string") throw corrupt(`execution report ${reportID} is missing createdAt`);
+    if (reportByAttempt.has(String(attemptID))) throw corrupt(`duplicate Report for Attempt ${String(attemptID)}`);
+    reportByAttempt.set(String(attemptID), reportID);
+  }
+
+  for (const [attemptID, attempt] of Object.entries(executionAttempts)) {
+    const hasReport = reportByAttempt.has(attemptID);
+    if (attempt["state"] === "reported" && !hasReport) {
+      throw corrupt(`reported execution attempt ${attemptID} has no durable Report`);
+    }
+    if (attempt["state"] === "indeterminate" && hasReport) {
+      throw corrupt(`indeterminate execution attempt ${attemptID} carries a Report`);
+    }
+    if (attempt["state"] !== "running" && typeof attempt["endedAt"] !== "string") {
+      throw corrupt(`terminal execution attempt ${attemptID} is missing endedAt`);
+    }
+  }
+
+  for (const [indexKey, attemptID] of Object.entries(executionAttemptByDirective)) {
+    if (!isRecord(executionAttempts[attemptID])) {
+      throw corrupt(`execution attempt index ${indexKey} references missing attempt ${String(attemptID)}`);
+    }
+  }
+
+
+  // -- v0.2.0 Phase 6A escalation families (declared early: the Phase 5 commit
+  // loop validates reconciliationRefs against them) -----------------------------
+  const executionIssues = isRecord(doc.executionIssues)
+    ? (doc.executionIssues as Record<string, Record<string, unknown>>)
+    : {};
+  const issueByExecutionRun = isRecord(doc.issueByExecutionRun)
+    ? (doc.issueByExecutionRun as Record<string, string>)
+    : {};
+  const verificationConflicts = isRecord(doc.verificationConflicts)
+    ? (doc.verificationConflicts as Record<string, Record<string, unknown>>)
+    : {};
+  const attemptReconciliations = isRecord(doc.attemptReconciliations)
+    ? (doc.attemptReconciliations as Record<string, Record<string, unknown>>)
+    : {};
+  const reconciliationByAttempt = isRecord(doc.reconciliationByAttempt)
+    ? (doc.reconciliationByAttempt as Record<string, string>)
+    : {};
+
+  // -- v0.2.0 Phase 5 acceptance layer (fail-closed, directive SS51-SS53) ------
+  // ADDITIVE families (pre-Phase-5 documents = "nothing was ever accepted").
+  // The full accepted-state graph is validated: assessment bindings and
+  // obligation subsets, accept-only commits, candidate/parent agreement, the
+  // linear commit chain with acceptedHead at its tip, one commit per window,
+  // window bases that may now anchor to a commit of the same run, and
+  // completed Stages carrying closure provenance with full obligation
+  // coverage — fail closed, never repaired.
+  const supervisorAssessments = isRecord(doc.supervisorAssessments)
+    ? (doc.supervisorAssessments as Record<string, Record<string, unknown>>)
+    : {};
+  const executionCommits = isRecord(doc.executionCommits)
+    ? (doc.executionCommits as Record<string, Record<string, unknown>>)
+    : {};
+  const executionCommitByWindow = isRecord(doc.executionCommitByWindow)
+    ? (doc.executionCommitByWindow as Record<string, string>)
+    : {};
+  const executionCommitByAssessment = isRecord(doc.executionCommitByAssessment)
+    ? (doc.executionCommitByAssessment as Record<string, string>)
+    : {};
+
+  // Window bases anchored to a commit: the commit must exist and belong to the same run (SS52).
+  for (const [windowID, win] of Object.entries(verificationWindows)) {
+    if (!isRecord(win)) continue;
+    const base = isRecord(win["baseAcceptedState"]) ? (win["baseAcceptedState"] as Record<string, unknown>) : undefined;
+    if (base && base["kind"] === "execution_commit") {
+      const anchor = typeof base["executionCommitID"] === "string" ? executionCommits[base["executionCommitID"]] : undefined;
+      if (!isRecord(anchor) || anchor["executionRunID"] !== win["executionRunID"]) {
+        throw corrupt(`verification window ${windowID} anchors a missing/foreign execution commit ${String(base["executionCommitID"])}`);
+      }
+    }
+  }
+
+  const commitIDsByRun = new Map<string, string[]>();
+  for (const [assessmentID, assessment] of Object.entries(supervisorAssessments)) {
+    if (!isRecord(assessment)) throw corrupt(`supervisor assessment ${assessmentID} is not an object`);
+    if (assessment["id"] !== assessmentID) throw corrupt(`supervisor assessment key ${assessmentID} does not match its identity`);
+    const runID = assessment["executionRunID"];
+    if (typeof runID !== "string" || !isRecord(executionRuns[runID])) {
+      throw corrupt(`supervisor assessment ${assessmentID} references missing execution run ${String(runID)}`);
+    }
+    const stageID = assessment["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage) || stage["executionRunID"] !== runID) {
+      throw corrupt(`supervisor assessment ${assessmentID} references a missing/foreign Stage`);
+    }
+    const windowID = assessment["windowID"];
+    const win = typeof windowID === "string" ? verificationWindows[windowID] : undefined;
+    if (!isRecord(win) || win["executionRunID"] !== runID || win["stageID"] !== stageID) {
+      throw corrupt(`supervisor assessment ${assessmentID} references a Window outside its Stage/Run`);
+    }
+    if (typeof assessment["candidateRevision"] !== "number" || !Number.isInteger(assessment["candidateRevision"]) || (assessment["candidateRevision"] as number) < 0) {
+      throw corrupt(`supervisor assessment ${assessmentID} has a malformed candidateRevision`);
+    }
+    if (!(ASSESSMENT_DISPOSITIONS as readonly string[]).includes(assessment["disposition"] as string)) {
+      throw corrupt(`supervisor assessment ${assessmentID} carries an invalid disposition`);
+    }
+    if (!(ASSESSMENT_ACCEPTANCE_SCOPES as readonly string[]).includes(assessment["acceptanceScope"] as string)) {
+      throw corrupt(`supervisor assessment ${assessmentID} carries an invalid acceptanceScope`);
+    }
+    for (const ref of (Array.isArray(assessment["reportRefs"]) ? assessment["reportRefs"] : []) as unknown[]) {
+      const reportID = typeof ref === "string" ? ref : isRecord(ref) ? ref["id"] : undefined;
+      const report = typeof reportID === "string" ? executionReports[reportID] : undefined;
+      if (!isRecord(report)) throw corrupt(`supervisor assessment ${assessmentID} references missing Report ${String(reportID)}`);
+      const attemptID = report["attemptID"];
+      const attempt = typeof attemptID === "string" ? executionAttempts[attemptID] : undefined;
+      if (!isRecord(attempt) || attempt["windowID"] !== windowID) {
+        throw corrupt(`supervisor assessment ${assessmentID} references a Report outside its Window`);
+      }
+    }
+    if (typeof assessment["hash"] !== "string" || computeSupervisorAssessmentHashFromRecord(assessment as never) !== assessment["hash"]) {
+      throw corrupt(`supervisor assessment ${assessmentID} content does not recompute to its canonical hash`);
+    }
+    if (typeof assessment["createdAt"] !== "string") throw corrupt(`supervisor assessment ${assessmentID} is missing createdAt`);
+    // SS79: covered obligations must be exact Stage obligations.
+    const stageObligationIDs = new Set(
+      ((isRecord(stage["completionObligations"]) ? Object.values(stage["completionObligations"]) : (Array.isArray(stage["completionObligations"]) ? stage["completionObligations"] : [])) as unknown[]).map(
+        (obligation) => (isRecord(obligation) ? String(obligation["id"]) : ""),
+      ),
+    );
+    for (const ref of (Array.isArray(assessment["coveredObligations"]) ? assessment["coveredObligations"] : []) as unknown[]) {
+      if (typeof ref !== "string" || !stageObligationIDs.has(ref)) {
+        throw corrupt(`supervisor assessment ${assessmentID} covers unknown Stage obligation ${String(ref)}`);
+      }
+    }
+  }
+
+  const commitByWindowTally = new Map<string, string>();
+  const parentTally = new Map<string, string>();
+  for (const [commitID, commit] of Object.entries(executionCommits)) {
+    if (!isRecord(commit)) throw corrupt(`execution commit ${commitID} is not an object`);
+    if (commit["id"] !== commitID) throw corrupt(`execution commit key ${commitID} does not match its identity`);
+    const runID = commit["executionRunID"];
+    if (typeof runID !== "string" || !isRecord(executionRuns[runID])) {
+      throw corrupt(`execution commit ${commitID} references missing execution run ${String(runID)}`);
+    }
+    const stageID = commit["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage) || stage["executionRunID"] !== runID) {
+      throw corrupt(`execution commit ${commitID} references missing Stage ${String(stageID)}`);
+    }
+    const windowID = commit["windowID"];
+    const win = typeof windowID === "string" ? verificationWindows[windowID] : undefined;
+    if (!isRecord(win) || win["executionRunID"] !== runID || win["stageID"] !== stageID) {
+      throw corrupt(`execution commit ${commitID} references a Window outside its Stage/Run`);
+    }
+    // One commit per window + the window must actually be closed.
+    if (win["state"] !== "closed") throw corrupt(`execution commit ${commitID} references a Window that is not closed`);
+    if (executionCommitByWindow[windowID as string] !== commitID) {
+      throw corrupt(`execution commit ${commitID} is not indexed as its window's commit`);
+    }
+    if (commitByWindowTally.has(windowID as string)) {
+      throw corrupt(`two execution commits for Window ${String(windowID)}`);
+    }
+    commitByWindowTally.set(windowID as string, commitID);
+    // The assessment must exist, be accept, and agree on window+candidate.
+    const assessmentID = commit["supervisorAssessmentID"];
+    const assessment = typeof assessmentID === "string" ? supervisorAssessments[assessmentID] : undefined;
+    if (!isRecord(assessment)) throw corrupt(`execution commit ${commitID} references missing SupervisorAssessment ${String(assessmentID)}`);
+    if (assessment["disposition"] !== "accept") {
+      throw corrupt(`execution commit ${commitID} is backed by a non-accept assessment`);
+    }
+    if (executionCommitByAssessment[assessmentID as string] !== commitID) {
+      throw corrupt(`execution commit ${commitID} is not indexed under its assessment`);
+    }
+    if (
+      assessment["executionRunID"] !== runID ||
+      assessment["stageID"] !== stageID ||
+      assessment["windowID"] !== windowID ||
+      assessment["candidateRevision"] !== commit["candidateRevision"] ||
+      win["candidateRevision"] !== commit["candidateRevision"]
+    ) {
+      throw corrupt(`execution commit ${commitID} candidate/window binding disagrees with its assessment or window`);
+    }
+    // Parent: copied from the window base + linear within the run.
+    if (stableStringifyForDoc(commit["parentAcceptedState"]) !== stableStringifyForDoc(win["baseAcceptedState"])) {
+      throw corrupt(`execution commit ${commitID} parentAcceptedState disagrees with its window anchor`);
+    }
+    const parent = commit["parentAcceptedState"];
+    if (isRecord(parent) && parent["kind"] === "execution_commit") {
+      const parentID = parent["executionCommitID"];
+      const parentCommit = typeof parentID === "string" ? executionCommits[parentID] : undefined;
+      if (!isRecord(parentCommit) || parentCommit["executionRunID"] !== runID) {
+        throw corrupt(`execution commit ${commitID} parents a missing/foreign commit ${String(parentID)}`);
+      }
+      parentTally.set(String(parentID), commitID);
+    }
+    // Satisfied obligations ⊆ Stage obligations.
+    const stageObligationIDs = new Set(
+      ((Array.isArray(stage["completionObligations"]) ? stage["completionObligations"] : []) as unknown[]).map(
+        (obligation) => (isRecord(obligation) ? String(obligation["id"]) : ""),
+      ),
+    );
+    for (const ref of (Array.isArray(commit["satisfiedObligations"]) ? commit["satisfiedObligations"] : []) as unknown[]) {
+      if (typeof ref !== "string" || !stageObligationIDs.has(ref)) {
+        throw corrupt(`execution commit ${commitID} satisfies unknown Stage obligation ${String(ref)}`);
+      }
+    }
+    // Phase 6A §90 — reconciliation provenance must resolve to reconciliations
+    // of the committed window (optional additive field).
+    for (const ref of (Array.isArray(commit["reconciliationRefs"]) ? commit["reconciliationRefs"] : []) as unknown[]) {
+      const reconciliation = typeof ref === "string" ? attemptReconciliations[ref] : undefined;
+      if (!isRecord(reconciliation) || reconciliation["windowID"] !== windowID) {
+        throw corrupt(`execution commit ${commitID} references missing/foreign reconciliation ${String(ref)}`);
+      }
+    }
+    if (typeof commit["createdAt"] !== "string") throw corrupt(`execution commit ${commitID} is missing createdAt`);
+    if (!Array.isArray(commit["reportRefs"]) || !Array.isArray(commit["directiveRefs"])) {
+      throw corrupt(`execution commit ${commitID} has malformed window provenance`);
+    }
+    const runCommits = commitIDsByRun.get(runID as string) ?? [];
+    runCommits.push(commitID);
+    commitIDsByRun.set(runID as string, runCommits);
+  }
+
+  // Linear chain + acceptedHead at the tip, per run.
+  for (const [runID, commitIDs] of commitIDsByRun) {
+    const run = executionRuns[runID];
+    // Exactly one chain tip (a commit nobody parents).
+    const tips = commitIDs.filter((id) => !parentTally.has(id));
+    if (tips.length !== 1) {
+      throw corrupt(`execution run ${runID} commit chain is not linear (${tips.length} tips)`);
+    }
+    const tip = tips[0]!;
+    const acceptedHead = isRecord(run) ? run["acceptedHead"] : undefined;
+    if (acceptedHead === undefined || acceptedHead === null) {
+      throw corrupt(`execution run ${runID} has commits but no acceptedHead`);
+    }
+    if (acceptedHead !== tip) {
+      throw corrupt(`execution run ${runID} acceptedHead ${String(acceptedHead)} is not the chain tip ${tip}`);
+    }
+  }
+
+  // Completed Stages need closure provenance: a stageCompleted commit whose
+  // obligation union (with prior accepted commits) covers ALL obligations.
+  for (const [stageID, stage] of Object.entries(executionStages)) {
+    if (stage["status"] !== "completed") continue;
+    const runID = stage["executionRunID"];
+    const closureCommit = Object.values(executionCommits).find(
+      (commit) => isRecord(commit) && commit["stageID"] === stageID && commit["executionRunID"] === runID && commit["stageCompleted"] === true,
+    );
+    if (!closureCommit) {
+      throw corrupt(`completed execution stage ${stageID} has no closure commit`);
+    }
+    const covered = new Set<string>();
+    for (const commit of Object.values(executionCommits)) {
+      if (isRecord(commit) && commit["executionRunID"] === runID && commit["stageID"] === stageID) {
+        for (const ref of (Array.isArray(commit["satisfiedObligations"]) ? commit["satisfiedObligations"] : []) as unknown[]) {
+          covered.add(String(ref));
+        }
+      }
+    }
+    const allCovered = ((Array.isArray(stage["completionObligations"]) ? stage["completionObligations"] : []) as unknown[]).every(
+      (obligation) => covered.has(String(isRecord(obligation) ? obligation["id"] : "")),
+    );
+    if (!allCovered) {
+      throw corrupt(`completed execution stage ${stageID} lacks full obligation coverage in its accepted commits`);
+    }
+    // run.activeStage must be absent for its completed stage's run when that stage was the active one.
+    const runRecord = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (isRecord(runRecord) && runRecord["activeStage"] === stageID) {
+      throw corrupt(`execution run ${runID} still points activeStage at completed Stage ${stageID}`);
+    }
+  }
+
+  // Acceptance indexes must resolve (a closed committed window always keeps its commit).
+  for (const [windowID, commitID] of Object.entries(executionCommitByWindow)) {
+    if (!isRecord(executionCommits[commitID])) {
+      throw corrupt(`execution commit index for window ${windowID} references missing commit ${String(commitID)}`);
+    }
+  }
+  for (const [assessmentID, commitID] of Object.entries(executionCommitByAssessment)) {
+    if (!isRecord(executionCommits[commitID])) {
+      throw corrupt(`execution commit index for assessment ${assessmentID} references missing commit ${String(commitID)}`);
+    }
+  }
+
+  // -- v0.2.0 Phase 6A escalation control plane (fail-closed, §59-§62) --------
+  // ADDITIVE families (pre-Phase-6A documents = "nothing ever escalated";
+  // the family records themselves were declared before the Phase 5 block).
+  // The full escalation graph is validated: bidirectional issue↔replan_required
+  // consistency, request_replan source assessments bound to the exact captured
+  // candidate, exact FinalPlan-reachable affected refs, accepted-history
+  // snapshots, exact evidence refs, resolver uniqueness/role/purpose/candidate
+  // binding, deterministic neutralization, and reconciliation targets/
+  // observation/revision arithmetic — fail closed, never repaired.
+
+  /** Resolve the committed FinalPlan record behind an execution run (same provenance chain as the Directive loop). */
+  const finalPlanRecordForRun = (runRecord: Record<string, unknown>): Record<string, unknown> | undefined => {
+    const runFinalPlan = isRecord(runRecord["finalPlan"]) ? (runRecord["finalPlan"] as Record<string, unknown>) : undefined;
+    const planID = runRecord["planID"];
+    const planFamily = typeof planID === "string" && isRecord(finalPlans[planID]) ? (finalPlans[planID] as Record<string, unknown>) : undefined;
+    if (!runFinalPlan || !planFamily) return undefined;
+    const record = planFamily[`${String(runFinalPlan["id"])}@${String(runFinalPlan["revision"])}`];
+    return isRecord(record) ? record : undefined;
+  };
+
+  const shapeCheckEvidenceRef = (value: unknown, where: string): void => {
+    try {
+      assertVerificationEvidenceRef(value);
+    } catch {
+      throw corrupt(`${where} carries a malformed verification evidence ref`);
+    }
+  };
+
+  for (const [issueID, issue] of Object.entries(executionIssues)) {
+    if (!isRecord(issue)) throw corrupt(`execution issue ${issueID} is not an object`);
+    if (issue["id"] !== issueID) throw corrupt(`execution issue key ${issueID} does not match its identity`);
+    const runID = issue["executionRunID"];
+    const run = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (!isRecord(run)) throw corrupt(`execution issue ${issueID} references missing execution run ${String(runID)}`);
+    // §60 — an issue can only exist on a terminal replan_required run, and the
+    // run must index it back (bidirectional consistency for new data).
+    if (run["lifecycle"] !== "replan_required") {
+      throw corrupt(`execution issue ${issueID} is attached to a ${String(run["lifecycle"])} run`);
+    }
+    if (issueByExecutionRun[String(runID)] !== issueID) {
+      throw corrupt(`execution issue ${issueID} is not indexed as its run's issue`);
+    }
+    // §59 — the exact FinalPlan binding must be preserved in the issue.
+    const runFinalPlan = isRecord(run["finalPlan"]) ? (run["finalPlan"] as Record<string, unknown>) : undefined;
+    const issueFinalPlan = isRecord(issue["finalPlanRef"]) ? (issue["finalPlanRef"] as Record<string, unknown>) : undefined;
+    if (
+      !runFinalPlan ||
+      !issueFinalPlan ||
+      issueFinalPlan["id"] !== runFinalPlan["id"] ||
+      issueFinalPlan["revision"] !== runFinalPlan["revision"]
+    ) {
+      throw corrupt(`execution issue ${issueID} FinalPlan ref disagrees with the run's binding`);
+    }
+    // §59 — the source assessment must be a request_replan judgment of this run.
+    const sourceAssessmentID = issue["sourceAssessmentID"];
+    const assessment = typeof sourceAssessmentID === "string" ? supervisorAssessments[sourceAssessmentID] : undefined;
+    if (!isRecord(assessment)) {
+      throw corrupt(`execution issue ${issueID} references missing source assessment ${String(sourceAssessmentID)}`);
+    }
+    if (assessment["executionRunID"] !== runID || assessment["disposition"] !== "request_replan") {
+      throw corrupt(`execution issue ${issueID} source assessment is not a request_replan judgment of its run`);
+    }
+    if (
+      issue["activeStageID"] !== assessment["stageID"] ||
+      issue["openWindowID"] !== assessment["windowID"] ||
+      issue["candidateRevision"] !== assessment["candidateRevision"]
+    ) {
+      throw corrupt(`execution issue ${issueID} captured candidate context disagrees with its source assessment`);
+    }
+    if (run["activeStage"] !== issue["activeStageID"] || run["openWindow"] !== issue["openWindowID"]) {
+      throw corrupt(`execution issue ${issueID} captured structure disagrees with the terminal run's frozen structure`);
+    }
+    if (typeof issue["reason"] !== "string" || (issue["reason"] as string).length === 0) {
+      throw corrupt(`execution issue ${issueID} has a malformed reason`);
+    }
+    // §59 — affectedPlanRefs must resolve exactly inside the bound FinalPlan.
+    const planRecord = finalPlanRecordForRun(run);
+    const affected = Array.isArray(issue["affectedPlanRefs"]) ? (issue["affectedPlanRefs"] as unknown[]) : undefined;
+    if (!planRecord || !affected) {
+      throw corrupt(`execution issue ${issueID} has malformed affectedPlanRefs or an unresolvable FinalPlan record`);
+    }
+    try {
+      validateExecutionPlanRefs(affected as never, planRecord as never);
+    } catch {
+      throw corrupt(`execution issue ${issueID} affectedPlanRefs do not resolve inside the bound FinalPlan`);
+    }
+    // reportRefs must be provenance of this run.
+    for (const ref of (Array.isArray(issue["reportRefs"]) ? issue["reportRefs"] : []) as unknown[]) {
+      const report = typeof ref === "string" ? executionReports[ref] : undefined;
+      const attemptID = isRecord(report) ? report["attemptID"] : undefined;
+      const attempt = typeof attemptID === "string" ? executionAttempts[attemptID] : undefined;
+      if (!isRecord(report) || !isRecord(attempt) || attempt["executionRunID"] !== runID) {
+        throw corrupt(`execution issue ${issueID} references missing/foreign Report ${String(ref)}`);
+      }
+    }
+    // §59 — accepted-history snapshot: the chain tip and the FULL chain.
+    if ((issue["acceptedHead"] ?? undefined) !== (run["acceptedHead"] ?? undefined)) {
+      throw corrupt(`execution issue ${issueID} acceptedHead snapshot disagrees with the run`);
+    }
+    const runCommits = Object.entries(executionCommits)
+      .filter(([, commit]) => isRecord(commit) && commit["executionRunID"] === runID)
+      .map(([commitKey]) => commitKey);
+    const issueCommitRefs = (Array.isArray(issue["acceptedCommitRefs"]) ? issue["acceptedCommitRefs"] : []) as unknown[];
+    if (
+      issueCommitRefs.length !== runCommits.length ||
+      !issueCommitRefs.every((ref) => typeof ref === "string" && runCommits.includes(ref)) ||
+      (run["acceptedHead"] !== undefined && !issueCommitRefs.includes(run["acceptedHead"] as string))
+    ) {
+      throw corrupt(`execution issue ${issueID} accepted commit history is impossible`);
+    }
+    for (const ref of issueCommitRefs) {
+      const commit = executionCommits[ref as string];
+      if (!isRecord(commit) || commit["executionRunID"] !== runID) {
+        throw corrupt(`execution issue ${issueID} accepted commit ${String(ref)} is missing/foreign`);
+      }
+    }
+    const stageRef = issue["activeStageID"];
+    if (stageRef !== undefined && (typeof stageRef !== "string" || executionStages[stageRef]?.["executionRunID"] !== runID)) {
+      throw corrupt(`execution issue ${issueID} references a missing/foreign Stage ${String(stageRef)}`);
+    }
+    const windowRef = issue["openWindowID"];
+    if (windowRef !== undefined && (typeof windowRef !== "string" || verificationWindows[windowRef]?.["executionRunID"] !== runID)) {
+      throw corrupt(`execution issue ${issueID} references a missing/foreign Window ${String(windowRef)}`);
+    }
+    for (const ref of (Array.isArray(issue["verificationConflictRefs"]) ? issue["verificationConflictRefs"] : []) as unknown[]) {
+      const conflict = typeof ref === "string" ? verificationConflicts[ref] : undefined;
+      if (!isRecord(conflict) || conflict["executionRunID"] !== runID) {
+        throw corrupt(`execution issue ${issueID} references missing/foreign conflict ${String(ref)}`);
+      }
+    }
+    for (const ref of (Array.isArray(issue["unresolvedIndeterminateAttemptRefs"]) ? issue["unresolvedIndeterminateAttemptRefs"] : []) as unknown[]) {
+      const attempt = typeof ref === "string" ? executionAttempts[ref] : undefined;
+      if (!isRecord(attempt) || attempt["executionRunID"] !== runID || attempt["state"] !== "indeterminate") {
+        throw corrupt(`execution issue ${issueID} references a missing/non-indeterminate Attempt ${String(ref)}`);
+      }
+      if (reconciliationByAttempt[ref as string] !== undefined) {
+        throw corrupt(`execution issue ${issueID} lists reconciled Attempt ${String(ref)} as unresolved`);
+      }
+    }
+    if (typeof issue["hash"] !== "string" || computeExecutionIssueHashFromRecord(issue as never) !== issue["hash"]) {
+      throw corrupt(`execution issue ${issueID} content does not recompute to its canonical hash`);
+    }
+    if (typeof issue["createdAt"] !== "string") throw corrupt(`execution issue ${issueID} is missing createdAt`);
+  }
+
+  // §60 — every replan_required run carries exactly one valid terminal issue.
+  for (const [runID, run] of Object.entries(executionRuns)) {
+    if (!isRecord(run) || run["lifecycle"] !== "replan_required") continue;
+    const issueID = issueByExecutionRun[runID];
+    if (typeof issueID !== "string" || !isRecord(executionIssues[issueID])) {
+      throw corrupt(`replan_required execution run ${runID} has no durable ExecutionIssue`);
+    }
+  }
+
+  // Resolver-uniqueness scan: at most ONE conflict_resolution Directive per
+  // conflict, and it must be the recorded binding (§29/§61/§92).
+  const resolversByConflict = new Map<string, string[]>();
+  for (const [key, directive] of Object.entries(executionDirectives)) {
+    if (!isRecord(directive) || directive["verificationPurpose"] !== "conflict_resolution") continue;
+    const conflictID = directive["conflictID"];
+    if (typeof conflictID !== "string") {
+      throw corrupt(`conflict-resolution directive ${key} carries no conflictID`);
+    }
+    const conflict = verificationConflicts[conflictID];
+    if (!isRecord(conflict)) {
+      throw corrupt(`conflict-resolution directive ${key} references missing conflict ${conflictID}`);
+    }
+    const list = resolversByConflict.get(conflictID) ?? [];
+    list.push(key);
+    resolversByConflict.set(conflictID, list);
+  }
+  for (const [conflictID, resolverKeys] of resolversByConflict) {
+    if (resolverKeys.length > 1) {
+      throw corrupt(`verification conflict ${conflictID} has ${resolverKeys.length} conflict-resolution Directives (exactly one is the hard limit)`);
+    }
+    const conflict = verificationConflicts[conflictID]!;
+    const binding = conflict["resolutionDirectiveRef"];
+    if (isRecord(binding)) {
+      const boundKey = `${String(binding["id"])}@${String(binding["revision"])}`;
+      if (boundKey !== resolverKeys[0]) {
+        throw corrupt(`verification conflict ${conflictID} resolver binding disagrees with the durable conflict-resolution Directive`);
+      }
+    }
+  }
+
+  for (const [conflictID, conflict] of Object.entries(verificationConflicts)) {
+    if (!isRecord(conflict)) throw corrupt(`verification conflict ${conflictID} is not an object`);
+    if (conflict["id"] !== conflictID) throw corrupt(`verification conflict key ${conflictID} does not match its identity`);
+    const runID = conflict["executionRunID"];
+    const run = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (!isRecord(run)) throw corrupt(`verification conflict ${conflictID} references missing execution run ${String(runID)}`);
+    const stageID = conflict["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage) || stage["executionRunID"] !== runID) {
+      throw corrupt(`verification conflict ${conflictID} references a missing/foreign Stage`);
+    }
+    const windowID = conflict["windowID"];
+    const win = typeof windowID === "string" ? verificationWindows[windowID] : undefined;
+    if (!isRecord(win) || win["executionRunID"] !== runID || win["stageID"] !== stageID) {
+      throw corrupt(`verification conflict ${conflictID} references a Window outside its Stage/Run`);
+    }
+    const candidateRevision = conflict["candidateRevision"];
+    if (typeof candidateRevision !== "number" || !Number.isInteger(candidateRevision) || candidateRevision < 0) {
+      throw corrupt(`verification conflict ${conflictID} has a malformed candidateRevision`);
+    }
+    // History is legal; the FUTURE is not — a conflict can never bind beyond its window.
+    if (candidateRevision > (win["candidateRevision"] as number)) {
+      throw corrupt(`verification conflict ${conflictID} binds candidateRevision beyond its window`);
+    }
+    shapeCheckEvidenceRef(conflict["evidenceA"], `verification conflict ${conflictID} evidenceA`);
+    shapeCheckEvidenceRef(conflict["evidenceB"], `verification conflict ${conflictID} evidenceB`);
+    if (stableStringifyForDoc(conflict["evidenceA"]) === stableStringifyForDoc(conflict["evidenceB"])) {
+      throw corrupt(`verification conflict ${conflictID} evidence A and B are the same ref`);
+    }
+    for (const side of ["evidenceA", "evidenceB"] as const) {
+      const ref = conflict[side] as Record<string, unknown>;
+      const report = typeof ref["reportID"] === "string" ? executionReports[ref["reportID"]] : undefined;
+      const attemptID = isRecord(report) ? report["attemptID"] : undefined;
+      const attempt = typeof attemptID === "string" ? executionAttempts[attemptID] : undefined;
+      if (!isRecord(report) || !isRecord(attempt) || attempt["windowID"] !== windowID) {
+        throw corrupt(`verification conflict ${conflictID} ${side} references a Report outside its Window`);
+      }
+      if (report["baseCandidateRevision"] !== candidateRevision) {
+        throw corrupt(`verification conflict ${conflictID} ${side} evidence binds a different candidate than the conflict`);
+      }
+      if (ref["kind"] === "finding" && (ref["findingIndex"] as number) >= (Array.isArray(report["findings"]) ? (report["findings"] as unknown[]).length : 0)) {
+        throw corrupt(`verification conflict ${conflictID} ${side} findingIndex is out of bounds`);
+      }
+    }
+    if (
+      typeof conflict["claimA"] !== "string" || (conflict["claimA"] as string).length === 0 ||
+      typeof conflict["claimB"] !== "string" || (conflict["claimB"] as string).length === 0 ||
+      typeof conflict["resolutionQuestion"] !== "string" || (conflict["resolutionQuestion"] as string).length === 0
+    ) {
+      throw corrupt(`verification conflict ${conflictID} has malformed claims/question`);
+    }
+    if (!(VERIFICATION_CONFLICT_STATUSES as readonly string[]).includes(conflict["status"] as string)) {
+      throw corrupt(`verification conflict ${conflictID} carries an invalid status`);
+    }
+    const outcome = conflict["resolutionOutcome"];
+    if (outcome !== undefined) {
+      if (!(CONFLICT_RESOLUTION_OUTCOMES as readonly string[]).includes(outcome as string)) {
+        throw corrupt(`verification conflict ${conflictID} carries an invalid resolutionOutcome`);
+      }
+    }
+    if (conflict["status"] === "open") {
+      if (conflict["resolutionReportRef"] !== undefined || outcome !== undefined || conflict["resolvedAt"] !== undefined) {
+        throw corrupt(`open verification conflict ${conflictID} carries finalization state`);
+      }
+    } else {
+      // Terminal conflicts must carry their consumed resolver (§61).
+      const reportRef = conflict["resolutionReportRef"];
+      const report = typeof reportRef === "string" ? executionReports[reportRef] : undefined;
+      if (!isRecord(report)) {
+        throw corrupt(`terminal verification conflict ${conflictID} has no consumed resolution Report`);
+      }
+      if (typeof conflict["resolvedAt"] !== "string") {
+        throw corrupt(`terminal verification conflict ${conflictID} is missing resolvedAt`);
+      }
+      const attemptID = report["attemptID"];
+      const attempt = typeof attemptID === "string" ? executionAttempts[attemptID] : undefined;
+      const attemptDirective = isRecord(attempt) && isRecord(attempt["directive"]) ? (attempt["directive"] as Record<string, unknown>) : undefined;
+      const resolverDirective = attemptDirective ? executionDirectives[`${String(attemptDirective["id"])}@${String(attemptDirective["revision"])}`] : undefined;
+      if (
+        !isRecord(attempt) ||
+        !isRecord(resolverDirective) ||
+        resolverDirective["verificationPurpose"] !== "conflict_resolution" ||
+        resolverDirective["conflictID"] !== conflictID ||
+        report["workerRole"] !== "verifier" ||
+        report["baseCandidateRevision"] !== candidateRevision
+      ) {
+        throw corrupt(`verification conflict ${conflictID} resolution Report has the wrong role/kind/purpose/candidate`);
+      }
+      const neutralized = (Array.isArray(conflict["neutralizedEvidenceRefs"]) ? conflict["neutralizedEvidenceRefs"] : []) as unknown[];
+      if (conflict["status"] === "resolved") {
+        if (
+          report["result"] !== "completed" ||
+          report["candidateMutation"] !== "none" ||
+          outcome === undefined ||
+          outcome === "unresolved"
+        ) {
+          throw corrupt(`resolved verification conflict ${conflictID} was finalized by a non-adjudicating report`);
+        }
+        const derived = neutralizedEvidenceForOutcome(outcome as never, conflict["evidenceA"] as never, conflict["evidenceB"] as never);
+        if (
+          neutralized.length !== derived.length ||
+          !neutralized.every((ref) => derived.some((candidate) => stableStringifyForDoc(candidate) === stableStringifyForDoc(ref)))
+        ) {
+          throw corrupt(`verification conflict ${conflictID} neutralized evidence does not match the deterministic outcome rule`);
+        }
+      } else {
+        // verification_blocked: no neutralization may have happened.
+        if (neutralized.length > 0) {
+          throw corrupt(`verification_blocked conflict ${conflictID} carries neutralized evidence`);
+        }
+        if (report["result"] === "completed" && outcome !== "unresolved") {
+          throw corrupt(`verification_blocked conflict ${conflictID} was blocked by an adjudicating report`);
+        }
+      }
+    }
+    if (typeof conflict["createdAt"] !== "string") throw corrupt(`verification conflict ${conflictID} is missing createdAt`);
+  }
+
+  const coverageTally = new Map<string, string>();
+  for (const [reconciliationID, reconciliation] of Object.entries(attemptReconciliations)) {
+    if (!isRecord(reconciliation)) throw corrupt(`attempt reconciliation ${reconciliationID} is not an object`);
+    if (reconciliation["id"] !== reconciliationID) throw corrupt(`attempt reconciliation key ${reconciliationID} does not match its identity`);
+    const runID = reconciliation["executionRunID"];
+    const run = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (!isRecord(run)) throw corrupt(`attempt reconciliation ${reconciliationID} references missing execution run ${String(runID)}`);
+    const stageID = reconciliation["stageID"];
+    const stage = typeof stageID === "string" ? executionStages[stageID] : undefined;
+    if (!isRecord(stage) || stage["executionRunID"] !== runID) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} references a missing/foreign Stage`);
+    }
+    const windowID = reconciliation["windowID"];
+    const win = typeof windowID === "string" ? verificationWindows[windowID] : undefined;
+    if (!isRecord(win) || win["executionRunID"] !== runID || win["stageID"] !== stageID) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} references a Window outside its Stage/Run`);
+    }
+    // §62 — targets: existing, same window, and STILL indeterminate (terminal
+    // immutable history — reconciliation never mutates the Attempt).
+    const targets = Array.isArray(reconciliation["targetAttemptIDs"]) ? (reconciliation["targetAttemptIDs"] as unknown[]) : [];
+    if (targets.length === 0) throw corrupt(`attempt reconciliation ${reconciliationID} carries no targets`);
+    for (const ref of targets) {
+      const attempt = typeof ref === "string" ? executionAttempts[ref] : undefined;
+      if (!isRecord(attempt) || attempt["windowID"] !== windowID || attempt["state"] !== "indeterminate") {
+        throw corrupt(`attempt reconciliation ${reconciliationID} references a missing/cross-window/non-indeterminate target ${String(ref)}`);
+      }
+    }
+    // §62 — the inspection must be a real non-mutating reconciliation inspection.
+    const directiveRef = isRecord(reconciliation["inspectionDirectiveRef"]) ? (reconciliation["inspectionDirectiveRef"] as Record<string, unknown>) : undefined;
+    const inspectionDirective = directiveRef ? executionDirectives[`${String(directiveRef["id"])}@${String(directiveRef["revision"])}`] : undefined;
+    if (
+      !directiveRef ||
+      !isRecord(inspectionDirective) ||
+      inspectionDirective["windowID"] !== windowID ||
+      inspectionDirective["kind"] !== "inspection" ||
+      inspectionDirective["candidateEffect"] !== "non_mutating" ||
+      !Array.isArray(inspectionDirective["reconciliationTargets"])
+    ) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} inspection Directive is not a reconciliation inspection of its Window`);
+    }
+    const inspectionEnvelope = isRecord(inspectionDirective["capabilityEnvelope"]) ? (inspectionDirective["capabilityEnvelope"] as Record<string, unknown>) : undefined;
+    if (
+      !inspectionEnvelope ||
+      inspectionEnvelope["repositoryRead"] !== true ||
+      RECONCILIATION_FORBIDDEN_CAPABILITIES.some((capability) => inspectionEnvelope[capability] === true)
+    ) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} inspection Directive violates reconciliation capability constraints`);
+    }
+    if (typeof directiveRef["hash"] === "string" && directiveRef["hash"] !== inspectionDirective["hash"]) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} inspection Directive hash mismatch`);
+    }
+    const inspectionAttemptID = reconciliation["inspectionAttemptID"];
+    const inspectionAttempt = typeof inspectionAttemptID === "string" ? executionAttempts[inspectionAttemptID] : undefined;
+    if (
+      !isRecord(inspectionAttempt) ||
+      inspectionAttempt["state"] !== "reported" ||
+      !isRecord(inspectionAttempt["directive"]) ||
+      (inspectionAttempt["directive"] as Record<string, unknown>)["id"] !== directiveRef["id"] ||
+      (inspectionAttempt["directive"] as Record<string, unknown>)["revision"] !== directiveRef["revision"]
+    ) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} references the wrong inspection Attempt`);
+    }
+    const inspectionReportID = reconciliation["inspectionReportID"];
+    const report = typeof inspectionReportID === "string" ? executionReports[inspectionReportID] : undefined;
+    if (
+      !isRecord(report) ||
+      report["attemptID"] !== inspectionAttemptID ||
+      report["result"] !== "completed" ||
+      report["candidateMutation"] !== "none"
+    ) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} references a missing/mutating/incomplete inspection Report`);
+    }
+    if (!SUCCESSFUL_RECONCILIATION_OBSERVATIONS.includes(report["reconciliationObservation"] as never)) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} inspection Report observation is not unchanged/changed`);
+    }
+    if (report["reconciliationObservation"] !== reconciliation["observation"]) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} observation disagrees with its inspection Report`);
+    }
+    const base = reconciliation["baseCandidateRevision"];
+    const resulting = reconciliation["resultingCandidateRevision"];
+    if (typeof base !== "number" || typeof resulting !== "number" || !Number.isInteger(base) || !Number.isInteger(resulting)) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} has malformed revision arithmetic`);
+    }
+    if (reconciliation["observation"] === "unchanged" && resulting !== base) {
+      throw corrupt(`unchanged attempt reconciliation ${reconciliationID} must not advance the candidate revision`);
+    }
+    if (reconciliation["observation"] === "changed" && resulting !== base + 1) {
+      throw corrupt(`changed attempt reconciliation ${reconciliationID} must advance the candidate revision exactly +1`);
+    }
+    if (base !== report["baseCandidateRevision"] || (resulting as number) > (win["candidateRevision"] as number)) {
+      throw corrupt(`attempt reconciliation ${reconciliationID} revision arithmetic disagrees with its report or window`);
+    }
+    if (typeof reconciliation["createdAt"] !== "string") throw corrupt(`attempt reconciliation ${reconciliationID} is missing createdAt`);
+    // One successful reconciliation per target, and the index must agree.
+    for (const ref of targets) {
+      if (reconciliationByAttempt[ref as string] !== reconciliationID) {
+        throw corrupt(`attempt reconciliation ${reconciliationID} is not indexed for its target ${String(ref)}`);
+      }
+      if (coverageTally.has(ref as string)) {
+        throw corrupt(`execution attempt ${String(ref)} is covered by two successful reconciliations`);
+      }
+      coverageTally.set(ref as string, reconciliationID);
+    }
+  }
+
+  for (const [attemptID, reconciliationID] of Object.entries(reconciliationByAttempt)) {
+    const reconciliation = attemptReconciliations[reconciliationID];
+    const targets = isRecord(reconciliation) && Array.isArray(reconciliation["targetAttemptIDs"]) ? (reconciliation["targetAttemptIDs"] as unknown[]) : [];
+    if (!isRecord(reconciliation) || !targets.includes(attemptID)) {
+      throw corrupt(`reconciliation index for attempt ${attemptID} references missing/inconsistent reconciliation ${String(reconciliationID)}`);
+    }
+  }
+
+  // -- v0.2.0 Phase 6B final closure & completion (fail-closed, SS59-SS63) ----
+  // ADDITIVE families (pre-Phase-6B documents = "nothing ever completed
+  // through the gate"). LEGACY rule (SS50): a completed run WITHOUT a
+  // completion record is pre-6B history and loads unchanged. Every RECORD is
+  // validated against the full final-closure provenance chain (SS61) and can
+  // only exist on a completed run (SS62/SS63) — fail closed, never repaired.
+  const executionCompletions = isRecord(doc.executionCompletions)
+    ? (doc.executionCompletions as Record<string, Record<string, unknown>>)
+    : {};
+  const completionByExecutionRun = isRecord(doc.completionByExecutionRun)
+    ? (doc.completionByExecutionRun as Record<string, string>)
+    : {};
+
+  for (const [completionID, completion] of Object.entries(executionCompletions)) {
+    if (!isRecord(completion)) throw corrupt(`execution completion ${completionID} is not an object`);
+    if (completion["id"] !== completionID) throw corrupt(`execution completion key ${completionID} does not match its identity`);
+    const runID = completion["executionRunID"];
+    const run = typeof runID === "string" ? executionRuns[runID] : undefined;
+    if (!isRecord(run)) throw corrupt(`execution completion ${completionID} references missing execution run ${String(runID)}`);
+    // SS62/SS63 — a record can ONLY exist on a completed run.
+    if (run["lifecycle"] !== "completed") {
+      throw corrupt(`execution completion ${completionID} exists against a ${String(run["lifecycle"])} run`);
+    }
+    // SS51 — the run must index this record back (new-protocol provenance).
+    if (run["completionRecord"] !== undefined && run["completionRecord"] !== completionID) {
+      throw corrupt(`execution run ${runID} completionRecord disagrees with its indexed completion`);
+    }
+    // SS61 — exact FinalPlan ref.
+    const runFinalPlan = isRecord(run["finalPlan"]) ? (run["finalPlan"] as Record<string, unknown>) : undefined;
+    const planRef = isRecord(completion["finalPlanRef"]) ? (completion["finalPlanRef"] as Record<string, unknown>) : undefined;
+    if (!runFinalPlan || !planRef || planRef["id"] !== runFinalPlan["id"] || planRef["revision"] !== runFinalPlan["revision"]) {
+      throw corrupt(`execution completion ${completionID} FinalPlan ref disagrees with the run's binding`);
+    }
+    // SS61 — exact final closure Stage.
+    const closureStageID = completion["finalClosureStageID"];
+    const closureStage = typeof closureStageID === "string" ? executionStages[closureStageID] : undefined;
+    if (
+      !isRecord(closureStage) ||
+      closureStage["executionRunID"] !== runID ||
+      executionStageKindOf(closureStage as never) !== "final_closure" ||
+      closureStage["status"] !== "completed"
+    ) {
+      throw corrupt(`execution completion ${completionID} references a missing/foreign/incomplete final closure Stage ${String(closureStageID)}`);
+    }
+    // SS61 — exact final Window (closed, of the closure Stage).
+    const finalWindowID = completion["finalWindowID"];
+    const finalWindow = typeof finalWindowID === "string" ? verificationWindows[finalWindowID] : undefined;
+    if (!isRecord(finalWindow) || finalWindow["executionRunID"] !== runID || finalWindow["stageID"] !== closureStageID || finalWindow["state"] !== "closed") {
+      throw corrupt(`execution completion ${completionID} references a missing/unclosed final Window ${String(finalWindowID)}`);
+    }
+    // SS61 — the final Commit: exists, is the run's acceptedHead, completed the
+    // closure Stage, closes the final Window.
+    const finalCommitID = completion["finalCommitID"];
+    const finalCommit = typeof finalCommitID === "string" ? executionCommits[finalCommitID] : undefined;
+    if (!isRecord(finalCommit)) {
+      throw corrupt(`execution completion ${completionID} references missing final Commit ${String(finalCommitID)}`);
+    }
+    if (finalCommit["stageID"] !== closureStageID || finalCommit["stageCompleted"] !== true || finalCommit["windowID"] !== finalWindowID) {
+      throw corrupt(`execution completion ${completionID} final Commit did not complete the closure Stage through the final Window`);
+    }
+    if (run["acceptedHead"] !== finalCommitID) {
+      throw corrupt(`execution completion ${completionID} final Commit is not the run's acceptedHead`);
+    }
+    if (completion["acceptedHead"] !== finalCommitID) {
+      throw corrupt(`execution completion ${completionID} acceptedHead snapshot disagrees with the final Commit`);
+    }
+    // SS61 — the final Assessment: the Commit's own, accept, stage scope, exact candidate.
+    const finalAssessmentID = completion["finalAssessmentID"];
+    const finalAssessment = typeof finalAssessmentID === "string" ? supervisorAssessments[finalAssessmentID] : undefined;
+    if (
+      !isRecord(finalAssessment) ||
+      finalAssessmentID !== finalCommit["supervisorAssessmentID"] ||
+      finalAssessment["disposition"] !== "accept" ||
+      finalAssessment["acceptanceScope"] !== "stage" ||
+      finalAssessment["windowID"] !== finalWindowID ||
+      finalAssessment["candidateRevision"] !== finalCommit["candidateRevision"]
+    ) {
+      throw corrupt(`execution completion ${completionID} references a wrong/mismatched final Assessment ${String(finalAssessmentID)}`);
+    }
+    if (typeof completion["completedAt"] !== "string") throw corrupt(`execution completion ${completionID} is missing completedAt`);
+    if (typeof completion["hash"] !== "string" || computeExecutionCompletionHashFromRecord(completion as never) !== completion["hash"]) {
+      throw corrupt(`execution completion ${completionID} content does not recompute to its canonical hash`);
+    }
+  }
+
+  // SS62 — a run-level completionRecord ref must resolve to a real record
+  // (new-protocol provenance is never dangling; legacy runs carry none).
+  for (const [runID, run] of Object.entries(executionRuns)) {
+    if (!isRecord(run)) continue;
+    const ref = run["completionRecord"];
+    if (ref !== undefined && !isRecord(executionCompletions[ref as string])) {
+      throw corrupt(`execution run ${runID} carries a dangling completionRecord ${String(ref)}`);
+    }
+  }
+
+  // SS58 — one v0.2 record per run; the index must agree with the records.
+  const completionTally = new Map<string, string>();
+  for (const [completionID, completion] of Object.entries(executionCompletions)) {
+    const runID = isRecord(completion) ? completion["executionRunID"] : undefined;
+    if (typeof runID !== "string") continue;
+    if (completionTally.has(runID)) {
+      throw corrupt(`execution run ${runID} has two completion records (${String(completionTally.get(runID))}, ${completionID})`);
+    }
+    completionTally.set(runID, completionID);
+    if (completionByExecutionRun[runID] !== completionID) {
+      throw corrupt(`execution completion ${completionID} is not indexed as its run's completion`);
+    }
+  }
+  for (const [runID, completionID] of Object.entries(completionByExecutionRun)) {
+    const record = executionCompletions[completionID];
+    if (!isRecord(record) || record["executionRunID"] !== runID) {
+      throw corrupt(`completion index for run ${runID} references missing/foreign completion ${String(completionID)}`);
     }
   }
 }

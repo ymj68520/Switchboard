@@ -54,6 +54,55 @@ export type FinalPlanCandidateID = Brand<string, "FinalPlanCandidateID">;
  * same id forever — there is no HANDOFF-002 for the same plan.
  */
 export type HandoffID = Brand<string, "HandoffID">;
+/**
+ * v0.2.0 supervised-execution foundation — the ExecutionRun ("EXEC-###").
+ * Unlike HANDOFF ids (one per plan forever), EXEC ids are allocated per
+ * ExecutionRun: the same FinalPlan may legitimately produce several runs over
+ * its lifetime (spec v0.2.0 §9), while crash/retry of the SAME initial
+ * handoff always recovers the SAME run (idempotency is by handoff identity,
+ * never by call count).
+ */
+export type ExecutionRunID = Brand<string, "ExecutionRunID">;
+/**
+ * v0.2.0 Phase 3 — the ExecutionStage ("STAGE-###") and VerificationWindow
+ * ("WIN-###"). Stage ids are never reused: a superseded Stage stays durable
+ * under its original id forever, and any decomposition correction creates
+ * NEW Stage ids.
+ */
+export type ExecutionStageID = Brand<string, "ExecutionStageID">;
+export type VerificationWindowID = Brand<string, "VerificationWindowID">;
+/**
+ * v0.2.0 Phase 4 — the worker transaction protocol: ExecutionDirective
+ * ("DIR-###", revised in place as DIR-###@N with every revision durable),
+ * ExecutionAttempt ("ATT-###", one logical Attempt per exact Directive
+ * revision), and the unified ExecutionReport ("RPT-###", one per Attempt).
+ */
+export type ExecutionDirectiveID = Brand<string, "ExecutionDirectiveID">;
+export type ExecutionAttemptID = Brand<string, "ExecutionAttemptID">;
+export type ExecutionReportID = Brand<string, "ExecutionReportID">;
+/**
+ * v0.2.0 Phase 5 — acceptance layer: SupervisorAssessment ("SA-###"), the
+ * ExecutionCommit chain ("EC-###", linear per ExecutionRun), and Stage
+ * completion obligation ids ("OBS-###", scoped to one Stage).
+ */
+export type SupervisorAssessmentID = Brand<string, "SupervisorAssessmentID">;
+export type ExecutionCommitID = Brand<string, "ExecutionCommitID">;
+export type StageCompletionObligationID = Brand<string, "StageCompletionObligationID">;
+/**
+ * v0.2.0 Phase 6A — the abnormal/escalation control plane: ExecutionIssue
+ * ("ISS-###", the durable replan justification), VerificationConflict
+ * ("VCF-###", one disputed fact), and AttemptReconciliation ("REC-###", the
+ * durable resolution of indeterminate-Attempt uncertainty).
+ */
+export type ExecutionIssueID = Brand<string, "ExecutionIssueID">;
+export type VerificationConflictID = Brand<string, "VerificationConflictID">;
+export type AttemptReconciliationID = Brand<string, "AttemptReconciliationID">;
+/**
+ * v0.2.0 Phase 6B — the final-closure layer: the ExecutionCompletionRecord
+ * ("CMPL-###", ONE per completed ExecutionRun — the durable provenance of the
+ * ExecutionCompletionGate, exactly like ExecutionIssue is for replan).
+ */
+export type ExecutionCompletionID = Brand<string, "ExecutionCompletionID">;
 
 /**
  * The Architecture artifact is a singleton per planning run; the frozen spec
@@ -82,7 +131,20 @@ export type UltraPlanIDBrand =
   | "ValidationFindingID"
   | "EvidenceAuditID"
   | "FinalPlanCandidateID"
-  | "HandoffID";
+  | "HandoffID"
+  | "ExecutionRunID"
+  | "ExecutionStageID"
+  | "VerificationWindowID"
+  | "ExecutionDirectiveID"
+  | "ExecutionAttemptID"
+  | "ExecutionReportID"
+  | "SupervisorAssessmentID"
+  | "ExecutionCommitID"
+  | "StageCompletionObligationID"
+  | "ExecutionIssueID"
+  | "VerificationConflictID"
+  | "AttemptReconciliationID"
+  | "ExecutionCompletionID";
 
 export interface IDFactory<B extends UltraPlanIDBrand> {
   /** Canonical display prefix, e.g. "PLAN" for PLAN-001. */
@@ -134,6 +196,19 @@ export const ValidationFindingIDs: IDFactory<"ValidationFindingID"> = idFactory(
 export const EvidenceAuditIDs: IDFactory<"EvidenceAuditID"> = idFactory("AUD");
 export const FinalPlanCandidateIDs: IDFactory<"FinalPlanCandidateID"> = idFactory("FPC");
 export const HandoffIDs: IDFactory<"HandoffID"> = idFactory("HANDOFF");
+export const ExecutionRunIDs: IDFactory<"ExecutionRunID"> = idFactory("EXEC");
+export const ExecutionStageIDs: IDFactory<"ExecutionStageID"> = idFactory("STAGE");
+export const VerificationWindowIDs: IDFactory<"VerificationWindowID"> = idFactory("WIN");
+export const ExecutionDirectiveIDs: IDFactory<"ExecutionDirectiveID"> = idFactory("DIR");
+export const ExecutionAttemptIDs: IDFactory<"ExecutionAttemptID"> = idFactory("ATT");
+export const ExecutionReportIDs: IDFactory<"ExecutionReportID"> = idFactory("RPT");
+export const SupervisorAssessmentIDs: IDFactory<"SupervisorAssessmentID"> = idFactory("SA");
+export const ExecutionCommitIDs: IDFactory<"ExecutionCommitID"> = idFactory("EC");
+export const StageCompletionObligationIDs: IDFactory<"StageCompletionObligationID"> = idFactory("OBS");
+export const ExecutionIssueIDs: IDFactory<"ExecutionIssueID"> = idFactory("ISS");
+export const VerificationConflictIDs: IDFactory<"VerificationConflictID"> = idFactory("VCF");
+export const AttemptReconciliationIDs: IDFactory<"AttemptReconciliationID"> = idFactory("REC");
+export const ExecutionCompletionIDs: IDFactory<"ExecutionCompletionID"> = idFactory("CMPL");
 
 /**
  * Next free sequence number for a `PREFIX-###` id family, given the ids

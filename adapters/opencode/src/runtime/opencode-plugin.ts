@@ -28,12 +28,22 @@ export const DEFAULT_PLANNING_RUNTIME_SPEC: PlanningRuntimeSpec = {
  * The /ultra-plan command template. OpenCode command templates are prompts;
  * the deterministic work happens in the `ultraplan_start` tool the template
  * directs the model to invoke. `$ARGUMENTS` is OpenCode's argument
- * placeholder.
+ * placeholder. Phase 7B: the arguments are RELAYED, never interpreted — the
+ * controller parses the raw command text host-side and enforces the typed
+ * execution-control authorizations itself.
  */
 export const ULTRA_PLAN_COMMAND_TEMPLATE = [
   "Start or resume the Ultra Plan planning run for this session.",
   "",
-  "Call the `ultraplan_start` tool now (goal: $ARGUMENTS; omit the goal when no arguments were given).",
+  "Call the `ultraplan_start` tool now, RELAYING the /ultra-plan arguments exactly as typed — do not interpret them:",
+  "- no arguments → call the tool with no arguments.",
+  "- goal text → pass it as goal.",
+  "- `new <goal>` → pass new-style: goal = the remaining text (the controller starts a fresh run).",
+  "- `resume` or `resume EXEC-###` → pass resume: true (and resumeExecutionRunID: EXEC-### when given).",
+  "- `resume EXEC-### --takeover` or `takeover EXEC-###` → pass takeover: true (and resumeExecutionRunID: EXEC-### when given).",
+  "- `abort EXEC-###` → pass abort: true and abortExecutionRunID: EXEC-###.",
+  "- `replan` or `replan EXEC-###` → pass replan: true (and replanExecutionRunID: EXEC-### when given).",
+  "The host verifies relayed control actions against the raw command text; never invent one.",
   "Then output the Ultra Plan status block returned by the tool verbatim, without paraphrasing it.",
 ].join("\n");
 
@@ -86,6 +96,12 @@ export class OpenCodeRuntimeAdapter implements UltraPlanRuntime {
     injectSystemContext: true,
     observeRepositoryTools: true,
     observeCommandInvocation: true,
+    // Phase 7A runtime facts (verified against the installed 1.18.32 SDK):
+    freshIsolatedWorkerInvocation: true,
+    synchronousFinalResponse: true,
+    nativeStructuredOutput: false,
+    perCallToolOverride: true,
+    sessionStatusQuery: true,
   };
 
   constructor(

@@ -919,12 +919,14 @@ describe("approval view and status (§45/§46/§75/§85)", () => {
     expect(finalStatus).toContain("Stage: final");
     expect(finalStatus).toContain("Lifecycle: handoff_pending");
     expect(finalStatus).toContain("Final Plan: FINAL-001@1 approved");
-    // Phase 2J §66: the not-prepared handoff state lines (supersede the 2I
-    // "Build handoff: pending" line).
-    expect(finalStatus).toContain("Execution handoff: not prepared");
-    expect(finalStatus).toContain("Build: not started");
+    // Phase 7B — the Final Approval durably selects the SUPERVISED handoff;
+    // status renders the supervised projection from durable execution state
+    // (the legacy Build delivery lines are unreachable for new approvals).
+    expect(finalStatus).toContain("Supervised execution: handoff pending (ExecutionRun not yet prepared)");
+    expect(finalStatus).toContain("PlanningRun: handoff pending (supervised_v0_2)");
     expect(finalStatus).not.toContain("Build started");
     expect(finalStatus).not.toContain("Run completed");
+    expect(finalStatus).not.toContain("Execution handoff: not prepared");
   });
 
   it("§86: handoff_pending L0 guidance closes planning mutation honestly", () => {

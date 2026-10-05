@@ -73,6 +73,18 @@ export interface StatusDetails {
     state: "not_prepared" | "prepared" | "dispatching" | "delivered";
     lifecycle: "handoff_pending" | "completed";
   };
+  /**
+   * Phase 7B §48/§91 — the SUPERVISED handoff projection, resolved from
+   * durable execution state ONLY (never hidden reasoning) for runs whose
+   * Final Approval recorded the supervised_v0_2 protocol. Replaces the
+   * legacy delivery lines; legacy runs never carry it.
+   */
+  supervisedHandoff?: {
+    executionRunID?: string;
+    executionLifecycle: "absent" | "prepared" | "active" | "completed" | "replan_required" | "aborted";
+    planningLifecycle: "handoff_pending" | "completed";
+    summary?: string;
+  };
 }
 
 function describeArchitecture(status: Architecture["status"], revision: number): string {
@@ -242,24 +254,35 @@ export function renderStatus(run: PlanningRun, details?: StatusDetails): string 
     run.stage === "final"
       ? [
           `Final Plan: ${details?.finalPlan ? `${details.finalPlan.ref} ${details.finalPlan.status}` : "FINAL-???"}`,
-          ...(details?.handoff
-            ? details.handoff.lifecycle === "completed"
-              ? [
-                  `Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} delivered`,
-                  "Build: handoff complete",
-                ]
-              : details.handoff.state === "not_prepared"
-                ? ["Execution handoff: not prepared", "Build: not started"]
-                : details.handoff.state === "prepared"
-                  ? [`Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} prepared`, "Build transition: pending"]
-                  : details.handoff.state === "dispatching"
-                    ? [`Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} dispatching`, "Build delivery: awaiting confirmation"]
-                    : [
-                        `Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} delivered`,
-                        "Build delivery: confirmed",
-                        "Run completion: pending",
-                      ]
-            : ["Build handoff: pending"]),
+          ...(details?.supervisedHandoff
+            ? // Phase 7B §48/§91 — supervised projection from durable execution state.
+              [
+                details.supervisedHandoff.executionRunID
+                  ? `Supervised execution: ${details.supervisedHandoff.executionRunID} (${details.supervisedHandoff.executionLifecycle})`
+                  : "Supervised execution: handoff pending (ExecutionRun not yet prepared)",
+                details.supervisedHandoff.planningLifecycle === "completed"
+                  ? "PlanningRun: completed (handed to the supervised execution run)"
+                  : "PlanningRun: handoff pending (supervised_v0_2)",
+                ...(details.supervisedHandoff.summary ? details.supervisedHandoff.summary.split("\n").slice(1) : []),
+              ]
+            : details?.handoff
+              ? details.handoff.lifecycle === "completed"
+                ? [
+                    `Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} delivered`,
+                    "Build: handoff complete",
+                  ]
+                : details.handoff.state === "not_prepared"
+                  ? ["Execution handoff: not prepared", "Build: not started"]
+                  : details.handoff.state === "prepared"
+                    ? [`Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} prepared`, "Build transition: pending"]
+                    : details.handoff.state === "dispatching"
+                      ? [`Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} dispatching`, "Build delivery: awaiting confirmation"]
+                      : [
+                          `Execution handoff: ${details.handoff.ref ?? "HANDOFF-???"} delivered`,
+                          "Build delivery: confirmed",
+                          "Run completion: pending",
+                        ]
+              : ["Build handoff: pending"]),
         ]
       : [];
 

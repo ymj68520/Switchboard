@@ -21,11 +21,27 @@ import { InMemoryPlanStore } from "../memory/store.js";
 import type { PlanStore } from "../memory/store.js";
 import { InMemoryObservationLedger } from "../repository/observations.js";
 import type { ObservationLedger } from "../repository/observations.js";
-import { OpenCodeRuntimeAdapter } from "./opencode-plugin.js";
+import { OpenCodeRuntimeAdapter, ULTRA_PLAN_TOOL_NAMES } from "./opencode-plugin.js";
 import type { UltraPlanRuntime } from "./types.js";
 import { OpenCodeSemanticValidator } from "../validation/opencode-validator.js";
 import type { SemanticValidator } from "../validation/types.js";
 import { OpenCodeExecutionAdapter } from "./opencode-execution-adapter.js";
+import { OpenCodeSupervisorAdapter } from "./opencode-supervisor-adapter.js";
+import { OpenCodeWorkerAdapter } from "./opencode-worker-adapter.js";
+import {
+  DEFAULT_PRODUCTION_EXECUTION_BUDGETS,
+  validateModelRef,
+  validateProductionExecutionBudgets,
+  type ProductionExecutionBudgets,
+  type SupervisedExecutionBundle,
+} from "./production-pump.js";
+import { resolveExecutionModelPolicy } from "./execution-model-policy.js";
+import { deriveHostPermissionCeiling } from "./capability-projection.js";
+import { discoverHostToolNames } from "./host-tool-inventory.js";
+import { UltraPlanError } from "../core/errors.js";
+import { InMemoryExecutionRuntimeTracer } from "./execution-runtime.js";
+import { observeGitWorkspaceBaseline } from "./workspace-baseline.js";
+import type { OpenCodeModelClient } from "./opencode-client.js";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 export interface UltraPlanInstance {
@@ -92,7 +108,7 @@ export function projectStorePath(projectKey: string): string {
  */
 export function getProjectInstance(
   projectID: string,
-  options: { client?: PluginInput["client"] } = {},
+  options: { client?: PluginInput["client"]; worktree?: string } = {},
 ): UltraPlanInstance {
   const existing = projectInstances.get(projectID);
   if (existing) return existing;
@@ -111,7 +127,7 @@ export function getProjectInstance(
           executionRuntime: (() => {
             const spec = new OpenCodeRuntimeAdapter().spec;
             return {
-              adapter: new OpenCodeExecutionAdapter(options.client),
+              adapter: new OpenCodeExecutionAdapter(options.client!),
               executionAgent: spec.executionAgent,
               executionModel: spec.executionModel,
             };
@@ -121,6 +137,88 @@ export function getProjectInstance(
   });
   projectInstances.set(projectID, instance);
   return instance;
+}
+
+/**
+ * Phase 7B §20/§58 — build the PRODUCTION supervised-execution bundle from
+ * the host client, the resolved host permission config, and the adapter
+ * configuration (model policy + budgets). Config validation fails CLOSED at
+ * construction (§59) — a bad budget/timeout/model ref refuses the cutover
+ * instead of silently degrading mid-execution.
+ *
+ * Phase 8 §12/§13 — the bundle also DISCOVERS the host's complete
+ * currently-registered tool inventory (`client.tool.ids()`) and threads it
+ * into both runtime adapters' explicit deny maps (per-call `tools` maps are
+ * overrides: a tool absent from the map stays enabled). Discovery failure is
+ * fail-closed (§13): the bundle refuses to build rather than falling back to
+ * the hardcoded baseline.
+ */
+export async function buildProductionSupervisedExecutionBundle(options: {
+  projectID: string;
+  client: PluginInput["client"];
+  store: PlanStore;
+  worktree?: string;
+  /** Configurable runtime spec (model policy + budgets); defaults to the adapter default. */
+  runtimeSpec?: import("./types.js").PlanningRuntimeSpec;
+  config?: Parameters<OpenCodeRuntimeAdapter["applyToConfig"]>[0];
+}): Promise<SupervisedExecutionBundle> {
+  const spec = options.runtimeSpec ?? new OpenCodeRuntimeAdapter().spec;
+  const policy = resolveExecutionModelPolicy(spec);
+  validateModelRef(policy.supervisorModel, "supervisor");
+  validateModelRef(policy.workerModel, "worker");
+  validateModelRef(policy.verifierModel, "verifier");
+  const budgets: ProductionExecutionBudgets = {
+    ...DEFAULT_PRODUCTION_EXECUTION_BUDGETS,
+    ...(spec.executionBudgets ?? {}),
+  };
+  validateProductionExecutionBudgets(budgets);
+  const inventory = await discoverHostToolNames(options.client);
+  if (!inventory.ok) {
+    throw new UltraPlanError(
+      "supervisor_tool_isolation_blocked",
+      `Production supervised execution requires a trusted host tool inventory and it could not be obtained: ${inventory.reason}`,
+    );
+  }
+  // §24 — the trusted workspace identity is the host-derived PROJECT id,
+  // exactly the key that scopes this durable store.
+  const workspace = { key: `opencode-project:${options.projectID}` };
+  const tracer = new InMemoryExecutionRuntimeTracer();
+  const hostCeiling = deriveHostPermissionCeiling({
+    ...(options.config?.permission !== undefined ? { permission: options.config.permission as Record<string, unknown> } : {}),
+    ...(options.config?.agent !== undefined ? { agent: options.config.agent as Record<string, { permission?: Record<string, unknown>; tools?: Record<string, boolean> }> } : {}),
+  });
+  const modelClient = options.client as OpenCodeModelClient;
+  return {
+    supervisor: new OpenCodeSupervisorAdapter({
+      client: modelClient,
+      store: options.store,
+      policy,
+      trustedCeiling: hostCeiling,
+      timeoutMs: budgets.supervisorTimeoutMs,
+      maxReadRounds: budgets.maxSupervisorReadOpsPerTurn,
+      registeredUltraPlanToolNames: ULTRA_PLAN_TOOL_NAMES,
+      extraHostToolNames: inventory.tools,
+      tracer,
+    }),
+    worker: new OpenCodeWorkerAdapter({
+      client: modelClient,
+      policy,
+      hostCeiling,
+      timeoutMs: budgets.workerTimeoutMs,
+      registeredUltraPlanToolNames: ULTRA_PLAN_TOOL_NAMES,
+      extraHostToolNames: inventory.tools,
+      tracer,
+    }),
+    workspace,
+    policy,
+    trustedCeiling: hostCeiling,
+    budgets,
+    executionStartBaseline: async () =>
+      options.worktree
+        ? observeGitWorkspaceBaseline(options.worktree)
+        : { workspaceFingerprint: "unobserved:no-worktree-path" },
+    tracer,
+  };
 }
 
 function isPromise(value: unknown): value is Promise<unknown> {

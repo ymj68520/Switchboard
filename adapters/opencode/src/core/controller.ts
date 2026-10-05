@@ -91,6 +91,20 @@ import { assertAcyclicSections, assertSectionCanComplete, stableStringify } from
 import type { Snapshot } from "../memory/snapshots.js";
 import { isUltraPlanError, UltraPlanError } from "./errors.js";
 import { HandoffDispatchRejected } from "../runtime/types.js";
+import { planningRunHandoffProtocol, type ReplanProvenance } from "./execution-handoff-protocol.js";
+import { executionInitialHandoffKey, type ExecutionRun } from "./execution-run.js";
+import {
+  buildSupervisedExecutionSummary,
+  renderSupervisedExecutionSummary,
+  runProductionSupervisedExecution,
+  type ProductionPumpResult,
+  type SupervisedExecutionBundle,
+} from "../runtime/production-pump.js";
+import {
+  InMemoryUserExecutionCommandLedger,
+  parseUserExecutionCommand,
+  type UserExecutionCommandLedger,
+} from "./user-command-authorizations.js";
 import type { HostDeliveryReceipt } from "../runtime/types.js";
 import { assembleExecutionHandoff, renderExecutionHandoffPrompt } from "../handoff/assemble.js";
 import type { ExecutionHandoff, HandoffDelivery } from "../handoff/types.js";
@@ -523,7 +537,45 @@ export type HandoffRecoveryResult =
   | { status: "prepared"; handoffID: HandoffID }
   | { status: "ambiguous"; handoffID: HandoffID }
   | { status: "retryable_failure"; handoffID: HandoffID; reason: string }
-  | { status: "blocked"; code: import("./errors.js").UltraPlanErrorCode; message: string };
+  | { status: "blocked"; code: import("./errors.js").UltraPlanErrorCode; message: string }
+  | {
+      status: "supervised";
+      planningRunID: string;
+      executionRunID: string;
+      pump: ProductionPumpResult;
+    };
+
+/**
+ * Phase 7B — one durable outcome of a supervised-execution control entry.
+ * Every outcome leaves the durable execution state consistent and resumable;
+ * nothing here silently downgrades to legacy Build.
+ */
+export type SupervisedExecutionEntry =
+  | {
+      status: "handoff_recovered";
+      planningRunID: string;
+      executionRunID: string;
+      pump: ProductionPumpResult;
+      statusText: string;
+    }
+  | { status: "resumed"; executionRunID: string; pump: ProductionPumpResult; statusText: string }
+  | { status: "requires_takeover"; executionRunID: string; ownerSessionID: string; statusText: string }
+  | { status: "ambiguous"; candidateRunIDs: string[]; statusText: string }
+  | { status: "handoff_pending_foreign"; planningRunID: string; ownerSessionID: string; statusText: string }
+  | {
+      status: "replan_started";
+      planningRunID: string;
+      sourceExecutionRunID: string;
+      issueID: string;
+      statusText: string;
+    }
+  | { status: "aborted"; executionRunID: string; statusText: string }
+  | { status: "blocked"; code: import("./errors.js").UltraPlanErrorCode; message: string; statusText: string };
+
+/** The production /ultra-plan entry result: planning, or a supervised-execution control outcome. */
+export type UltraPlanEntryResult =
+  | ({ kind: "planning" } & StartOrResumeResult)
+  | { kind: "supervised"; entry: SupervisedExecutionEntry };
 
 /** Outcome of a successful transaction, as orchestrated by the controller. */
 export interface CommitResult {
@@ -924,6 +976,21 @@ export interface ControllerOptions {
     /** Defaults to the host-native Build agent (§30). */
     executionAgent?: string;
   };
+  /**
+   * Phase 7B — the production supervised-execution runtime bundle (§20/§58):
+   * the Phase 7A runtime ports, the trusted workspace identity, the resolved
+   * model policy, and the explicit budgets. Absent → supervised handoffs stay
+   * durably pending with `execution_runtime_unavailable` (resumable, never
+   * silently downgraded to legacy Build).
+   */
+  supervisedExecution?: SupervisedExecutionBundle;
+  /**
+   * Phase 7B §33-§36/§41 — HOST-minted typed /ultra-plan command
+   * authorizations (takeover/abort/replan/resume). A fresh in-memory ledger
+   * is created when omitted, so "the user typed it" is always enforced
+   * mechanically.
+   */
+  userCommands?: UserExecutionCommandLedger;
   now?: () => Timestamp;
 }
 
@@ -955,6 +1022,8 @@ export class UltraPlanController {
   private readonly runtime: UltraPlanRuntime | undefined;
   private readonly semanticValidator: SemanticValidator | undefined;
   private readonly executionRuntime: ControllerOptions["executionRuntime"];
+  private supervisedExecution: ControllerOptions["supervisedExecution"];
+  private readonly userCommands: UserExecutionCommandLedger;
   private readonly now: () => Timestamp;
 
   constructor(options: ControllerOptions) {
@@ -965,6 +1034,8 @@ export class UltraPlanController {
     this.runtime = options.runtime;
     this.semanticValidator = options.semanticValidator;
     this.executionRuntime = options.executionRuntime;
+    this.supervisedExecution = options.supervisedExecution;
+    this.userCommands = options.userCommands ?? new InMemoryUserExecutionCommandLedger(options.now);
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -1009,7 +1080,16 @@ export class UltraPlanController {
    */
   async startOrResume(sessionID: string, goal?: string): Promise<StartOrResumeResult> {
     this.admissions.consume(sessionID, this.startCommand, this.now());
+    return this.startOrResumePlanning(sessionID, goal);
+  }
 
+  /**
+   * The planning body of startOrResume (the start admission is already
+   * consumed). Phase 7B: a handoff_pending run that durably carries the
+   * supervised_v0_2 marker NEVER reaches the legacy Build recovery —
+   * maybeRecoverHandoff routes it to the supervised handoff state machine.
+   */
+  private async startOrResumePlanning(sessionID: string, goal?: string): Promise<StartOrResumeResult> {
     const existing = await this.store.findActiveRunBySession(sessionID);
 
     if (existing) {
@@ -1031,6 +1111,13 @@ export class UltraPlanController {
       return { ...result, ...(handoff ? { handoff } : {}) };
     }
 
+    const run = await this.createPlanningRun(sessionID, goal);
+    const activation = await this.activate(run);
+    return finish(this.store, run, true, activation);
+  }
+
+  /** Create the session's fresh PlanningRun (shared by start/resume and /ultra-plan new). */
+  private async createPlanningRun(sessionID: string, goal?: string): Promise<PlanningRun> {
     const at = this.now();
     const seq = await this.store.nextPlanSequence();
     const run = await this.store.createRun({
@@ -1049,8 +1136,7 @@ export class UltraPlanController {
       updatedAt: at,
     });
     await this.store.appendEvent(run.id, { type: "run.created", sessionID });
-    const activation = await this.activate(run);
-    return finish(this.store, run, true, activation);
+    return run;
   }
 
   /** Deterministic status for the session's active run, or null. */
@@ -3128,6 +3214,559 @@ export class UltraPlanController {
     return { proposal: frozen.proposal, hash: frozen.hash, idempotent: false, preview: renderProposalForApproval(frozen.proposal) };
   }
 
+  // -- Phase 7B: production supervised execution (cutover) --------------------
+  //
+  // The production path replacing the v0.1 free-Build handoff for NEW Final
+  // Approvals: durable supervised handoff intent (the run-header marker, set
+  // by the Final Approval transaction) → recoverable state machine
+  // A(prepare)→B(attach)→C(activate)→D(PlanningRun.completed)→E(pump). Every
+  // step is durable, idempotent, and crash-recoverable (§9/§10 — small
+  // durable transitions + deterministic recovery, never one big transaction).
+
+  /** Harness-only: mint the typed user-command authorization from RAW /ultra-plan arguments. */
+  issueUserExecutionCommand(sessionID: string, rawArguments: string): void {
+    this.userCommands.issue(sessionID, parseUserExecutionCommand(rawArguments), this.now());
+  }
+
+  /**
+   * Harness-only (Phase 7B §20/§58): bind the production supervised-execution
+   * runtime AFTER controller construction — the plugin's config hook, where
+   * the resolved host permission config is available. Exactly once; before
+   * any /ultra-plan session work the hook always runs.
+   */
+  attachSupervisedExecution(bundle: SupervisedExecutionBundle): void {
+    if (this.supervisedExecution) {
+      throw new UltraPlanError("invalid_scope", "A supervised execution runtime is already bound", {});
+    }
+    this.supervisedExecution = bundle;
+  }
+
+  /**
+   * §66 — the production /ultra-plan entry. The user command args are parsed
+   * HOST-side (parseUserExecutionCommand); the model only relays them.
+   * Routing: explicit subcommand → supervised handoff recovery →
+   * recoverable-execution resume/takeover surface → replan continuation →
+   * normal planning.
+   */
+  async enter(sessionID: string, rawArguments: string): Promise<UltraPlanEntryResult> {
+    const typed = parseUserExecutionCommand(rawArguments);
+    this.admissions.consume(sessionID, this.startCommand, this.now());
+    switch (typed.kind) {
+      case "abort":
+        return { kind: "supervised", entry: await this.abortSupervisedExecution(sessionID, typed.executionRunID) };
+      case "replan":
+        return { kind: "supervised", entry: await this.startReplanFromExecutionIssue(sessionID, { executionRunID: typed.executionRunID }) };
+      case "takeover":
+        return {
+          kind: "supervised",
+          entry: await this.resumeSupervisedExecution(sessionID, { takeover: true, executionRunID: typed.executionRunID }),
+        };
+      case "resume":
+        return { kind: "supervised", entry: await this.resumeSupervisedExecution(sessionID, { executionRunID: typed.executionRunID }) };
+      case "new": {
+        const run = await this.createPlanningRun(sessionID, typed.goal);
+        const activation = await this.activate(run);
+        const finished = await finish(this.store, run, true, activation);
+        return { kind: "planning", ...finished };
+      }
+      case "plan":
+      default: {
+        const routed = await this.routeSupervisedAutoEntry(sessionID);
+        if (routed) return routed;
+        const result = await this.startOrResumePlanning(sessionID, typed.goal);
+        return { kind: "planning", ...result };
+      }
+    }
+  }
+
+  /**
+   * §66 items 4-7 — the plain /ultra-plan continuation order. A handoff_pending
+   * supervised run recovers FIRST (its machine covers every crash window,
+   * including an already-active execution run), then recoverable-execution
+   * resume, then replan continuation, then normal planning.
+   */
+  private async routeSupervisedAutoEntry(sessionID: string): Promise<UltraPlanEntryResult | undefined> {
+    const latest = await this.store.findLatestRunBySession(sessionID);
+    if (latest?.lifecycle === "handoff_pending" && planningRunHandoffProtocol(latest) === "supervised_v0_2") {
+      return { kind: "supervised", entry: await this.recoverSupervisedHandoff(sessionID, latest) };
+    }
+    const execution = await this.scanRecoverableExecution(sessionID, undefined);
+    if (execution) return { kind: "supervised", entry: execution };
+    const replan = await this.scanReplanContinuation(sessionID);
+    if (replan) return { kind: "supervised", entry: replan };
+    return undefined;
+  }
+
+  /**
+   * §9 state machine, driven to completion on EVERY entry (each step is
+   * idempotent against durable state, so re-entry after a crash at any of the
+   * H1-H5 windows resumes the SAME chain):
+   *   A handoff_pending+supervised, ExecutionRun absent → prepare
+   *   B prepared, binding absent → attach the TRUSTED user session (§13)
+   *   C prepared, binding attached → activate (§15 — BEFORE completion)
+   *   D active, PlanningRun handoff_pending → complete PlanningRun handoff
+   *   E active, PlanningRun completed → run the production pump (§20)
+   */
+  private async recoverSupervisedHandoff(sessionID: string, planningRun: PlanningRun): Promise<SupervisedExecutionEntry> {
+    const bundle = this.supervisedExecution;
+    if (!bundle) {
+      return {
+        status: "blocked",
+        code: "execution_runtime_unavailable",
+        message: "No supervised execution runtime is bound; the supervised handoff stays durably pending",
+        statusText: `ERROR [execution_runtime_unavailable] Supervised handoff for ${planningRun.id} is pending: no supervised execution runtime is bound in this process. Resume /ultra-plan in the owning session once the runtime is available.`,
+      };
+    }
+    // §13 — the INITIAL SupervisorBinding owner is the trusted OpenCode user
+    // session that owns the final-approval handoff (planningRun.sessionID),
+    // never a Supervisor/Worker child session and never the entering session.
+    if (planningRun.sessionID !== sessionID) {
+      return {
+        status: "handoff_pending_foreign",
+        planningRunID: planningRun.id,
+        ownerSessionID: planningRun.sessionID,
+        statusText: `Supervised handoff for ${planningRun.id} belongs to session ${planningRun.sessionID}; resume /ultra-plan in that session (takeover becomes available once the run is active).`,
+      };
+    }
+    if (!planningRun.finalPlan) {
+      return {
+        status: "blocked",
+        code: "handoff_not_allowed",
+        message: "The handoff_pending run has no committed FinalPlan pointer",
+        statusText: `ERROR [handoff_not_allowed] Run ${planningRun.id} is handoff_pending without a committed FinalPlan; refusing supervised handoff.`,
+      };
+    }
+    const finalPlanRecord = await this.store.getFinalPlan(planningRun.id, planningRun.finalPlan.id, planningRun.finalPlan.revision);
+    if (!finalPlanRecord || finalPlanRecord.status !== "approved") {
+      return {
+        status: "blocked",
+        code: "handoff_not_allowed",
+        message: "The run's FinalPlan does not resolve as approved; refusing supervised handoff",
+        statusText: `ERROR [handoff_not_allowed] Run ${planningRun.id}: the FinalPlan does not resolve as approved; refusing supervised handoff.`,
+      };
+    }
+    // A→B (§11 — stable initial-handoff identity; recovery returns the SAME run)
+    let executionRun = (await this.store.findExecutionRunsForPlan(planningRun.id))[0];
+    if (!executionRun) {
+      // §12 — the execution-start baseline is observed NOW (execution start),
+      // by the HOST; approval-time state is never silently reused.
+      if (!bundle.executionStartBaseline) {
+        return {
+          status: "blocked",
+          code: "execution_baseline_unavailable",
+          message: "No execution-start workspace observer is bound; refusing to fabricate the executionStartBaseline",
+          statusText: "ERROR [execution_baseline_unavailable] The host did not provide an execution-start workspace observer; the supervised handoff stays pending.",
+        };
+      }
+      const baseline = await bundle.executionStartBaseline();
+      const prepared = await this.store.prepareInitialExecutionRun({
+        planID: planningRun.id,
+        finalPlan: { id: planningRun.finalPlan.id, revision: planningRun.finalPlan.revision },
+        finalPlanHash: finalPlanRecord.hash,
+        workspace: bundle.workspace,
+        executionStartBaseline: baseline,
+        initialHandoffKey: executionInitialHandoffKey(planningRun.id, planningRun.finalPlan),
+      });
+      executionRun = prepared.run;
+    }
+    // B→C — attach the trusted user session as the initial Supervisor owner.
+    let binding = await this.store.findSupervisorBinding(executionRun.id);
+    if (!binding) {
+      binding = (
+        await this.store.attachExecutionSupervisor({
+          executionRunID: executionRun.id,
+          sessionID: planningRun.sessionID,
+          workspace: bundle.workspace,
+        })
+      ).binding;
+    }
+    // C→D — durable supervised activation BEFORE the PlanningRun completes.
+    if (executionRun.lifecycle === "prepared") {
+      executionRun = await this.store.activateSupervisedExecutionRun({
+        executionRunID: executionRun.id,
+        sessionID: planningRun.sessionID,
+        workspace: bundle.workspace,
+        generation: binding.generation,
+        runRevision: executionRun.revision,
+        finalPlan: { id: planningRun.finalPlan.id, revision: planningRun.finalPlan.revision },
+      });
+    }
+    // D→E — PlanningRun.completed now means "handed to a durable ACTIVE
+    // supervised ExecutionRun" (§16), never "Build prompt delivered".
+    await this.store.completePlanningRunForSupervisedHandoff(planningRun.id);
+    // E — the production runtime entry: no second user command needed (§20).
+    const pump = await runProductionSupervisedExecution(this.store, bundle, {
+      executionRunID: executionRun.id,
+      sessionID: planningRun.sessionID,
+    });
+    return {
+      status: "handoff_recovered",
+      planningRunID: planningRun.id,
+      executionRunID: executionRun.id,
+      pump,
+      statusText: this.renderPumpStatusText(pump),
+    };
+  }
+
+  /**
+   * §30-§34 — resume (or surface) the recoverable supervised execution for
+   * this session. Same owner → resume from canonical Store. Different owner →
+   * takeover REQUIRED (no mutation). Multiple recoverable runs → ambiguous
+   * (never a latest-pick). `takeover` requires the HOST-minted typed
+   * authorization — the model can never authorize it (§34).
+   */
+  async resumeSupervisedExecution(
+    sessionID: string,
+    options: { executionRunID?: string; takeover?: boolean } = {},
+  ): Promise<SupervisedExecutionEntry> {
+    if (options.takeover) {
+      this.userCommands.consume(
+        sessionID,
+        { kind: "takeover", ...(options.executionRunID ? { executionRunID: options.executionRunID } : {}) },
+        this.now(),
+      );
+    }
+    const bundle = this.supervisedExecution;
+    if (!bundle) {
+      return {
+        status: "blocked",
+        code: "execution_runtime_unavailable",
+        message: "No supervised execution runtime is bound; nothing to resume",
+        statusText: "ERROR [execution_runtime_unavailable] No supervised execution runtime is bound in this process.",
+      };
+    }
+    const entry = await this.scanRecoverableExecution(sessionID, options.executionRunID);
+    if (!entry) {
+      throw new UltraPlanError("unknown_reference", "No recoverable supervised ExecutionRun applies in this workspace", {});
+    }
+    if (entry.status === "requires_takeover" && options.takeover) {
+      // §33 — explicit HUMAN takeover: trusted new session identity, Core
+      // takeover gate, generation +1, old owner fenced.
+      const binding = (await this.store.findSupervisorBinding(entry.executionRunID as never))!;
+      await this.store.takeoverExecutionSupervisor({
+        executionRunID: entry.executionRunID as never,
+        sessionID,
+        workspace: bundle.workspace,
+        expectedGeneration: binding.generation,
+        authorization: { kind: "user_authorized", reason: "explicit /ultra-plan takeover typed by the user" },
+      });
+      const pump = await runProductionSupervisedExecution(this.store, bundle, {
+        executionRunID: entry.executionRunID,
+        sessionID,
+      });
+      return {
+        status: "resumed",
+        executionRunID: entry.executionRunID,
+        pump,
+        statusText: `Takeover of ${entry.executionRunID} complete (generation ${binding.generation + 1}, previous owner ${entry.ownerSessionID} fenced).\n${this.renderPumpStatusText(pump)}`,
+      };
+    }
+    return entry;
+  }
+
+  /**
+   * §30/§67 — the recoverable-execution scan. Returns undefined when this
+   * workspace has no recoverable run (the caller falls through to planning).
+   */
+  private async scanRecoverableExecution(sessionID: string, executionRunID?: string): Promise<SupervisedExecutionEntry | undefined> {
+    const bundle = this.supervisedExecution;
+    if (!bundle) return undefined;
+    const recoverable = await this.store.listRecoverableExecutionRuns(bundle.workspace);
+    if (recoverable.length === 0) return undefined;
+    let target: ExecutionRun;
+    if (executionRunID) {
+      const found = recoverable.find((run) => run.id === executionRunID);
+      if (!found) {
+        throw new UltraPlanError(
+          "unknown_reference",
+          `ExecutionRun ${executionRunID} is not a recoverable run in this workspace`,
+          { executionRunID },
+        );
+      }
+      target = found;
+    } else if (recoverable.length > 1) {
+      // §31 — NEVER pick by recency; require the exact run.
+      return {
+        status: "ambiguous",
+        candidateRunIDs: recoverable.map((run) => run.id),
+        statusText: `ERROR [ambiguous_execution_run] ${recoverable.length} recoverable supervised runs exist in this workspace: ${recoverable.map((run) => run.id).join(", ")}. Re-run /ultra-plan resume <run> to choose the exact ExecutionRun.`,
+      };
+    } else {
+      target = recoverable[0]!;
+    }
+    const binding = await this.store.findSupervisorBinding(target.id);
+    if (!binding) {
+      // Crash window B: the recovery chain (including attachment) belongs to
+      // the session that owns the handoff — the planning run's session.
+      const planningRun = await this.store.getRun(target.planID);
+      if (planningRun && planningRun.lifecycle === "handoff_pending") {
+        if (planningRun.sessionID === sessionID) {
+          return await this.recoverSupervisedHandoff(sessionID, planningRun);
+        }
+        return {
+          status: "handoff_pending_foreign",
+          planningRunID: planningRun.id,
+          ownerSessionID: planningRun.sessionID,
+          statusText: `Supervised handoff for ${planningRun.id} (${target.id}) belongs to session ${planningRun.sessionID}; resume /ultra-plan in that session.`,
+        };
+      }
+      return {
+        status: "blocked",
+        code: "supervisor_binding_not_found",
+        message: `ExecutionRun ${target.id} has no SupervisorBinding and its planning run is not recoverable`,
+        statusText: `ERROR [supervisor_binding_not_found] ExecutionRun ${target.id} has no supervisor binding; resume /ultra-plan in the owning session.`,
+      };
+    }
+    if (binding.ownerSessionID !== sessionID) {
+      // §32 — surface everything the user needs; DO NOT auto-takeover.
+      return {
+        status: "requires_takeover",
+        executionRunID: target.id,
+        ownerSessionID: binding.ownerSessionID,
+        statusText: this.renderTakeoverRequiredText(target, binding.ownerSessionID),
+      };
+    }
+    const pump = await runProductionSupervisedExecution(this.store, bundle, { executionRunID: target.id, sessionID });
+    return { status: "resumed", executionRunID: target.id, pump, statusText: this.renderPumpStatusText(pump) };
+  }
+
+  /**
+   * §35-§37 — the explicit HUMAN abort. Requires the HOST-minted typed
+   * authorization naming the EXACT run; a cross-session abort requires the
+   * explicit takeover first. A running Attempt cannot be proven
+   * side-effect-free at abort time → fail closed to indeterminate (never a
+   * fabricated failed Report, no workspace rollback).
+   */
+  async abortSupervisedExecution(sessionID: string, executionRunID: string): Promise<SupervisedExecutionEntry> {
+    this.userCommands.consume(sessionID, { kind: "abort", executionRunID }, this.now());
+    const bundle = this.supervisedExecution;
+    if (!bundle) {
+      return {
+        status: "blocked",
+        code: "execution_runtime_unavailable",
+        message: "No supervised execution runtime is bound; abort requires the supervised runtime context",
+        statusText: "ERROR [execution_runtime_unavailable] No supervised execution runtime is bound in this process.",
+      };
+    }
+    const run = await this.store.getExecutionRun(executionRunID as never);
+    if (!run) {
+      throw new UltraPlanError("execution_run_not_found", `ExecutionRun ${executionRunID} does not exist`, { executionRunID });
+    }
+    if (run.lifecycle === "aborted") {
+      return { status: "aborted", executionRunID: run.id, statusText: `ExecutionRun ${run.id} is already aborted; history and workspace untouched.` };
+    }
+    if (run.lifecycle !== "active" && run.lifecycle !== "prepared") {
+      return {
+        status: "blocked",
+        code: "abort_not_allowed",
+        message: `ExecutionRun ${run.id} is terminal (${run.lifecycle}); it cannot be aborted`,
+        statusText: `ERROR [abort_not_allowed] ExecutionRun ${run.id} is ${run.lifecycle} (terminal); nothing to abort.`,
+      };
+    }
+    const binding = await this.store.findSupervisorBinding(run.id);
+    if (binding && binding.ownerSessionID !== sessionID) {
+      return {
+        status: "requires_takeover",
+        executionRunID: run.id,
+        ownerSessionID: binding.ownerSessionID,
+        statusText: this.renderTakeoverRequiredText(run, binding.ownerSessionID),
+      };
+    }
+    // §37 — authority facts: an unprovable running Attempt becomes
+    // indeterminate BEFORE the terminal transition, preserving reconciliation
+    // semantics and never faking a Report.
+    const running = await this.store.findRunningExecutionAttempt(run.id);
+    if (running) {
+      await this.store.markExecutionAttemptIndeterminate({
+        executionRunID: run.id,
+        attemptID: running.id,
+        sessionID,
+        workspace: bundle.workspace,
+        generation: binding?.generation ?? 1,
+      });
+    }
+    await this.store.abortExecutionRun(run.id, {
+      workspace: bundle.workspace,
+      runRevision: run.revision,
+      finalPlan: run.finalPlan,
+    });
+    const summary = await buildSupervisedExecutionSummary(this.store, run.id);
+    return {
+      status: "aborted",
+      executionRunID: run.id,
+      statusText: `ExecutionRun ${run.id} aborted by explicit user command. History retained${
+        summary.acceptedHead ? ` (accepted head ${summary.acceptedHead})` : ""
+      }; workspace NOT rolled back.${running ? " The running attempt was marked indeterminate (its outcome could not be proven)." : ""}`,
+    };
+  }
+
+  /**
+   * §41/§42 — the EXPLICIT typed replan entry (consumes the HOST-minted
+   * "replan" authorization and creates a NEW PlanningRun bound to the exact
+   * ExecutionIssue provenance).
+   */
+  async startReplanFromExecutionIssue(
+    sessionID: string,
+    options: { executionRunID?: string } = {},
+  ): Promise<SupervisedExecutionEntry> {
+    this.userCommands.consume(
+      sessionID,
+      { kind: "replan", ...(options.executionRunID ? { executionRunID: options.executionRunID } : {}) },
+      this.now(),
+    );
+    const target = await this.resolveReplanTargetRun(sessionID, options.executionRunID);
+    return await this.createReplanRun(sessionID, target);
+  }
+
+  /**
+   * §41 — the recommended plain continuation: a /ultra-plan re-entry when the
+   * session's latest execution run is replan_required starts replanning FROM
+   * the issue (explicitly surfaced in the returned status, never silent).
+   * Returns undefined when no unambiguous target exists so the caller falls
+   * through to normal planning.
+   */
+  private async scanReplanContinuation(sessionID: string): Promise<SupervisedExecutionEntry | undefined> {
+    const latest = await this.store.findLatestRunBySession(sessionID);
+    if (!latest || latest.replanProvenance) return undefined;
+    const executionRuns = await this.store.findExecutionRunsForPlan(latest.id);
+    const replanRuns = executionRuns.filter((run) => run.lifecycle === "replan_required");
+    if (replanRuns.length !== 1) return undefined;
+    const issue = await this.store.findExecutionIssueForRun(replanRuns[0]!.id);
+    if (!issue) return undefined;
+    return await this.createReplanRun(sessionID, replanRuns[0]!);
+  }
+
+  /** §40 — replan targets the EXACT terminal run; never a guess. */
+  private async resolveReplanTargetRun(sessionID: string, executionRunID: string | undefined): Promise<ExecutionRun> {
+    if (executionRunID) {
+      const found = await this.store.getExecutionRun(executionRunID as never);
+      if (!found) {
+        throw new UltraPlanError("execution_run_not_found", `ExecutionRun ${executionRunID} does not exist`, { executionRunID });
+      }
+      return found;
+    }
+    const latest = await this.store.findLatestRunBySession(sessionID);
+    const candidates = latest
+      ? (await this.store.findExecutionRunsForPlan(latest.id)).filter((run) => run.lifecycle === "replan_required")
+      : [];
+    if (candidates.length !== 1) {
+      throw new UltraPlanError(
+        "replan_not_available",
+        "No unambiguous replan_required ExecutionRun applies for this session; name the exact run (/ultra-plan replan EXEC-###)",
+        { candidateCount: candidates.length },
+      );
+    }
+    return candidates[0]!;
+  }
+
+  /** Shared replan-run creation (§40/§42/§43): NEW PlanningRun + exact provenance. */
+  private async createReplanRun(sessionID: string, executionRun: ExecutionRun): Promise<SupervisedExecutionEntry> {
+    if (executionRun.lifecycle !== "replan_required") {
+      throw new UltraPlanError(
+        "replan_not_available",
+        `ExecutionRun ${executionRun.id} is ${executionRun.lifecycle}; replanning starts only from a replan_required run`,
+        { executionRunID: executionRun.id, lifecycle: executionRun.lifecycle },
+      );
+    }
+    const issue = await this.store.findExecutionIssueForRun(executionRun.id);
+    if (!issue) {
+      throw new UltraPlanError("replan_not_available", `ExecutionRun ${executionRun.id} has no ExecutionIssue; replan provenance cannot bind`, {
+        executionRunID: executionRun.id,
+      });
+    }
+    const priorFinalPlanRecord = await this.store.getFinalPlan(executionRun.planID, executionRun.finalPlan.id, executionRun.finalPlan.revision);
+    if (!priorFinalPlanRecord) {
+      throw new UltraPlanError("unknown_reference", `ExecutionRun ${executionRun.id} binds FinalPlan ${executionRun.finalPlan.id}@${executionRun.finalPlan.revision}, which does not resolve`, {
+        executionRunID: executionRun.id,
+      });
+    }
+    // §40 — a NEW PlanningRun ID; the old completed PlanningRun is never
+    // reactivated and the old terminal ExecutionRun is never rebound (§46/§47).
+    const priorPlanningRun = await this.store.getRun(executionRun.planID);
+    const at = this.now();
+    const seq = await this.store.nextPlanSequence();
+    const provenance: ReplanProvenance = {
+      sourceExecutionIssue: { id: issue.id, executionRunID: executionRun.id, hash: issue.hash },
+      priorFinalPlan: {
+        id: executionRun.finalPlan.id,
+        revision: executionRun.finalPlan.revision,
+        hash: priorFinalPlanRecord.hash,
+      },
+      priorExecutionRun: executionRun.id,
+    };
+    const run = await this.store.createRun({
+      id: PlanIDs.from(seq),
+      sessionID,
+      lifecycle: "active",
+      stage: "discovery",
+      revision: 1,
+      goal: { statement: priorPlanningRun?.goal.statement ?? "" },
+      constraints: [],
+      sections: [],
+      decisions: [],
+      openQuestions: [],
+      conflicts: [],
+      replanProvenance: provenance,
+      createdAt: at,
+      updatedAt: at,
+    });
+    await this.store.appendEvent(run.id, { type: "run.created", sessionID });
+    // §39 — surface the issue explicitly (never a silent replan).
+    const context = await this.store.buildExecutionIssueReplanContext(issue.id);
+    const statusText = [
+      `REPLAN: new PlanningRun ${run.id} started from ExecutionIssue ${issue.id}.`,
+      `Prior execution run: ${executionRun.id} (terminal replan_required); prior FinalPlan ${context.finalPlan.id}@${context.finalPlan.revision}.`,
+      `Issue reason: ${issue.reason}`,
+      `Affected plan refs: ${issue.affectedPlanRefs.map((ref) => ("id" in ref ? String(ref.id) : JSON.stringify(ref))).join(", ") || "(none recorded)"}`,
+      context.acceptedCommits.length > 0
+        ? `Accepted execution head: ${context.acceptedCommits[0]!.id} (${context.acceptedCommits.length} accepted commit(s) — evidence/context only, NOT Plan Memory).`
+        : "No accepted execution commits.",
+      "The old execution run remains terminal; plan from the affected scope (Proposal → Approval → PlanCommit as usual).",
+    ].join("\n");
+    return {
+      status: "replan_started",
+      planningRunID: run.id,
+      sourceExecutionRunID: executionRun.id,
+      issueID: issue.id,
+      statusText,
+    };
+  }
+
+  /** §30/§31/§32 — the explicit-run / takeover-required surfaces. */
+  private renderTakeoverRequiredText(run: ExecutionRun, ownerSessionID: string): string {
+    return [
+      `ERROR [requires_takeover] ExecutionRun ${run.id} is ${run.lifecycle} and owned by session ${ownerSessionID}; no automatic takeover exists.`,
+      `FinalPlan: ${run.finalPlan.id}@${run.finalPlan.revision}.`,
+      `To take over explicitly: /ultra-plan resume ${run.id} --takeover (a real user decision; the previous owner is then fenced).`,
+    ].join("\n");
+  }
+
+  private renderPumpStatusText(pump: ProductionPumpResult): string {
+    if (pump.outcome === "ambiguous_execution_run") {
+      return `ERROR [ambiguous_execution_run] ${pump.candidateRunIDs.length} recoverable supervised runs: ${pump.candidateRunIDs.join(", ")}. Use /ultra-plan resume <run>.`;
+    }
+    if (pump.outcome === "not_recoverable") {
+      return `ERROR [not_recoverable] ${pump.reason}`;
+    }
+    if (pump.outcome === "unbound_execution_run") {
+      return `ERROR [supervisor_binding_not_found] ExecutionRun ${pump.executionRunID} has no supervisor binding; resume /ultra-plan in the owning session.`;
+    }
+    const summaryText = renderSupervisedExecutionSummary(pump.summary);
+    if (pump.outcome === "terminal") {
+      if (pump.terminal === "completed") {
+        return `Supervised execution ${pump.executionRunID} COMPLETED.\n${summaryText}`;
+      }
+      if (pump.terminal === "replan_required") {
+        return `Supervised execution ${pump.executionRunID} stopped: REPLAN_REQUIRED.\n${summaryText}\nContinue with /ultra-plan replan to start a new PlanningRun from the ExecutionIssue.`;
+      }
+      return `Supervised execution ${pump.executionRunID} is ${pump.terminal}.\n${summaryText}`;
+    }
+    if (pump.outcome === "requires_takeover") {
+      return `ERROR [requires_takeover] ExecutionRun ${pump.executionRunID} is owned by session ${pump.ownerSessionID}; no automatic takeover. Use /ultra-plan resume ${pump.executionRunID} --takeover.\n${summaryText}`;
+    }
+    return `Supervised execution ${pump.executionRunID} yielded (${pump.reason}) — the run stays active and resumable; re-run /ultra-plan to continue.\n${summaryText}`;
+  }
+
   // -- Phase 2J: recoverable ExecutionHandoff & same-session Build transition --
 
   /**
@@ -3180,6 +3819,16 @@ export class UltraPlanController {
     // §83/§94: completed is terminal — recovery is an idempotent no-op.
     if (run.lifecycle === "completed") return { status: "already_completed" };
     if (run.lifecycle !== "handoff_pending") return { status: "not_applicable" };
+    // Phase 7B §17/E4 — defense in depth BELOW the durable store gate: a run
+    // whose Final Approval durably selected supervised_v0_2 never re-enters
+    // the legacy free-Build delivery workflow, not even by direct call.
+    if (planningRunHandoffProtocol(run) === "supervised_v0_2") {
+      return {
+        status: "blocked",
+        code: "handoff_not_allowed",
+        message: `PlanningRun ${run.id} durably selected the supervised_v0_2 handoff protocol; the legacy free-Build recovery is unreachable`,
+      };
+    }
     if (!this.executionRuntime) {
       return { status: "blocked", code: "execution_runtime_unavailable", message: "No execution runtime adapter is bound; the handoff stays pending" };
     }
@@ -3328,6 +3977,30 @@ export class UltraPlanController {
     try {
       const run = await this.store.findLatestRunBySession(sessionID);
       if (!run || run.lifecycle !== "handoff_pending") return undefined;
+      // Phase 7B §4/§5 — the DURABLE protocol discriminator routes recovery.
+      // A supervised_v0_2 run is never offered to the legacy Build path.
+      if (planningRunHandoffProtocol(run) === "supervised_v0_2") {
+        const entry = await this.recoverSupervisedHandoff(sessionID, run);
+        if (entry.status === "handoff_recovered") {
+          return {
+            status: "supervised",
+            planningRunID: entry.planningRunID,
+            executionRunID: entry.executionRunID,
+            pump: entry.pump,
+          };
+        }
+        if (entry.status === "blocked") {
+          return { status: "blocked", code: entry.code, message: entry.message };
+        }
+        if (entry.status === "handoff_pending_foreign") {
+          return {
+            status: "blocked",
+            code: "handoff_session_mismatch",
+            message: `Supervised handoff for ${entry.planningRunID} belongs to session ${entry.ownerSessionID}`,
+          };
+        }
+        return { status: "blocked", code: "handoff_not_allowed", message: `Supervised handoff recovery ended in ${entry.status}` };
+      }
       return await this.recoverExecutionHandoff(sessionID);
     } catch {
       return undefined;
@@ -5098,6 +5771,8 @@ async function renderRunStatus(store: PlanStore, run: PlanningRun): Promise<stri
   let finalPlanDetails: StatusDetails["finalPlan"];
   // Phase 2J §66-§70: the durable handoff/delivery state of a final run.
   let handoffDetails: StatusDetails["handoff"];
+  // Phase 7B §48/§91: the SUPERVISED projection (durable execution state).
+  let supervisedHandoffDetails: StatusDetails["supervisedHandoff"];
   if (run.stage === "final" && (run.lifecycle === "handoff_pending" || run.lifecycle === "completed")) {
     if (run.finalPlan) {
       const committed = await store.getFinalPlan(run.id, run.finalPlan.id, run.finalPlan.revision);
@@ -5105,20 +5780,34 @@ async function renderRunStatus(store: PlanStore, run: PlanningRun): Promise<stri
         finalPlanDetails = { ref: `${committed.id}@${committed.revision}`, status: committed.status };
       }
     }
-    const handoff = await store.findExecutionHandoffForPlan(run.id);
-    const delivery = handoff ? await store.getHandoffDelivery(run.id, handoff.id) : undefined;
-    if (run.lifecycle === "completed") {
-      handoffDetails = {
-        ...(handoff ? { ref: handoff.id } : {}),
-        state: delivery?.state === "delivered" ? "delivered" : "not_prepared",
-        lifecycle: "completed",
+    if (planningRunHandoffProtocol(run) === "supervised_v0_2") {
+      // §48/§91 — the compact user-facing execution projection, built ONLY
+      // from durable state (stages / window / accepted head / latest reports).
+      const executionRuns = await store.findExecutionRunsForPlan(run.id);
+      const executionRun = executionRuns[0];
+      const summary = executionRun ? await buildSupervisedExecutionSummary(store, executionRun.id) : undefined;
+      supervisedHandoffDetails = {
+        ...(executionRun ? { executionRunID: executionRun.id } : {}),
+        executionLifecycle: executionRun?.lifecycle ?? "absent",
+        planningLifecycle: run.lifecycle === "completed" ? "completed" : "handoff_pending",
+        ...(summary ? { summary: renderSupervisedExecutionSummary(summary) } : {}),
       };
     } else {
-      handoffDetails = {
-        ...(handoff ? { ref: handoff.id } : {}),
-        state: delivery?.state ?? "not_prepared",
-        lifecycle: "handoff_pending",
-      };
+      const handoff = await store.findExecutionHandoffForPlan(run.id);
+      const delivery = handoff ? await store.getHandoffDelivery(run.id, handoff.id) : undefined;
+      if (run.lifecycle === "completed") {
+        handoffDetails = {
+          ...(handoff ? { ref: handoff.id } : {}),
+          state: delivery?.state === "delivered" ? "delivered" : "not_prepared",
+          lifecycle: "completed",
+        };
+      } else {
+        handoffDetails = {
+          ...(handoff ? { ref: handoff.id } : {}),
+          state: delivery?.state ?? "not_prepared",
+          lifecycle: "handoff_pending",
+        };
+      }
     }
   }
   return renderStatus(run, {
@@ -5129,6 +5818,7 @@ async function renderRunStatus(store: PlanStore, run: PlanningRun): Promise<stri
     ...(synthesis ? { synthesis } : {}),
     ...(finalPlanDetails ? { finalPlan: finalPlanDetails } : {}),
     ...(handoffDetails ? { handoff: handoffDetails } : {}),
+    ...(supervisedHandoffDetails ? { supervisedHandoff: supervisedHandoffDetails } : {}),
   });
 }
 

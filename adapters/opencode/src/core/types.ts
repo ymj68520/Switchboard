@@ -86,6 +86,20 @@ export interface PlanningRun {
 
   finalPlan?: FinalPlanRef;
 
+  /**
+   * Phase 7B §5-§7 — the durable handoff-protocol discriminator, recorded by
+   * the Final Approval transaction in the SAME atomic publication as
+   * `lifecycle → handoff_pending`. Absent ONLY on pre-cutover documents,
+   * which resolve to legacy_v0_1 (never inferred from artifacts).
+   */
+  handoffProtocol?: import("./execution-handoff-protocol.js").ExecutionHandoffProtocol;
+
+  /**
+   * Phase 7B §42 — exact-ref REPLAN provenance, present ONLY on a
+   * PlanningRun created from an ExecutionIssue (never on the original run).
+   */
+  replanProvenance?: import("./execution-handoff-protocol.js").ReplanProvenance;
+
   headCommit?: CommitID;
   headSnapshot?: SnapshotID;
 
