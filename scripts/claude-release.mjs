@@ -8,7 +8,7 @@
  * deterministic bundle build → allowlist staging → secret/path scan →
  * `claude plugin validate` (staged) → deterministic archive → digest →
  * reproducibility double-build → extracted-artifact validate + byte
- * comparison → staged-bundle MCP handshake (serverInfo version + 18 tools)
+ * comparison → staged-bundle MCP handshake (serverInfo version + 40 tools)
  * → `--version` smoke → marketplace materialization + validate →
  * release manifest + provenance.
  *
@@ -274,15 +274,15 @@ async function main() {
   if (handshake.serverInfo?.version !== version) {
     step("mcp-handshake", "FAIL", `serverInfo.version ${handshake.serverInfo?.version} != manifest ${version}`);
   }
-  if (handshake.tools.length !== 18) {
-    step("mcp-handshake", "FAIL", `tools/list returned ${handshake.tools.length} tools, expected 18 (E3/E21)`);
+  if (handshake.tools.length !== 40) {
+    step("mcp-handshake", "FAIL", `tools/list returned ${handshake.tools.length} tools, expected 40 (E11/E14 model-facing surface)`);
   }
   step("mcp-handshake", "PASS", `serverInfo v${handshake.serverInfo?.version}, ${handshake.tools.length} tools`);
 
   // 12. --version smoke from the staged bundle (§37).
   const versionRun = await run(process.execPath, [path.join(pluginRoot, "dist", "phase-plan-runtime.mjs"), "--version"], { capture: true });
   const expectedBanner = `phase-plan ${version}`;
-  if (!versionRun.stdout.includes(expectedBanner) || !versionRun.stdout.includes("schema support 13")) {
+  if (!versionRun.stdout.includes(expectedBanner) || !versionRun.stdout.includes("schema support 26")) {
     step("version-command", "FAIL", `unexpected banner: ${versionRun.stdout.trim().slice(0, 120)}`);
   }
   step("version-command", "PASS", versionRun.stdout.trim().split("\n").join(" | "));
@@ -296,7 +296,7 @@ async function main() {
     name: "phase-plan-release-test",
     owner: { name: "Switchboard" },
     metadata: {
-      description: "Local release-test marketplace for the Phase Plan v0.1 plugin (Phase 18 §18/§47).",
+      description: "Local release-test marketplace for the Phase Plan plugin (release §18/§47).",
       version,
     },
     plugins: [
@@ -321,7 +321,7 @@ async function main() {
   const releaseMetadata = {
     product: "phase-plan",
     version,
-    schemaVersion: 13,
+    schemaVersion: 26,
     toolCount: handshake.tools.length,
     toolNames: handshake.tools.map((t) => t.name),
     runtime: { node: ">=24.15.0" },

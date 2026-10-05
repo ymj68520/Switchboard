@@ -48,6 +48,7 @@ describe("release version contract (§3/§4)", () => {
       "hooks/hooks.json",
       "skills/phase-plan/SKILL.md",
       "agents/validator.md",
+      "agents/execution-worker.md",
       "dist/phase-plan-runtime.mjs",
       "README.md",
       "CHANGELOG.md",
@@ -74,7 +75,7 @@ describe("release version contract (§3/§4)", () => {
     expect(metadata.version).toBe(RUNTIME_VERSION);
     expect(metadata.product).toBe("phase-plan");
     expect(metadata.schemaVersion).toBe(SUPPORTED_SCHEMA_VERSION);
-    expect(metadata.toolCount).toBe(18);
+    expect(metadata.toolCount).toBe(40);
     const zipPath = path.join(RELEASE_ROOT, metadata.artifact);
     expect(existsSync(zipPath)).toBe(true);
     expect(metadata.artifactSha256).toBe(createHash("sha256").update(readFileSync(zipPath)).digest("hex"));

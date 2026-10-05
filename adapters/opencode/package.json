@@ -1,6 +1,6 @@
 {
   "name": "@switchboard/opencode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "private": true,
   "description": "Switchboard adapter for OpenCode, including the Ultra Plan planning harness (/ultra-plan).",
@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin-entry.d.ts",
+      "import": "./dist/plugin-entry.js",
+      "default": "./dist/plugin-entry.js"
     }
   },
   "files": [

@@ -1,8 +1,8 @@
 # Ultra Plan for OpenCode
 
-**A deterministic planning harness for OpenCode.** Ultra Plan turns a goal into an approved, auditable implementation plan inside your normal OpenCode session: the model proposes, a deterministic harness freezes and validates every artifact, you approve every committed change, and the finished plan is handed to OpenCode's Build agent in the same session.
+**A deterministic planning-and-execution harness for OpenCode.** Ultra Plan turns a goal into an approved, auditable implementation plan inside your normal OpenCode session: the model proposes, a deterministic harness freezes and validates every artifact, you approve every committed change — and after Final Approval the plan is executed under a supervised execution protocol (a Supervisor that directs, Workers that act, independent Verifiers, and a Core that owns every authoritative transition).
 
-Ultra Plan is **not** a model and **not** a router. It is a workflow layer that makes the planning loop deterministic: the model never names authoritative objects, never commits anything, and never approves anything. Every committed fact entered through an explicit user approval of an exact proposal.
+Ultra Plan is **not** a model and **not** a router. It is a workflow layer that makes the loop deterministic: the model never names authoritative objects, never commits anything, and never approves anything. Every committed fact entered through an explicit user approval of an exact proposal.
 
 ---
 
@@ -30,9 +30,9 @@ This is a provider policy boundary of the free tier, not a generic OpenCode inco
 Ultra Plan is distributed as a **GitHub Release asset**. Download the release tarball, install it into your project from the downloaded file, and register the plugin with a one-line shim.
 
 ```text
-1. download switchboard-opencode-0.1.0.tgz
+1. download switchboard-opencode-0.2.0.tgz
    from the GitHub Release assets
-2. npm install ./switchboard-opencode-0.1.0.tgz
+2. npm install ./switchboard-opencode-0.2.0.tgz
 3. create .opencode/plugin/ultra-plan.js containing exactly:
       export { default } from "@switchboard/opencode";
 4. start OpenCode normally
@@ -106,16 +106,84 @@ State is durable across OpenCode restarts. Reopen the project and run `/ultra-pl
 
 ## Final approval and the Build handoff
 
-Synthesis produces a frozen input, a provenance-bound manifest, an isolated-session semantic validation, and an evidence audit; a deterministic finalization gate decides — the model cannot. The final plan requires one more explicit approval (verified twice: pre-ask and inside the commit). The commit publishes the FinalPlan and moves the run to `handoff_pending`; the harness then dispatches a deterministic ExecutionHandoff to OpenCode's `build` agent **in the same session**, confirms delivery from the host's history, and marks the run `completed`. The final commit chain is immutable.
+Synthesis produces a frozen input, a provenance-bound manifest, an isolated-session semantic validation, and an evidence audit; a deterministic finalization gate decides — the model cannot. The final plan requires one more explicit approval (verified twice: pre-ask and inside the commit). The commit publishes the FinalPlan, moves the run to `handoff_pending`, and durably records the `supervised_v0_2` handoff protocol.
+
+## Supervised execution (v0.2.0 production path)
+
+After Final Approval, the run no longer falls back to a free-Build handoff. `/ultra-plan` enters the **supervised execution** state machine:
+
+```text
+Final Approval (handoff_pending, supervised_v0_2)
+  → prepareInitialExecutionRun        (exactly one ExecutionRun per Final Approval)
+  → SupervisorBinding                 (owner = the trusted user session; generation fencing)
+  → ExecutionRun active → PlanningRun completed
+  → production pump, driven by the Supervisor model:
+      derive the Stage decomposition (§JIT — from the approved FinalPlan only)
+      activate a Stage → open its VerificationWindow → issue Directives
+      Workers execute through OpenCode repository tools in FRESH child sessions
+      independent Verifiers verify candidates; conflicts and indeterminate
+      side effects go through the frozen conflict/reconciliation protocols
+      accept → ExecutionCommit (the only acceptedHead advancer)
+  → final_closure Stage → ExecutionCompletionGate → ExecutionRun completed
+```
+
+Supervisor, Workers, and Verifiers are mechanically isolated (per-call host tool maps over the DISCOVERED host tool inventory — the Supervisor gets no host tools at all; Workers only the capability-mapped tools; OpenCode's per-call maps are overrides, so the deny coverage comes from a live inventory, fail-closed at startup). Budgets yield the pump WITHOUT lifecycle mutation; the run stays active and resumable.
+
+### Execution control (human-only; the model can relay but never authorize)
+
+```text
+/ultra-plan                        enter: recover/resume execution, or start planning
+/ultra-plan resume [EXEC-###]      resume the recoverable execution run (same session)
+/ultra-plan resume EXEC-### --takeover   explicit human takeover (binding generation +1)
+/ultra-plan abort EXEC-###         terminate the EXACT run (history kept; no rollback;
+                                   an unprovable running Attempt becomes indeterminate)
+/ultra-plan replan [EXEC-###]      stop for replanning → a NEW PlanningRun carrying the
+                                   ExecutionIssue provenance; a new Final Approval
+                                   creates a NEW ExecutionRun (old runs never rebind)
+```
+
+Ambiguous recovery targets are never auto-picked (`ambiguous_execution_run`); a different session surfaces `requires_takeover` instead of taking over.
+
+### Runtime configuration (validated fail-closed at startup)
+
+All settings are optional; invalid values REFUSE the plugin load (never silent degradation).
+
+| Setting | Type | Default | Allowed range | Failure behavior |
+|---|---|---|---|---|
+| `ULTRA_PLAN_SUPERVISOR_MODEL` | `"provider/model"` | planning model | any configured ref | unparsable ref refuses startup |
+| `ULTRA_PLAN_WORKER_MODEL` | `"provider/model"` | host execution model | any configured ref | unparsable ref refuses startup |
+| `ULTRA_PLAN_VERIFIER_MODEL` | `"provider/model"` | worker model | any configured ref | unparsable ref refuses startup |
+| `ULTRA_PLAN_PLANNING_MODEL` | `"provider/model"` | session model | any configured ref | unparsable ref refuses startup |
+| `ULTRA_PLAN_MAX_SUPERVISOR_TURNS_PER_PUMP` | positive int | `25` | ≥ 1 | non-integer/≤0 refuses startup |
+| `ULTRA_PLAN_MAX_WORKER_DISPATCHES_PER_PUMP` | positive int | `25` | ≥ 1 | non-integer/≤0 refuses startup |
+| `ULTRA_PLAN_MAX_SUPERVISOR_READ_OPS_PER_TURN` | positive int | `8` | ≥ 1 | non-integer/≤0 refuses startup |
+| `ULTRA_PLAN_SUPERVISOR_TIMEOUT_MS` | positive int ms | `300000` | ≥ 1 | non-integer/≤0 refuses startup |
+| `ULTRA_PLAN_WORKER_TIMEOUT_MS` | positive int ms | `600000` | ≥ 1 | non-integer/≤0 refuses startup |
+| `ULTRA_PLAN_MAX_CONSECUTIVE_SUPERVISOR_PROTOCOL_FAILURES` | positive int | `3` | ≥ 1 | non-integer/≤0 refuses startup |
+
+Reasoning-style models also need an adequate OUTPUT limit in the host model config (e.g. `provider.sensenova.models["deepseek-v4-flash"].limit.output`); a too-small output budget truncates strict-JSON control payloads and the turns fail closed.
+
+Budgets are runtime-only (never persisted). Exhaustion yields; `/ultra-plan` resumes with a fresh budget from the durable Store.
+
+### Where execution state lives
+
+The same durable per-project store as planning (`plan-store.json`): the protocol discriminator, the ExecutionRun, SupervisorBinding, Stages/Windows/Directives/Attempts/Reports/Assessments/Commits, the ExecutionIssue, and the ExecutionCompletionRecord. Every recovery decision is rebuilt from this file — never from conversations or child-session existence.
+
+### Legacy free-Build compatibility (pre-cutover recovery only)
+
+Handoffs created BEFORE the v0.2.0 cutover (no durable protocol marker) still recover through the legacy free-Build path. New Final Approvals can never produce one: the store refuses legacy handoff creation for supervised runs, and a legacy-looking run carrying execution state is corruption (fails closed).
 
 ## Known limitations
 
-- Validated only on OpenCode CLI 1.18.32, Node 24.21.0, Windows.
-- No Build execution tracking, no execution-issue/replanning workflow, no automatic FinalPlan amendment (explicitly out of v0.1 scope).
+- Validated only on OpenCode CLI 1.18.x, Node 24.x, Windows.
+- Execution is SERIAL: one active Stage, one open VerificationWindow, one active Attempt per run. No parallel execution, no ExecutionObservation.
+- Worker/Verifier Reports are trusted factual inputs — they do not by themselves advance authoritative state; Core owns every acceptance.
+- No cross-machine active-run migration (the run binds a stable workspace identity); no automatic rollback on abort.
+- Legacy free-Build exists ONLY for pre-cutover recovery (see above).
 - Context token counts are conservative estimates, not provider billing tokens.
-- The durable store is a whole document: publication is O(state) — fine for planning-scale data, not a database.
-- Handoff delivery confirmation scans session history within a bounded loop.
+- The durable store is a whole document: publication is O(state) — fine for planning/execution-scale data, not a database.
 - The semantic validator cannot run on free-tier `opencode/*` models (provider policy rejects tools-disabled requests — see "Provider support" above).
+- Per-call tool maps deny the DISCOVERED host inventory at plugin load; a host tool registered AFTER load (without a host restart) is not covered until the next plugin construction.
 
 ## Troubleshooting
 
@@ -125,8 +193,13 @@ Synthesis produces a frozen input, a provenance-bound manifest, an isolated-sess
 | `store_busy` | Another writer holds the store lock (bounded 4 s wait exhausted). | Retry; after a killed process the lock self-heals within ~15 s. |
 | `store_version_unsupported` | The store was written by a NEWER plugin version. | Upgrade the plugin; the store is refused rather than misread. |
 | `context_budget_exceeded` | Required planning context exceeded the configured budget (`overflow=fail`), or rendered complete with a warning (default). | Raise `ULTRA_PLAN_CONTEXT_BUDGET_TOKENS`. |
-| `start_not_authorized` | `ultraplan_start` was invoked without the `/ultra-plan` command. | Use `/ultra-plan`. |
+| `start_not_authorized` | `ultraplan_start` was invoked without the `/ultra-plan` command, or an execution control action (takeover/abort/replan) was relayed without the host-minted authorization from the raw `/ultra-plan` arguments. | Use `/ultra-plan …` (the model cannot mint these). |
 | `capability_not_available` | The operation is not valid in the current stage/substate. | Check the status block / L5 checklist. |
+| `supervisor_tool_isolation_blocked` | The host tool inventory (`client.tool.ids()`) was unavailable at startup — supervised execution refuses to run without a trusted inventory. | Upgrade/repair the OpenCode host so the inventory endpoint responds; restart. |
+| `budget_exhausted` / yielded pump | The turn/dispatch budget for this pump run was consumed; NO lifecycle state changed. | Run `/ultra-plan` again to resume with a fresh budget. |
+| `requires_takeover` | The recoverable run is owned by another session. | From that session: resume; or here: `/ultra-plan resume EXEC-### --takeover`. |
+| `ambiguous_execution_run` | More than one recoverable execution run matches; auto-picking is forbidden. | Resume the exact run: `/ultra-plan resume EXEC-###`. |
+| `stale_supervisor_binding` | A takeover happened elsewhere; the presented generation is stale. | Never auto-taken-over — resume with the current owner or take over explicitly. |
 
 ## License
 

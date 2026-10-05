@@ -73,6 +73,27 @@ shown the candidate and asked before anything attaches.
   execution handoff after your explicit Final Approval, delivered back into
   the same session.
 
+## Supervised execution (v0.2.0)
+
+After Final Approval, the plan is executed as a **durable supervised
+execution run** in the same session — planning and execution stay separate:
+
+- The immutable FinalPlan drives an ExecutionRun with explicit stages and
+  verification windows; the same FinalPlan can also seed further independent
+  runs later.
+- Work is issued as an immutable Directive → Attempt → Report protocol.
+  A fresh execution-worker subagent performs each attempt, and accepted
+  progress advances only through an ExecutionCommit after fresh independent
+  verification — never by the worker's own claim.
+- Rework, bounded conflict resolution, `replan_required` with successor
+  planning, and crash/indeterminate attempt reconciliation are all durable
+  and auditable; `/clear`, fork, compaction, rewind, and supervisor takeover
+  recover fail-closed.
+- Human authority is explicit: execution abort requires your confirmation,
+  and re-running the same FinalPlan (`reexecute_final_plan`) is
+  human-authorized only. The FinalPlan itself is never rewritten by
+  execution.
+
 ## A1 — resuming across sessions (crash/restart UX)
 
 Plan state is durable and version-fenced. If Claude Code exits or the

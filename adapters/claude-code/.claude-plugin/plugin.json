@@ -1,6 +1,6 @@
 {
   "name": "phase-plan",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Persistent, approval-driven planning harness for Claude Code (/phase-plan).",
   "author": {
     "name": "Switchboard"

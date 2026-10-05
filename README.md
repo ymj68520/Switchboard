@@ -164,15 +164,15 @@ switchboard/
 
 ## Status
 
-Switchboard's first release, **v0.1** (2026-09-29), ships all three adapters as a single GitHub Release:
+The current release is **v0.2** (2026-10-06), shipped as a single GitHub Release bundle:
 
 | Host | Product | Version | Scope |
 | --- | --- | --- | --- |
-| Claude Code | Phase Plan | 0.1.1 | persistent, approval-driven planning with execution handoff |
-| Codex CLI | phase-model | 0.0.1 | automatic Plan/Default model switching for the Codex TUI |
-| OpenCode | Ultra Plan | 0.1.0 | deterministic planning harness (`/ultra-plan`) with same-session Build handoff |
+| Claude Code | Phase Plan | 0.2.0 | approval-driven planning plus durable supervised execution after Final Approval |
+| OpenCode | Ultra Plan | 0.2.0 | deterministic planning harness (`/ultra-plan`) with supervised execution production cutover |
+| Codex CLI | phase-model | 0.0.1 | automatic Plan/Default model switching for the Codex TUI (unchanged since v0.1) |
 
-Distribution is GitHub Release assets only; nothing is published to npm. See each adapter's README for validated environments, installation steps, and known limitations.
+Distribution is GitHub Release assets only; nothing is published to npm. The first release, **v0.1** (2026-09-29), remains available at its own GitHub Release. See each adapter's README for validated environments, installation steps, and known limitations.
 
 ## Roadmap
 
@@ -182,11 +182,11 @@ Repository architecture, per-adapter specifications, and host adapter contracts 
 
 **Phase 2 — OpenCode — shipped**
 
-Ultra Plan v0.1.0: a deterministic planning harness built on OpenCode's native agent and command capabilities.
+Ultra Plan v0.2.0: a deterministic planning harness built on OpenCode's native agent and command capabilities, now with supervised execution as the production path (durable supervised handoff, ExecutionCommit chain, final_closure).
 
 **Phase 3 — Claude Code — shipped**
 
-Phase Plan v0.1.1: approval-driven persistent planning on Claude Code's native plugin, hook, and MCP capabilities.
+Phase Plan v0.2.0: approval-driven persistent planning plus durable supervised execution after Final Approval on Claude Code's native plugin, hook, and MCP capabilities.
 
 **Phase 4 — Codex — shipped**
 

@@ -28,6 +28,7 @@ export const RELEASE_ALLOWLIST = Object.freeze([
   "hooks/hooks.json",
   "skills/phase-plan/SKILL.md",
   "agents/validator.md",
+  "agents/execution-worker.md",
   "dist/phase-plan-runtime.mjs",
   "README.md",
   "CHANGELOG.md",

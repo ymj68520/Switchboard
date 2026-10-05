@@ -4,6 +4,21 @@ All notable user-visible changes to the Phase Plan plugin are documented
 here. Versions follow the plugin manifest (`.claude-plugin/plugin.json`),
 which is the single release version source.
 
+## 0.2.0
+
+Durable supervised execution after Final Approval (the v0.2.0 architecture program, E1–E14 + A1). The FinalPlan remains the immutable normative authority; PlanningRun and ExecutionRun remain separate.
+
+- **ExecutionRun / ExecutionStage / VerificationWindow** — a durable, schema-versioned execution layer above the approved plan; serialized per workspace (at most one prepared/active run each).
+- **Immutable Directive → Attempt → Report protocol** — fresh independent verification before any accepted progress; ExecutionCommit is the only acceptedHead writer.
+- **Rework, bounded conflict resolution, REPLAN_REQUIRED with successor planning** — controlled replan return that reuses the planning machinery.
+- **Crash/indeterminate Attempt reconciliation** — unresolved attempts fence the run; reconciled attempts resume it.
+- **Recovery across /clear, fork, compaction, rewind, and supervisor takeover** — boundary precedence with fail-closed unbound-host handling.
+- **Human-authorized execution abort** — control-plane abort with one-to-one provenance and worker lifecycle fences.
+- **Same immutable FinalPlan → multiple independent ExecutionRuns**, including human-authorized reexecution (`reexecute_final_plan`).
+- **Directive v4 execution identity** (v1/v2/v3 remain readable and hash-stable); store schema 26; model-facing tool surface now 40 tools (including `abort_execution_run` and `reexecute_final_plan` as human-control tools).
+
+Store migration: existing plan stores upgrade automatically to schema 26; there is no reverse automatic downgrade, and older plugin processes fail closed against a newer store.
+
 ## 0.1.1
 
 Re-release build of the v0.1.0 content at version 0.1.1: the release-version validation pass (Phase 18 R8) exercised the plugin-update channel (0.1.0 → 0.1.1) and confirmed plugin-data persistence across updates. No product changes.
