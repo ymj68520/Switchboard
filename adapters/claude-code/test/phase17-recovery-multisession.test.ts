@@ -371,7 +371,15 @@ describe("Phase 17 multi-session matrix (§22–§29)", () => {
   it("§25/§26 matrices D/E: /clear and fork never transfer planning authority; the old run stays detached-active for exact resume", async () => {
     const world = await buildPhase17World("discovery", "S1");
     try {
-      handleSessionEnd(depsOf(world), { sessionId: world.owner, hookEventName: "SessionEnd", reason: "clear" });
+      // E12C amendment: the /clear boundary detach lives in the owner's
+      // SessionStart(source=clear); SessionEnd(reason=clear) is a no-op.
+      await handleSessionStart(depsOf(world), {
+        sessionId: world.owner,
+        cwd: world.workspaceRoot,
+        permissionMode: "plan",
+        hookEventName: "SessionStart",
+        source: "clear",
+      });
       expect(getBinding(world.store, world.runId)).toMatchObject({ state: "detached", sessionId: "S1" });
       // A NEW session (clear/fork identity) inherits nothing: no capsule, no
       // reattach; a fresh /phase-plan creates a NEW run instead of resuming.
@@ -403,9 +411,19 @@ describe("Phase 17 multi-session matrix (§22–§29)", () => {
   it("§27/§28 matrices F/G: Build /clear and fork never transfer ExecutionBinding; the new session cannot read the execution contract", async () => {
     const world = await buildPhase17World("completed-build");
     try {
-      handleSessionEnd(depsOf(world), { sessionId: world.owner, hookEventName: "SessionEnd", reason: "clear" });
+      // E12C amendment: the /clear boundary detach lives in the owner's
+      // SessionStart(source=clear); SessionEnd(reason=clear) is a no-op.
+      await handleSessionStart(depsOf(world), {
+        sessionId: world.owner,
+        cwd: world.workspaceRoot,
+        permissionMode: "default",
+        hookEventName: "SessionStart",
+        source: "clear",
+      });
       // A fork/clear identity does NOT reattach the execution binding (only
       // exact-session resume does), so no execution context is readable.
+      // E2 §18 — the new session DOES receive the read-only recovery notice
+      // for the workspace's active ExecutionRun; authority is never transferred.
       for (const source of ["clear", "fork", "startup"] as const) {
         const out = await handleSessionStart(depsOf(world), {
           sessionId: "S17-OTHER",
@@ -414,7 +432,10 @@ describe("Phase 17 multi-session matrix (§22–§29)", () => {
           hookEventName: "SessionStart",
           source,
         });
-        expect(out.kind).toBe("empty");
+        expect(out.kind).toBe("json");
+        const text = String(((out as { kind: "json"; payload: { hookSpecificOutput?: { additionalContext?: string } } }).payload).hookSpecificOutput?.additionalContext ?? "");
+        expect(text).toContain("Phase Plan execution is in progress");
+        expect(text).toContain("NO writable supervision authority");
       }
       // The new session's execution reads are unsigned → fail closed.
       const outcome = (await import("./phase17-helpers.js")).callAsTool(world, "get_state", "other");
@@ -437,8 +458,17 @@ describe("Phase 17 multi-session matrix (§22–§29)", () => {
   it("§29 matrix H: the successor's ownership follows ordinary planning-binding semantics under /clear, fork, takeover, and exact resume", async () => {
     const world = await buildPhase17World("successor-unmaterialized");
     try {
-      // /clear detaches; a fork identity inherits nothing.
-      handleSessionEnd(depsOf(world), { sessionId: world.owner, hookEventName: "SessionEnd", reason: "clear" });
+      // /clear detaches; a fork identity inherits nothing. E2 §18 — the fork
+      // session receives only the read-only execution notice (the predecessor
+      // ExecutionRun is active in this workspace); no authority transfers.
+      // E12C amendment: the boundary detach lives in SessionStart(source=clear).
+      await handleSessionStart(depsOf(world), {
+        sessionId: world.owner,
+        cwd: world.workspaceRoot,
+        permissionMode: "plan",
+        hookEventName: "SessionStart",
+        source: "clear",
+      });
       const forkOut = await handleSessionStart(depsOf(world), {
         sessionId: "S17-OTHER",
         cwd: world.workspaceRoot,
@@ -446,7 +476,9 @@ describe("Phase 17 multi-session matrix (§22–§29)", () => {
         hookEventName: "SessionStart",
         source: "fork",
       });
-      expect(forkOut.kind).toBe("empty");
+      expect(forkOut.kind).toBe("json");
+      const forkText = String(((forkOut as { kind: "json"; payload: { hookSpecificOutput?: { additionalContext?: string } } }).payload).hookSpecificOutput?.additionalContext ?? "");
+      expect(forkText).toContain("NO writable supervision authority");
       // Takeover by another session follows the SAME generation fence as any
       // planning run — predecessor lineage grants no bypass. The expected
       // generation is the CURRENT (post-detach) epoch the selection metadata

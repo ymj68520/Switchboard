@@ -31,6 +31,7 @@ import {
 } from "../src/store/successor-baselines.js";
 import { getExecutionBindingInTx, getExecutionHandoffInTx, reattachExecutionBindingInTx } from "../src/store/execution.js";
 import { detachBindingInTx } from "../src/store/session-bindings.js";
+import { getExecutionRunBySourcePlanningRunInTx } from "../src/store/execution-runs.js";
 import { getFinalPlanInTx } from "../src/store/finalization.js";
 import { getHeadCommitRecord } from "../src/store/plan-commits.js";
 import { listSectionWorkflowStates } from "../src/store/section-workflow.js";
@@ -104,10 +105,15 @@ function callReportIssue(
   },
   options: { toolUseId?: string; generation?: number } = {},
 ) {
+  // A1 §37 — the signed EXECUTION identity carries the canonical
+  // ExecutionRunID resolved from the fixture planning run.
+  const executionRunId = ctx.store.withRead(
+    (tx) => getExecutionRunBySourcePlanningRunInTx(tx, f.runId),
+  )?.executionRunId ?? f.runId;
   const token = executionToken(ctx, {
     sessionId: f.sessionId,
     workspaceId: f.workspaceId,
-    runId: f.runId,
+    runId: executionRunId,
     finalPlanId: f.finalPlanId,
     generation: options.generation ?? 1,
     tool: "report_execution_issue",
@@ -120,6 +126,11 @@ function callReportIssue(
     issue: { issue_id: string; issue_hash: string; kind: string };
     executionIssues: { openCount: number; replanRequired: boolean };
   };
+}
+
+/** A1 §37 — the canonical ExecutionRunID of the fixture planning run. */
+function executionRunIdOf(ctx: PhasePlanToolContext, planningRunId: string): string {
+  return ctx.store.withRead((tx) => getExecutionRunBySourcePlanningRunInTx(tx, planningRunId))?.executionRunId ?? planningRunId;
 }
 
 /** The FinalPlan row + parsed canonical of a run (ids are server-generated — read dynamically). */
@@ -193,13 +204,13 @@ describe("migration 11 → 12 execution-issue-successor-baseline (§5, E1/E67/E6
     expect(ctx.store.withRead((tx) => getFinalPlanInTx(tx, f.runId))!.finalPlanHash).toBe(f.finalPlanHash);
     ctx.store.withRead((tx) => {
       const history = tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-      expect(history.map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+      expect(history.map((row) => row.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
       for (const table of ["execution_issues", "planning_run_baselines", "execution_issue_adoptions", "planning_run_baseline_materializations"]) {
         const row = tx.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
         expect(row.n).toBe(0);
       }
     });
-    expect(SUPPORTED_SCHEMA_VERSION).toBe(13);
+    expect(SUPPORTED_SCHEMA_VERSION).toBe(26);
   });
 
   it("no execution progress tables ever exist (§6, E63)", async () => {
@@ -264,12 +275,12 @@ describe("ExecutionIssue identity, exact refs, immutability (§7–§11, E2–E7
   });
 
   it("a completely unscoped issue is rejected (§11)", async () => {
-    const { f, ctx } = await deliveredWorld();
+    const { f, ctx, handoff } = await deliveredWorld();
     // The MCP schema enforces minItems=1 (MCP_INPUT_INVALID); the DOMAIN law
     // is asserted at the service boundary.
     expect(codeOf(() =>
       createExecutionIssueService(ctx.store, ctx.clock).reportIssue({
-        runId: f.runId,
+        executionRunId: handoff.execution_run.id,
         workspaceId: f.workspaceId,
         workspaceRoot: f.workspaceRoot,
         sessionId: f.sessionId,
@@ -355,7 +366,7 @@ describe("ExecutionIssue identity, exact refs, immutability (§7–§11, E2–E7
 
 describe("report_execution_issue MCP surface (§12–§14, E8, E66)", () => {
   it("is a registered tool, carries no approval meta, and is followed by the two Phase 16 control tools (§87/§14/E66, Phase 16 §48)", () => {
-    expect(PHASE_PLAN_TOOLS).toHaveLength(18);
+    expect(PHASE_PLAN_TOOLS).toHaveLength(40);
     const tool = PHASE_PLAN_TOOLS[15]!;
     expect(tool.name).toBe("report_execution_issue");
     expect(tool._meta).toBeUndefined();
@@ -411,7 +422,7 @@ describe("Build replanRequired projections and mutation guard (§19–§21, E10�
   it("get_state / get_context(detail=build) expose the open-issue projection (§19, E10)", async () => {
     const { f, ctx } = await deliveredWorld();
     const stateToken = executionToken(ctx, {
-      sessionId: f.sessionId, workspaceId: f.workspaceId, runId: f.runId,
+      sessionId: f.sessionId, workspaceId: f.workspaceId, runId: executionRunIdOf(ctx, f.runId),
       finalPlanId: f.finalPlanId, generation: 1, tool: "get_state", toolUseId: "TU-STATE-1",
     });
     const before = executePhasePlanTool(ctx, "get_state", { _hostContext: stateToken }) as Record<string, unknown>;
@@ -427,7 +438,7 @@ describe("Build replanRequired projections and mutation guard (§19–§21, E10�
     const after = executePhasePlanTool(ctx, "get_state", { _hostContext: stateToken }) as Record<string, unknown>;
     expect(after.executionIssues).toEqual({ openCount: 1, replanRequired: true });
     const contextToken = executionToken(ctx, {
-      sessionId: f.sessionId, workspaceId: f.workspaceId, runId: f.runId,
+      sessionId: f.sessionId, workspaceId: f.workspaceId, runId: executionRunIdOf(ctx, f.runId),
       finalPlanId: f.finalPlanId, generation: 1, tool: "get_context", toolUseId: "TU-BUILDCTX-1",
       business: { detail: "build" },
     });
@@ -439,7 +450,8 @@ describe("Build replanRequired projections and mutation guard (§19–§21, E10�
 
   it("the PreToolUse mutation guard pauses Build while an issue is open; reads stay available (§20/§21, E11/E12)", async () => {
     const { f, ctx } = await deliveredWorld();
-    // No open issue: a Write is not our business (Phase 14 behavior preserved).
+    // No open issue: under E5 §19 the delivered run's SUPERVISOR may not write
+    // directly — repository work belongs to ExecutionWorkers now.
     const writeBefore = outputOf(await handlePreToolUse(depsOf(ctx), {
       sessionId: f.sessionId,
       cwd: f.workspaceRoot,
@@ -449,7 +461,9 @@ describe("Build replanRequired projections and mutation guard (§19–§21, E10�
       toolInput: { file_path: "x.ts", content: "hi" },
       toolUseId: "W0",
     }));
-    expect(writeBefore.hookSpecificOutput).toBeUndefined();
+    const payloadBefore = writeBefore.hookSpecificOutput as { permissionDecision?: string; permissionDecisionReason?: string };
+    expect(payloadBefore.permissionDecision).toBe("deny");
+    expect(payloadBefore.permissionDecisionReason).toContain("SUPERVISOR_DIRECT_TOOL_FORBIDDEN");
 
     callReportIssue(ctx, f, {
       kind: "explicit_dependency",
@@ -1184,7 +1198,7 @@ describe("context v5 successor lineage and recovery capsule (§46/§47/§102, E4
     expect(capsule).toContain(`Baseline FinalPlan: ${f.finalPlanId}`);
     expect(capsule).toContain("Baseline materialized: no");
     // E80 (pre-materialization recovery): the capsule alone reconstructs the lineage.
-    expect(capsule).toContain(`Predecessor run: ${f.runId}`);
+    expect(capsule).toContain(`Predecessor PlanningRun: ${f.runId}`);
   });
 
   it("after materialization the context reports materialized=true with the local HEAD", async () => {
@@ -1286,7 +1300,12 @@ describe("successor creation and adoption concurrency (§72–§75, E59/E60)", (
       expect(fulfilled).toHaveLength(1);
       for (const rejection of rejected) {
         expect((rejection as PromiseRejectedResult).reason).toBeInstanceOf(RuntimeError);
-        expect((rejection as PromiseRejectedResult).reason.code).toBe("STALE_EXECUTION_BINDING");
+        // Both documented race outcomes fence the loser: the winner's detached
+        // execution binding (STALE_EXECUTION_BINDING) or the adopted baseline
+        // (SUCCESSOR_RUN_ALREADY_STARTED) — never a second successor.
+        expect(["STALE_EXECUTION_BINDING", "SUCCESSOR_RUN_ALREADY_STARTED"]).toContain(
+          (rejection as PromiseRejectedResult).reason.code,
+        );
       }
       const baselines = ctx.store.withRead((tx) =>
         tx.prepare("SELECT COUNT(*) AS n FROM planning_run_baselines").get() as { n: number },

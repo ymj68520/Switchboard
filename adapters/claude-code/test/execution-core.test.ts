@@ -93,7 +93,7 @@ describe("ExecutionHostContextV1 (§53–§56, E42/E44/E45)", () => {
   const envelope = buildExecutionHostContextEnvelope({
     sessionId: "sess-1",
     workspaceId: "ws-1",
-    runId: "plan-1",
+    executionRunId: "plan-1",
     finalPlanId: "fplan_x",
     executionBindingGeneration: 3,
     permissionMode: "default",

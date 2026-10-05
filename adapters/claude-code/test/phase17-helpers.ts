@@ -66,6 +66,8 @@ export interface Phase17World {
   lifecycle: "active" | "completed" | "aborted";
   /** For successor worlds: the predecessor run id. */
   predecessorRunId?: string;
+  /** A1 — delivered worlds carry the canonical ExecutionRunID of the world. */
+  executionRunId?: string;
   /** Delivered worlds carry the FinalPlan id (execution authority input). */
   finalPlanId?: string;
   close(): void;
@@ -154,6 +156,7 @@ async function completedWorld(owner: string): Promise<Phase17World> {
   });
   const exec = ctx.store.withRead((tx) => getExecutionBindingInTx(tx, f.runId));
   if (exec === null || exec.state !== "attached") throw new Error("fixture failed to reach a delivered handoff");
+  const executionRunId = prepared.execution_run.id;
   return {
     state: "completed-build",
     root: f.root,
@@ -163,6 +166,7 @@ async function completedWorld(owner: string): Promise<Phase17World> {
     workspaceId: f.workspaceId,
     workspaceRoot: f.workspaceRoot,
     runId: f.runId,
+    executionRunId,
     owner,
     generation: exec.generation,
     bindingKind: "execution",
@@ -188,7 +192,8 @@ export async function buildPhase17World(state: Phase17State, owner = "S1"): Prom
           operationId: "abort:P17-ABORT",
           requestHash: runControlRequestHash({
             operation: "abort",
-            runId: world.runId,
+            targetKind: "planning_run",
+            planningRunId: world.runId,
             workspaceId: world.workspaceId,
             expectedBindingGeneration: world.generation,
           }),
@@ -245,7 +250,8 @@ export async function buildPhase17World(state: Phase17State, owner = "S1"): Prom
       const issueToken = executionToken(done.ctx, {
         sessionId: done.owner,
         workspaceId: done.workspaceId,
-        runId: done.runId,
+        // A1 §37 — the EXECUTION token carries the canonical ExecutionRunID.
+        runId: done.executionRunId!,
         finalPlanId: done.finalPlanId!,
         generation: done.generation,
         tool: "report_execution_issue",
@@ -357,7 +363,8 @@ export function callAsTool(
       token = executionToken(world.ctx, {
         sessionId,
         workspaceId: world.workspaceId,
-        runId: world.runId,
+        // A1 §37 — the EXECUTION token carries the canonical ExecutionRunID.
+        runId: world.executionRunId ?? world.runId,
         finalPlanId: world.finalPlanId ?? "fp_missing",
         generation: world.generation,
         tool,

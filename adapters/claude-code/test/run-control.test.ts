@@ -28,6 +28,7 @@ import { discoverAndRegisterWorkspace } from "../src/workspace/identity.js";
 import { createBindingService } from "../src/session/binding-service.js";
 import { createPlanningRunService } from "../src/application/planning-run-service.js";
 import { createRunControlService } from "../src/application/run-control-service.js";
+import type { RunControlResult } from "../src/application/run-control-service.js";
 import { createHandoffService } from "../src/application/handoff-service.js";
 import { getFinalPlanInTx } from "../src/store/finalization.js";
 import { getHeadCommitRecord } from "../src/store/plan-commits.js";
@@ -128,8 +129,10 @@ function callTakeover(
     status: string;
     idempotent: boolean;
     control_id: string;
+    control?: { targetKind: string; planningRunId: string | null; executionRunId: string | null };
     run: { id: string; lifecycle: string; stage: string; revision: number; goal: string };
     binding: { state: string; generation: number };
+    supervisor?: { execution_run_id: string; generation: number; state: string };
   };
 }
 
@@ -396,7 +399,7 @@ describe("takeover_run (§8–§26, §55)", () => {
             operationId: `takeover:TU-${sessionId}`,
             requestHash: "race-hash",
           },
-        });
+        }) as RunControlResult;
       // Two store handles on the same database, as two host processes would open.
       const storeB = await initializePlanStore({ pluginDataRoot: w.root, busyTimeoutMs: 5000 });
       try {
@@ -412,7 +415,7 @@ describe("takeover_run (§8–§26, §55)", () => {
     }
   });
 
-  it("terminal runs can never be taken over; a caller holding execution authority is refused (§8/§9/E7/E8/E12)", async () => {
+  it("terminal planning runs are never planning-taken-over; the completed run's ACTIVE ExecutionRun takes over as supervision (E2 §12); a caller holding execution authority is refused (§8/§9/E7/E8/E12)", async () => {
     // A DELIVERED world: the predecessor run is completed with an attached
     // ExecutionBinding held by S1 (planning binding detached at delivery).
     const { f, ctx } = await makeApprovedFinalPlanFixture("S1");
@@ -426,29 +429,56 @@ describe("takeover_run (§8–§26, §55)", () => {
         responseHandoffId: prepared.handoff_id,
         responseHandoffHash: prepared.handoff_hash,
       });
+      // E2 §12 — the completed run's takeover call now routes to the
+      // execution-supervision branch: a stale expected supervision generation
+      // fails closed, and the correct one (1) transfers supervision ownership.
       expect(
         codeOf(() =>
           callTakeover(ctx, { sessionId: "S2", workspaceId: f.workspaceId }, {
             run_id: f.runId,
-            expected_binding_generation: f.generation,
+            expected_binding_generation: 2,
           }),
         ),
-      ).toBe("RUN_TERMINAL");
-      // E12 — the session bound to the delivered execution contract (S1,
-      // attached ExecutionBinding, detached planning binding) cannot take over
-      // another active run in the same workspace.
+      ).toBe("STALE_SUPERVISOR_BINDING");
+      const supervised = callTakeover(ctx, { sessionId: "S2", workspaceId: f.workspaceId }, {
+        run_id: f.runId,
+        expected_binding_generation: 1,
+      }, { toolUseId: "TU-TAKE-SUPERVISION" });
+      // A1 §49 — the supervision result reports the canonical ExecutionRunID.
+      expect(supervised.supervisor).toMatchObject({ execution_run_id: prepared.execution_run.id, generation: 2, state: "attached" });
+      expect(supervised.run.lifecycle).toBe("completed");
+      // E12 — A1 §23 demotion: the legacy ExecutionBinding is no longer live
+      // authority, so S1 (whose supervision of run 1's execution moved to S2
+      // above and whose planning binding detached at delivery) holds NO
+      // conflicting canonical authority. Planning takeover of the second run
+      // therefore SUCCEEDS on its own planning_run target (A1-I27); workspace
+      // safety is enforced separately by the execution singleton (A1 §27) —
+      // run 2's future handoff fails closed while run 1's ExecutionRun is
+      // nonterminal in this workspace.
       const runs = createPlanningRunService(ctx.store, fixedClock({ ids: ["run-id-2"] }));
       const second = runs.createPlanningRun({ workspaceId: f.workspaceId, sessionId: "S9", goal: "second run" });
-      expect(
-        codeOf(() =>
-          callTakeover(ctx, { sessionId: "S1", workspaceId: f.workspaceId }, {
-            run_id: second.run.runId,
-            expected_binding_generation: 1,
-          }),
-        ),
-      ).toBe("SESSION_ALREADY_BOUND");
-      expect(controlRowCount(ctx.store)).toBe(0);
-      expect(getBinding(ctx.store, second.run.runId)).toMatchObject({ sessionId: "S9", generation: 1 });
+      const secondTakeover = callTakeover(ctx, { sessionId: "S1", workspaceId: f.workspaceId }, {
+        run_id: second.run.runId,
+        expected_binding_generation: 1,
+      }, { toolUseId: "TU-TAKE-E12" });
+      expect(secondTakeover.status).toBe("taken_over");
+      expect(secondTakeover.binding).toMatchObject({ state: "attached", generation: 2 });
+      // Exactly two planning-target authorizations were recorded (the
+      // supervision takeover above + this planning takeover), both typed
+      // planning_run targeting their exact planning runs (A1 §49/I27).
+      const typedRows = ctx.store.withRead(
+        (tx) => tx.prepare("SELECT target_kind AS kind, planning_run_id AS pid, execution_run_id AS eid FROM run_control_authorizations ORDER BY created_at").all(),
+      ) as Array<{ kind: string; pid: string | null; eid: string | null }>;
+      expect(typedRows).toHaveLength(2);
+      // A1 §49 — the supervision takeover recorded an execution_run target;
+      // this planning takeover recorded a planning_run target.
+      expect(typedRows[0]).toMatchObject({ kind: "execution_run" });
+      expect(typedRows[1]).toMatchObject({ kind: "planning_run", pid: second.run.runId });
+      // Session identities live in the durable rows, never in the response.
+      const secondBinding = ctx.store.withRead(
+        (tx) => tx.prepare("SELECT session_id AS sid, generation AS gen, state FROM session_bindings WHERE run_id = ?").get(second.run.runId),
+      ) as { sid: string; gen: number; state: string };
+      expect(secondBinding).toMatchObject({ sid: "S1", gen: 2, state: "attached" });
     } finally {
       ctx.store.close();
       removeTempPluginDataRoot(root);
@@ -534,7 +564,7 @@ describe("takeover_run (§8–§26, §55)", () => {
       const token = encodeExecutionHostContextToken(w.ctx.secret, buildExecutionHostContextEnvelope({
         sessionId: "S2",
         workspaceId: w.workspaceId,
-        runId: w.runId,
+        executionRunId: w.runId,
         finalPlanId: "fplan_x",
         executionBindingGeneration: 1,
         permissionMode: "plan",
@@ -977,7 +1007,7 @@ describe("run-control races (§57/§58)", () => {
             operationId: `takeover:TU-${sessionId}`,
             requestHash: "race-hash-2",
           },
-        });
+        }) as RunControlResult;
       const abort = (store: PlanStore) =>
         createRunControlService(store, toolClock()).abortRun({
           workspaceId: w.workspaceId,
@@ -988,7 +1018,7 @@ describe("run-control races (§57/§58)", () => {
             operationId: "abort:TU-ABORT-RACE",
             requestHash: "race-hash-3",
           },
-        });
+        }) as RunControlResult;
       try {
         // Order 1 — the takeover lands first: the old owner's abort is fenced.
         expect(take(storeB, "S2").binding).toMatchObject({ state: "attached", generation: 2 });
@@ -1003,7 +1033,7 @@ describe("run-control races (§57/§58)", () => {
       try {
         const storeB2 = await initializePlanStore({ pluginDataRoot: w2.root, busyTimeoutMs: 5000 });
         try {
-          expect(createRunControlService(w2.store, toolClock()).abortRun({
+          expect((createRunControlService(w2.store, toolClock()).abortRun({
             workspaceId: w2.workspaceId,
             callerSessionId: "S1",
             bindingGeneration: 1,
@@ -1012,7 +1042,7 @@ describe("run-control races (§57/§58)", () => {
               operationId: "abort:TU-ABORT-FIRST",
               requestHash: "race-hash-4",
             },
-          }).run.lifecycle).toBe("aborted");
+          }) as RunControlResult).run.lifecycle).toBe("aborted");
           expect(
             maybeCode(() =>
               createRunControlService(storeB2, toolClock()).takeoverRun({

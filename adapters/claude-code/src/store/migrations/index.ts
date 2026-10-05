@@ -18,6 +18,19 @@ import { createFinalizationFinalPlanMigration } from "./010-finalization-final-p
 import { createExecutionHandoffMigration } from "./011-execution-handoff-foundation.js";
 import { createExecutionIssueSuccessorBaselineMigration } from "./012-execution-issue-successor-baseline.js";
 import { createRunControlAuthorizationsMigration } from "./013-run-control-authorizations.js";
+import { createExecutionRunMigration } from "./014-execution-run-foundation.js";
+import { createSupervisorBindingMigration } from "./015-supervisor-binding-foundation.js";
+import { createExecutionStructureMigration } from "./016-execution-structure-foundation.js";
+import { createExecutionProtocolMigration } from "./017-execution-protocol-foundation.js";
+import { createWorkerInvocationMigration } from "./018-worker-invocation-foundation.js";
+import { createAcceptanceFoundationMigration } from "./019-acceptance-foundation.js";
+import { createStageCompletionProvenanceMigration } from "./020-stage-completion-provenance.js";
+import { createVerificationPolicyConflictMigration } from "./021-verification-policy-conflict.js";
+import { createReplanRequiredFoundationMigration } from "./022-replan-required-foundation.js";
+import { createExecutionScopeFoundationMigration } from "./023-execution-scope-foundation.js";
+import { createAttemptReconciliationFoundationMigration } from "./024-attempt-reconciliation-foundation.js";
+import { createExecutionAbortFoundationMigration } from "./025-execution-abort-foundation.js";
+import { createExecutionRunIdentityMigration } from "./026-execution-run-identity-foundation.js";
 
 export interface StoreMigration {
   /** Authoritative `PRAGMA user_version` this migration starts from. */
@@ -79,7 +92,20 @@ export interface ProductionMigrationDeps {
  * `8→9 synthesis-validation-foundation`,
  * `9→10 finalization-final-plan`, `10→11 execution-handoff-foundation`,
  * `11→12 execution-issue-successor-baseline`,
- * `12→13 run-control-authorizations`.
+ * `12→13 run-control-authorizations`,
+ * `13→14 execution-run-foundation`,
+ * `14→15 supervisor-binding-foundation`,
+ * `15→16 execution-structure-foundation`,
+ * `16→17 execution-protocol-foundation`,
+ * `17→18 worker-invocation-foundation`,
+ * `18→19 acceptance-foundation`,
+ * `19→20 stage-completion-provenance`,
+ * `20→21 verification-policy-conflict-foundation`,
+ * `21→22 replan-required-foundation`,
+ * `22→23 execution-scope-foundation`,
+ * `23→24 attempt-reconciliation-foundation`,
+ * `24→25 execution-abort-foundation`,
+ * `25→26 execution-run-identity-foundation` (A1-I).
  */
 export function createProductionMigrations(deps: ProductionMigrationDeps): StoreMigration[] {
   return [
@@ -96,5 +122,18 @@ export function createProductionMigrations(deps: ProductionMigrationDeps): Store
     createExecutionHandoffMigration(),
     createExecutionIssueSuccessorBaselineMigration(),
     createRunControlAuthorizationsMigration(),
+    createExecutionRunMigration(),
+    createSupervisorBindingMigration(),
+    createExecutionStructureMigration(),
+    createExecutionProtocolMigration(),
+    createWorkerInvocationMigration(),
+    createAcceptanceFoundationMigration(),
+    createStageCompletionProvenanceMigration(),
+    createVerificationPolicyConflictMigration(),
+    createReplanRequiredFoundationMigration(),
+    createExecutionScopeFoundationMigration(),
+    createAttemptReconciliationFoundationMigration(),
+    createExecutionAbortFoundationMigration(),
+    createExecutionRunIdentityMigration(),
   ];
 }

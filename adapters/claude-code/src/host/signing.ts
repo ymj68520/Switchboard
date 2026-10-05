@@ -21,6 +21,7 @@ import { canonicalJson } from "../core/canonical-json.js";
 export const ENTRY_INTENT_DOMAIN = "phase-plan:entry-intent:v1";
 export const HOST_CONTEXT_DOMAIN = "phase-plan:host-context:v1";
 export const EXECUTION_CONTEXT_DOMAIN = "phase-plan:execution-context:v1";
+export const WORKER_CONTEXT_DOMAIN = "phase-plan:worker-context:v1";
 
 /** Signature encoding: URL-safe base64, no padding. */
 export function encodeSignature(signature: Buffer): string {

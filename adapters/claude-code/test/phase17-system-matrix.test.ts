@@ -15,6 +15,7 @@ import { RuntimeError } from "../src/runtime/errors.js";
 import { handleUserPromptSubmit } from "../src/hooks/handlers.js";
 import { DRIFT_GUARD_REASON } from "../src/hooks/output.js";
 import { initializePlanStore } from "../src/store/sqlite-store.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { auditStoreConsistency, auditObservationBlobs } from "../src/store/integrity.js";
 import { rawConnection, rawSetSchemaVersion, makeTempPluginDataRoot, removeTempPluginDataRoot, fixedClock, dropSchema13Objects } from "./store-helpers.js";
 import { assertWriteCompat } from "../src/store/transaction.js";
@@ -67,12 +68,14 @@ describe("Phase 17 §30/§31 — schema fencing and old-process post-migration f
     try {
       const w = await runOnStore(root);
       w.store.close();
-      rawSetSchemaVersion(path.join(root, "store", "phase-plan.sqlite3"), 14);
+      // One past the supported schema — the symbolic too-new fence, so this
+      // test tracks the schema ceiling instead of pinning a version literal.
+      rawSetSchemaVersion(path.join(root, "store", "phase-plan.sqlite3"), SUPPORTED_SCHEMA_VERSION + 1);
       // A fresh full worker refuses to open/mutate the too-new store.
       await expect(initializePlanStore({ pluginDataRoot: root })).rejects.toMatchObject({ code: "STORE_SCHEMA_TOO_NEW" });
       const raw = rawConnection(path.join(root, "store", "phase-plan.sqlite3"));
       const version = raw.prepare("PRAGMA user_version").get() as { user_version?: number };
-      expect(version.user_version).toBe(14);
+      expect(version.user_version).toBe(SUPPORTED_SCHEMA_VERSION + 1);
       raw.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -89,7 +92,7 @@ describe("Phase 17 §30/§31 — schema fencing and old-process post-migration f
       const dbPath = path.join(root, "store", "phase-plan.sqlite3");
       const raw = rawConnection(dbPath);
       dropSchema13Objects(raw);
-      raw.exec("DELETE FROM schema_migrations WHERE version = 13");
+      raw.exec("DELETE FROM schema_migrations WHERE version >= 13");
       rawSetSchemaVersion(dbPath, 12);
       expect((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(12);
       raw.close();
@@ -287,16 +290,29 @@ describe("Phase 17 §38 — replay idempotency and conflict matrix (E39)", () =>
 });
 
 describe("Phase 17 §39 — terminal lifecycle matrix (E40)", () => {
-  it("completed and aborted runs reject every ownership entry path", async () => {
+  it("completed and aborted runs reject every ownership entry path (E2: completed-build routes to supervision takeover)", async () => {
     for (const state of ["aborted", "completed-build"] as const) {
       const world = await buildPhase17World(state);
       try {
         const run = world.store.withRead((tx) => tx.prepare("SELECT lifecycle FROM planning_runs WHERE run_id = ?").get(world.runId) as { lifecycle: string });
         expect(run.lifecycle).toBe(state === "aborted" ? "aborted" : "completed");
-        // takeover (other session) → terminal or typed refusal, never a takeover.
-        const t = hostTokenV2(world.secret, "takeover_run", { run_id: world.runId, expected_binding_generation: world.generation }, { sessionId: "S17-OTHER", workspaceId: world.workspaceId }, { toolUseId: `P17-TERM-${state}` });
-        const code = codeOf(() => executePhasePlanTool(world.ctx, "takeover_run", { run_id: world.runId, expected_binding_generation: world.generation, _hostContext: t }));
-        expect(["RUN_TERMINAL", "SESSION_ALREADY_BOUND"]).toContain(code);
+        // takeover (other session) → terminal or typed refusal, never a silent
+        // planning takeover. E2 §12: a completed run with an ACTIVE ExecutionRun
+        // routes to the supervision branch — probed with a deliberately STALE
+        // supervision expectation, so the typed refusal is fencing
+        // (STALE_SUPERVISOR_BINDING), deterministically.
+        const supRow = world.store.withRead((tx) => tx.prepare("SELECT generation AS g FROM supervisor_bindings WHERE execution_run_id = ?").get(world.executionRunId ?? world.runId) as { g: number } | undefined);
+        const staleSupervisionExpectation = (supRow?.g ?? 0) + 1;
+        const t = hostTokenV2(world.secret, "takeover_run", { run_id: world.runId, expected_binding_generation: staleSupervisionExpectation }, { sessionId: "S17-OTHER", workspaceId: world.workspaceId }, { toolUseId: `P17-TERM-${state}` });
+        const code = codeOf(() => executePhasePlanTool(world.ctx, "takeover_run", { run_id: world.runId, expected_binding_generation: staleSupervisionExpectation, _hostContext: t }));
+        if (state === "aborted") {
+          expect(["RUN_TERMINAL", "SESSION_ALREADY_BOUND"]).toContain(code);
+        } else {
+          expect(["STALE_SUPERVISOR_BINDING", "SESSION_ALREADY_BOUND"]).toContain(code);
+        }
+        // The planning lifecycle itself was never touched by the attempt.
+        const runAfter = world.store.withRead((tx) => tx.prepare("SELECT lifecycle FROM planning_runs WHERE run_id = ?").get(world.runId) as { lifecycle: string });
+        expect(runAfter.lifecycle).toBe(run.lifecycle);
       } finally {
         world.close();
       }
@@ -318,8 +334,10 @@ describe("Phase 17 §40 — workspace identity matrix (E41)", () => {
       execSync(`git worktree add "${wt2}" -b wt2`, { cwd: repo });
 
       const store = await initializePlanStore({ pluginDataRoot: path.join(root, "data") });
-      const a = await discoverAndRegisterWorkspace(store, repo, fixedClock({ ids: ["wa"] }));
-      const b = await discoverAndRegisterWorkspace(store, wt2, fixedClock({ ids: ["wb"] }));
+      // The A1 workspace derivation consumes several ids per registration —
+      // the list must outlive it so the two worktrees never mint one id.
+      const a = await discoverAndRegisterWorkspace(store, repo, fixedClock({ ids: ["wa-1", "wa-2", "wa-3", "wa-4"] }));
+      const b = await discoverAndRegisterWorkspace(store, wt2, fixedClock({ ids: ["wb-1", "wb-2", "wb-3", "wb-4"] }));
       expect(a.registration.workspace.workspaceId).not.toBe(b.registration.workspace.workspaceId);
 
       const runs = createPlanningRunService(store, fixedClock({ ids: ["run-id"] }));

@@ -106,7 +106,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       const history = (rawConnection(databasePath, 5000));
       try {
         const rows = history.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
       } finally {
         history.close();
       }
@@ -188,7 +188,7 @@ describe("migration 10 → 11 execution-handoff-foundation (§99–§102, E73–
       // A normal open migrates it forward again.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(13);
+        expect(store.getSchemaVersion()).toBe(26);
       } finally {
         store.close();
       }

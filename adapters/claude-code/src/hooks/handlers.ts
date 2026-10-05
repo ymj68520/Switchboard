@@ -84,8 +84,289 @@ import {
   reattachExecutionBindingInTx,
   detachExecutionBindingInTx,
 } from "../store/execution.js";
+import { getExecutionRunBySourcePlanningRunInTx, getExecutionRunInTx } from "../store/execution-runs.js";
+import {
+  detachSupervisorBindingInTx,
+  findActiveExecutionRunForWorkspaceInTx,
+  listActiveExecutionRunsForWorkspaceInTx,
+  listSupervisorBindingsForSessionInTx,
+  reattachSupervisorBindingInTx,
+} from "../store/supervisor-bindings.js";
+import {
+  renderExecutionRecoveryContext,
+  renderExecutionRecoveryNotice,
+  renderExecutionAmbiguityNotice,
+} from "../context/execution-recovery.js";
+import { classifyExecutionSessionStartInTx } from "../application/execution-session-recovery.js";
+import { ensureExecutionStructureInTx } from "../application/execution-structure-service.js";
+import { createSupervisorBindingService } from "../application/supervisor-binding-service.js";
+import { requireWorkerAuthorityInTx } from "../application/worker-runtime-service.js";
+import {
+  EXECUTION_WORKER_AGENT_TYPE,
+  encodeWorkerHostContextToken,
+  buildWorkerHostContextEnvelope,
+} from "../host/worker-context.js";
+import {
+  AGENT_LAUNCH_TOOLS,
+  SUPERVISOR_FORBIDDEN_DIRECT_TOOLS,
+  narrowWorkerTool,
+} from "../runtime/worker-capabilities.js";
+import { findAttachedSupervisorBindingForSessionInTx } from "../store/supervisor-bindings.js";
 import { getFinalPlanInTx } from "../store/finalization.js";
 import { countOpenExecutionIssuesInTx } from "../store/execution-issues.js";
+
+/**
+ * E5 §10/§12/§17 — sign the worker authority context for the three worker
+ * tools. The subagent identity comes from the host (agent_id/agent_type probe
+ * — present ONLY on subagent calls, Claude Code 2.1.283); a call without it,
+ * or from any non-execution-worker agent type, is denied fail-closed. The
+ * workspace is discovered from the hook's observed cwd. No planning run
+ * binding exists for a worker session — Core verifies the claim instead.
+ */
+async function handleWorkerToolSigning(
+  deps: HookHandlerDeps,
+  input: PreToolUseInput,
+  eventName: string,
+): Promise<HookOutput> {
+  if (
+    input.agentId === undefined
+    || input.agentType !== EXECUTION_WORKER_AGENT_TYPE
+    || input.agentId === ""
+  ) {
+    return deny(
+      eventName,
+      "WORKER_AUTHORITY_REQUIRED",
+      "phase_plan worker tools require the phase-plan execution-worker subagent identity; a main session can never claim worker authority (E5 §33/§44)",
+    );
+  }
+  if (input.cwd === undefined || input.cwd.trim() === "") {
+    return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; the worker workspace cannot be discovered");
+  }
+  try {
+    const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
+    const workerToken = encodeWorkerHostContextToken(
+      deps.secret,
+      buildWorkerHostContextEnvelope({
+        sessionId: input.sessionId,
+        ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+        workspaceId: registration.workspace.workspaceId,
+        agent: { agentId: input.agentId, agentType: input.agentType },
+        permissionMode: input.permissionMode ?? "unknown",
+        toolUseId: input.toolUseId,
+        toolName: input.toolName,
+        businessInputHash: businessInputHashOf(input.toolInput),
+      }),
+    );
+    return updatedInputNoDecision(eventName, { ...input.toolInput, _hostContext: workerToken });
+  } catch (err) {
+    return deny(eventName, "WORKSPACE_UNAVAILABLE", err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * E5 §42 / E6 §6/§19 — sign the EXECUTION-domain supervisor context for the
+ * supervisor execution operations (issue_execution_directive,
+ * start_worker_attempt, get_execution_acceptance_context,
+ * submit_supervisor_assessment, get_execution_progression_context,
+ * continue_execution_stage, activate_execution_stage): the current session
+ * must be the ATTACHED supervisor of an ACTIVE execution run in the bound
+ * workspace. Subagents are denied (never a worker/validator capability); a
+ * worker session can never reach the assessment surface (E6 §52).
+ */
+const SUPERVISOR_EXECUTION_OP_TOOLS: readonly string[] = [
+  "issue_execution_directive",
+  "start_worker_attempt",
+  "get_execution_acceptance_context",
+  "submit_supervisor_assessment",
+  "get_execution_progression_context",
+  "continue_execution_stage",
+  "activate_execution_stage",
+  "get_verification_policy_context",
+  "declare_verification_conflict",
+  "resolve_verification_conflict",
+  "request_execution_replan",
+  "get_execution_final_closure_context",
+  "begin_execution_final_closure",
+  "get_attempt_recovery_context",
+  "retry_unclaimed_worker_launch",
+  "issue_attempt_reconciliation",
+  "resolve_indeterminate_attempt",
+];
+
+async function handleSupervisorExecutionOpSigning(
+  deps: HookHandlerDeps,
+  input: PreToolUseInput,
+  eventName: string,
+): Promise<HookOutput> {
+  if (input.agentId !== undefined || input.agentType !== undefined) {
+    return deny(
+      eventName,
+      "WORKER_AUTHORITY_REQUIRED",
+      "supervisor execution operations are supervisor capabilities; subagents can never exercise them",
+    );
+  }
+  if (input.cwd === undefined || input.cwd.trim() === "") {
+    return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; the workspace cannot be verified");
+  }
+  const signed = deps.store.withRead((tx) => {
+    const binding = findAttachedSupervisorBindingForSessionInTx(tx, input.sessionId);
+    if (binding === null || binding.state !== "attached") return null;
+    const run = getExecutionRunInTx(tx, binding.executionRunId);
+    if (run === null || run.lifecycle !== "active") return null;
+    const workspaceRow = tx
+      .prepare("SELECT workspace_id AS workspaceId, canonical_root AS canonicalRoot FROM workspaces WHERE workspace_id = ?")
+      .get(binding.workspaceId) as Record<string, unknown> | undefined;
+    if (workspaceRow === undefined) return null;
+    return { binding, run, workspaceRow };
+  });
+  if (signed === null) {
+    return deny(
+      eventName,
+      "SUPERVISOR_BINDING_REQUIRED",
+      "supervisor execution operations require the current attached supervision of an active execution run",
+    );
+  }
+  if (!cwdInsideWorkspace(input.cwd, signed.workspaceRow as unknown as WorkspaceRecord)) {
+    return deny(eventName, "WORKSPACE_MISMATCH", "the session has left the supervised workspace; execution operations are denied");
+  }
+  const execToken = encodeExecutionHostContextToken(
+    deps.secret,
+    buildExecutionHostContextEnvelope({
+      sessionId: input.sessionId,
+      ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+      workspaceId: signed.binding.workspaceId,
+      executionRunId: signed.run.executionRunId,
+      finalPlanId: signed.run.finalPlan.id,
+      executionBindingGeneration: signed.binding.generation,
+      permissionMode: input.permissionMode ?? "unknown",
+      toolUseId: input.toolUseId,
+      toolName: input.toolName,
+      businessInputHash: businessInputHashOf(input.toolInput),
+    }),
+  );
+  return updatedInputNoDecision(eventName, { ...input.toolInput, _hostContext: execToken });
+}
+
+/**
+ * E5 §19/§20 — the supervisor direct-tool guard context: MAIN session, whose
+ * session id owns the ATTACHED SupervisorBinding of an ACTIVE execution run in
+ * the workspace observed by the hook. Workers (and every other subagent) are
+ * never matched — the agent-field absence IS the main-session attestation.
+ */
+function findSupervisorGuardRunInTx(
+  deps: HookHandlerDeps,
+  input: PreToolUseInput,
+): { runId: string } | null {
+  if (input.cwd === undefined || input.cwd.trim() === "") return null;
+  return deps.store.withRead((tx) => {
+    const binding = findAttachedSupervisorBindingForSessionInTx(tx, input.sessionId);
+    if (binding === null || binding.state !== "attached") return null;
+    const run = getExecutionRunInTx(tx, binding.executionRunId);
+    if (run === null || run.lifecycle !== "active") return null;
+    const workspaceRow = tx
+      .prepare("SELECT canonical_root AS canonicalRoot FROM workspaces WHERE workspace_id = ?")
+      .get(binding.workspaceId) as { canonicalRoot: string } | undefined;
+    if (workspaceRow === undefined) return null;
+    if (!cwdInsideWorkspace(input.cwd, workspaceRow as unknown as WorkspaceRecord)) return null;
+    // A1 §16 — the guard's issue counting is scoped by the canonical
+    // ExecutionRunID (the caller counts open ExecutionIssues with it).
+    return { runId: run.executionRunId };
+  });
+}
+
+/**
+ * E12 §30/§31/§33 — the non-owner main-session guard: while an ACTIVE
+ * supervised ExecutionRun exists for the workspace the hook observes, a main
+ * session WITHOUT current Supervisor authority may not perform ordinary
+ * execution mutation and may not launch subagents around the ownership fence
+ * (fail closed — agent types cannot be proven trustworthy, E12 §33). The
+ * guard reads the workspace catalog only (no registration on the guard path)
+ * and matches by exact workspace containment, the same semantic the
+ * supervisor guard uses. Claimed ExecutionWorkers are structurally unaffected
+ * (E12 §32): the guard runs only for main sessions, whose attestation is the
+ * ABSENCE of the host's agent fields. Phase Plan reads, recovery context, and
+ * the takeover entry stay available (E12 §40).
+ *
+ * Returns the denial reason, or null when nothing is denied.
+ */
+function nonOwnerExecutionGuardDenial(deps: HookHandlerDeps, input: PreToolUseInput, logical: string): string | null {
+  if (input.cwd === undefined || input.cwd.trim() === "") return null;
+  if (!EXECUTION_MUTATION_TOOLS.has(logical)) return null;
+  return deps.store.withRead((tx) => {
+    const workspaces = tx
+      .prepare("SELECT workspace_id AS workspaceId, canonical_root AS canonicalRoot FROM workspaces")
+      .all() as unknown as WorkspaceRecord[];
+    const hit = workspaces.find((row) => cwdInsideWorkspace(input.cwd, row));
+    if (hit === undefined) return null;
+    const activeRuns = listActiveExecutionRunsForWorkspaceInTx(tx, hit.workspaceId);
+    if (activeRuns.length === 0) return null;
+    if (logical === "Agent") {
+      return (
+        "while an active supervised ExecutionRun owns this workspace, a session without Supervisor authority may not launch "
+        + "subagents (arbitrary agents are denied fail-closed, E12 §33; even the execution-worker launch is a Supervisor "
+        + "capability). Reads, Phase Plan recovery context, and the explicit user-authorized takeover "
+        + "(phase_plan.takeover_run) stay available."
+      );
+    }
+    return (
+      "while an active supervised ExecutionRun owns this workspace, a session without current Supervisor authority may not "
+      + "perform ordinary execution mutation (E12 §30) — the run's work is performed by its ExecutionWorkers. Reads, Phase "
+      + "Plan recovery context, and the explicit user-authorized takeover (phase_plan.takeover_run) stay available."
+    );
+  });
+}
+
+/**
+ * E5 §16/§23/§26/§38 — the execution-worker's host-tool guard: a claimed
+ * invocation is REQUIRED before any repository tool (fail closed while
+ * unverifiable), and the bound Directive capability envelope narrows the tool
+ * surface. Allowed tools fall through to Claude Code's native permission
+ * ceiling — Phase Plan never elevates host authority (E5 §21) and never
+ * consults expectedExecutionScope (E5 §26).
+ */
+async function handleWorkerCapabilityGuard(
+  deps: HookHandlerDeps,
+  input: PreToolUseInput,
+  eventName: string,
+  logical: string,
+): Promise<HookOutput> {
+  if (input.cwd === undefined || input.cwd.trim() === "") {
+    return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; worker authority cannot be verified");
+  }
+  try {
+    const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
+    const directive = deps.store.withRead((tx) => {
+      try {
+        const facts = requireWorkerAuthorityInTx(tx, {
+          workerSessionId: input.sessionId,
+          workspaceId: registration.workspace.workspaceId,
+        });
+        return facts.directive;
+      } catch {
+        return null;
+      }
+    });
+    if (directive === null) {
+      return deny(
+        eventName,
+        "WORKER_AUTHORITY_REQUIRED",
+        "no claimed worker invocation exists for this session; claim your attempt (phase_plan.worker_claim) before using repository tools",
+      );
+    }
+    const narrowed = narrowWorkerTool(logical, directive.capabilityEnvelope);
+    if (!narrowed.allowed) {
+      return deny(eventName, narrowed.capability === null ? "CAPABILITY_DENIED" : "CAPABILITY_DENIED", narrowed.reason);
+    }
+    return emptyOutput();
+  } catch {
+    return deny(
+      eventName,
+      "WORKER_AUTHORITY_REQUIRED",
+      "worker authority could not be verified; fail closed (E5 §38)",
+    );
+  }
+}
+
 import { parsePlanningRunRow } from "../core/planning-run.js";
 import { assertWritableBindingInTx } from "../store/session-bindings.js";
 import { createStoreContextSource } from "../application/context-read-model.js";
@@ -153,7 +434,15 @@ function isPhasePlanTool(logical: string): logical is HostContextLogicalTool {
     logical === "handoff" ||
     logical === "report_execution_issue" ||
     logical === "takeover_run" ||
-    logical === "abort_run"
+    logical === "abort_run" ||
+    // E13 §4/§5 — the human-authorized ExecutionRun abort joins the control
+    // plane (main-session capability, mandatory host dialog, no ownership
+    // requirement).
+    logical === "abort_execution_run" ||
+    // A1-II §9/§10 — the human-authorized same-FinalPlan reexecution joins
+    // the control plane (main-session capability, mandatory host dialog, no
+    // ownership requirement; the resulting run does not exist yet).
+    logical === "reexecute_final_plan"
   );
 }
 
@@ -175,6 +464,14 @@ const V2_ATTESTED_TOOLS = new Set<HostContextLogicalTool>([
   // the validator) can never take over or abort a PlanningRun.
   "takeover_run",
   "abort_run",
+  // E13 §7 — ExecutionWorkers can never request an abort; the attested agent
+  // fields let the MCP handler deny subagent contexts at the control surface.
+  "abort_execution_run",
+  // A1-II §9/§49 — reexecution is HUMAN control authority; supervisors may
+  // request it only through the mandatory dialog and subagents (workers,
+  // validator, conflict resolvers, reconciliation inspectors) can never even
+  // initiate it — the attested agent fields let the MCP handler deny them.
+  "reexecute_final_plan",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -214,9 +511,49 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
     }
   }
 
+  // E12C amendment §4/§7/§8 — the authoritative /clear boundary. The host's
+  // source="clear" proves the conversation context that owned this session's
+  // bindings was destroyed, so the boundary detach lives HERE (not in
+  // SessionEnd): everything the pre-clear context owned detaches — planning
+  // Binding and ExecutionBinding with their generation bumps, SupervisorBinding
+  // with the generation UNCHANGED (amendment §7 — clear is a detach, not a
+  // takeover). This mirrors exactly what SessionEnd(reason=clear) did before
+  // the amendment; that event is a structural no-op now, which makes the
+  // boundary order-independent and a reordered/late pre-clear SessionEnd can
+  // never detach a context that explicitly reacquired ownership (§8/D).
+  // Execution state (acceptedHead/Stage/Window/candidateRevision/Attempt/
+  // Report) is untouched — only binding rows change (amendment §4).
+  if (input.source === "clear") {
+    try {
+      const controlBindings = createBindingService(deps.store, deps.clock);
+      for (const entry of listSessionRuns(deps.store, input.sessionId)) {
+        if (entry.binding.state !== "attached") continue;
+        controlBindings.detach({ runId: entry.binding.runId, sessionId: input.sessionId });
+      }
+      deps.store.withWrite((tx) => {
+        for (const binding of listExecutionBindingsForSessionInTx(tx, input.sessionId)) {
+          if (binding.state === "attached") {
+            detachExecutionBindingInTx(tx, { runId: binding.runId, sessionId: input.sessionId }, deps.clock.nowIso());
+          }
+        }
+        for (const binding of listSupervisorBindingsForSessionInTx(tx, input.sessionId)) {
+          if (binding.state === "attached") {
+            detachSupervisorBindingInTx(tx, { executionRunId: binding.executionRunId, sessionId: input.sessionId }, deps.clock.nowIso());
+          }
+        }
+        return null;
+      });
+    } catch {
+      // advisory boundary repair; the classification below renders the actual
+      // Store state and the supervisor authority revalidation stays fail-closed
+    }
+  }
+
   // Phase 14 §79 — Build recovery: an exact-session detached ExecutionBinding
   // reattaches on resume (generation +1); clear/fork/startup never inherit
   // because a new session id owns no binding rows (§80/§81).
+  // E2 §7/§18 — the SupervisorBinding reattaches the same way, but as
+  // REATTACHMENT: same session, same workspace, generation UNCHANGED.
   if (input.source === "resume" && !ownsPlanningLife) {
     const execBindings = deps.store.withRead((tx) => listExecutionBindingsForSessionInTx(tx, input.sessionId));
     for (const binding of execBindings) {
@@ -233,6 +570,45 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
           // advisory; the read-authority revalidation provides correctness
         }
       }
+    }
+    const supervisorBindings = deps.store.withRead((tx) => listSupervisorBindingsForSessionInTx(tx, input.sessionId));
+    for (const binding of supervisorBindings) {
+      if (binding.state === "detached" && binding.workspaceId === workspaceId) {
+        try {
+          deps.store.withWrite((tx) =>
+            reattachSupervisorBindingInTx(
+              tx,
+              { executionRunId: binding.executionRunId, sessionId: input.sessionId, workspaceId },
+              deps.clock.nowIso(),
+            ),
+          );
+        } catch {
+          // advisory; the supervision authority check revalidates on every use
+        }
+      }
+    }
+  }
+  // E3 §23 — structure-absent active runs bootstrap deterministically on
+  // recovery (idempotent system materialization from the exact FinalPlan;
+  // independent of Supervisor ownership, which never changes here).
+  if (!ownsPlanningLife) {
+    try {
+      const bootstrapRun = deps.store.withRead((tx) => {
+        for (const binding of listExecutionBindingsForSessionInTx(tx, input.sessionId)) {
+          const row = tx
+            .prepare("SELECT execution_run_id AS executionRunId FROM execution_runs WHERE run_id = ? AND lifecycle = 'active'")
+            .get(binding.runId) as { executionRunId: string } | undefined;
+          if (row !== undefined) return row;
+        }
+        return findActiveExecutionRunForWorkspaceInTx(tx, workspaceId);
+      });
+      if (bootstrapRun !== null) {
+        deps.store.withWrite((tx) =>
+          ensureExecutionStructureInTx(tx, bootstrapRun.executionRunId, deps.clock, deps.clock.nowIso()),
+        );
+      }
+    } catch {
+      // fail-visible: the recovery context below renders the actual Store state
     }
   }
   // §77 — a delivered handoff with an attached binding injects the immutable
@@ -265,7 +641,140 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
       handoffId: executionRecovery.handoffId,
       handoffHash: executionRecovery.handoffHash,
     });
+    // E2 §18 — the owner session also receives the deterministic Execution
+    // Recovery Context (ownership: current-session), rendered from Store truth.
+    // E3 §23 — structure-absent active runs bootstrap deterministically here
+    // (idempotent system materialization; ownership is unaffected).
+    const supervisorFacts = deps.store.withRead((tx) => {
+      // A1 §16 — the delivered-handoff binding names the source PlanningRun;
+      // the recovery projection is scoped by the canonical ExecutionRunID.
+      const executionRun = getExecutionRunBySourcePlanningRunInTx(tx, executionRecovery.runId);
+      if (executionRun === null) return null;
+      // E12 §21/§53 — the owner's capsule is the FULL canonical recovery
+      // projection (acceptedHead, progression, verification policy, attempt
+      // recovery), rebuilt from the Store; conversation context is never an
+      // input.
+      const facts = createSupervisorBindingService(deps.store, deps.clock).loadExecutionRecoveryFactsInTx(tx, {
+        executionRunId: executionRun.executionRunId,
+        sessionId: input.sessionId,
+      });
+      const cls = classifyExecutionSessionStartInTx(tx, {
+        sessionId: input.sessionId,
+        workspaceId,
+        source: input.source,
+      });
+      return {
+        ...facts,
+        sessionStart: { outcome: cls.outcome, relation: cls.relation, ambiguousRunIds: cls.ambiguousRunIds },
+      };
+    });
+    if (supervisorFacts !== null) {
+      return contextOutput(
+        "SessionStart",
+        `Phase Plan execution session restored:\n\n${contract}\n\n${renderExecutionRecoveryContext(supervisorFacts)}`,
+      );
+    }
     return contextOutput("SessionStart", `Phase Plan execution session restored:\n\n${contract}`);
+  }
+
+  // E2 §18 / E12 §50 / E12C amendment §13 — the deterministic SessionStart
+  // classification. The outcome derives from Store identity PLUS the host's
+  // authoritative boundary sources: clear/fork outrank the same-session
+  // ownership shortcut (a reused session_id never re-derives authority across
+  // those boundaries); the source is otherwise an annotation, never authority
+  // (E12 §4). Mutation rules: the clear-boundary detach block and the
+  // resume-reattach block above are the ONLY automatic binding mutations;
+  // every different-session outcome below is read-only until the explicit
+  // user-authorized takeover; compaction (and every other attached-owner
+  // case) is zero-mutation.
+  if (!ownsPlanningLife) {
+    const classified = deps.store.withRead((tx) => {
+      const classification = classifyExecutionSessionStartInTx(tx, {
+        sessionId: input.sessionId,
+        workspaceId,
+        source: input.source,
+      });
+      if (classification.executionRunId === null) return { classification, facts: null };
+      const executionRun = getExecutionRunInTx(tx, classification.executionRunId);
+      if (executionRun === null) return { classification, facts: null };
+      // E12 §53 — every recovery capsule carries the FULL canonical Store
+      // projection (ownership, structure, protocol, accepted progress,
+      // verification policy, attempt recovery) plus the session annotation.
+      const facts = createSupervisorBindingService(deps.store, deps.clock).loadExecutionRecoveryFactsInTx(tx, {
+        executionRunId: classification.executionRunId,
+        sessionId: input.sessionId,
+      });
+      return { classification, facts };
+    });
+    const outcome = classified.classification.outcome;
+    if (outcome === "same_owner_attached" && classified.facts !== null) {
+      return contextOutput(
+        "SessionStart",
+        `Phase Plan execution session restored:\n\n${renderExecutionRecoveryContext({
+          ...classified.facts,
+          sessionStart: { outcome, relation: classified.classification.relation },
+        })}`,
+      );
+    }
+    if (outcome === "same_owner_detached_resume" && classified.facts !== null) {
+      // Zero mutation for non-resume relations (E12 §51 — a clear/compact/
+      // startup/fork SessionStart never reattaches by itself): the capsule
+      // names the detached same-session class and the deterministic next
+      // action instead.
+      return contextOutput(
+        "SessionStart",
+        renderExecutionRecoveryContext({
+          ...classified.facts,
+          sessionStart: { outcome, relation: classified.classification.relation },
+        }),
+      );
+    }
+    if (outcome === "cleared_detached" && classified.facts !== null) {
+      // E12C amendment §4 — the /clear boundary converged this session's
+      // ownership to detached (the detach happened in the boundary block
+      // above; generation unchanged). The full Store capsule renders with the
+      // cleared ownership class and the explicit-reacquisition next action.
+      return contextOutput(
+        "SessionStart",
+        renderExecutionRecoveryContext({
+          ...classified.facts,
+          sessionStart: { outcome, relation: classified.classification.relation },
+        }),
+      );
+    }
+    if (outcome === "fork_non_inheriting" && classified.facts !== null) {
+      // E12C amendment §9/§11 — a fork context never inherits authority and
+      // the original owner is never mutated, even under a contract-violating
+      // reused session_id (the Host guarantees a fork mints a new session id —
+      // pinned by the E12C tests; this branch is the fail-closed fallback).
+      return contextOutput(
+        "SessionStart",
+        renderExecutionRecoveryContext({
+          ...classified.facts,
+          sessionStart: { outcome, relation: classified.classification.relation },
+        }),
+      );
+    }
+    if (outcome === "different_session_owner_exists" && classified.facts !== null) {
+      return contextOutput(
+        "SessionStart",
+        renderExecutionRecoveryNotice(classified.facts, classified.classification.executionRunId!, {
+          outcome,
+          relation: classified.classification.relation,
+        }),
+      );
+    }
+    if (outcome === "active_run_unbound" && classified.facts !== null) {
+      return contextOutput(
+        "SessionStart",
+        renderExecutionRecoveryNotice(classified.facts, classified.classification.executionRunId!),
+      );
+    }
+    if (outcome === "ambiguous_active_runs") {
+      return contextOutput("SessionStart", renderExecutionAmbiguityNotice(classified.classification.ambiguousRunIds));
+    }
+    // terminal_run / no_execution_run fall through: the replan-boundary and
+    // planning-capsule paths below own those renderings (E12 §72 keeps them).
   }
 
   if (input.source === "resume") {
@@ -280,6 +789,37 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
         sessionId: input.sessionId,
       });
     }
+  }
+
+  // E9 §28/§30 — the replan boundary is a valid recoverable state: render it
+  // passively (run terminal, issue exact, next action) and NEVER auto-create
+  // the successor PlanningRun merely because SessionStart fired.
+  const replanBoundary = deps.store.withRead((tx) => {
+    for (const binding of listSupervisorBindingsForSessionInTx(tx, input.sessionId)) {
+      const run = getExecutionRunInTx(tx, binding.executionRunId);
+      if (run === null || run.lifecycle !== "replan_required") continue;
+      const issue = tx
+        .prepare(
+          "SELECT i.issue_id AS id FROM execution_issues i "
+          + "LEFT JOIN execution_issue_adoptions a ON a.execution_run_id = i.execution_run_id AND a.issue_id = i.issue_id "
+          + "WHERE i.execution_run_id = ? AND i.kind = 'replan_required' AND a.issue_id IS NULL LIMIT 1",
+        )
+        .get(binding.executionRunId) as { id: string } | undefined;
+      if (issue !== undefined) return { executionRunId: binding.executionRunId, issueId: issue.id };
+    }
+    return null;
+  });
+  if (replanBoundary !== null) {
+    return contextOutput(
+      "SessionStart",
+      [
+        "Phase Plan execution requires replanning.",
+        `ExecutionRun ${replanBoundary.executionRunId} is TERMINAL (lifecycle=replan_required); it can never resume.`,
+        `ExecutionIssue: ${replanBoundary.issueId} (the exact transition snapshot).`,
+        "Next action: invoke /phase-plan — a NEW PlanningRun is created from the old immutable FinalPlan baseline.",
+        "Ordinary Build/repository mutation stays fail-closed until formal planning entry.",
+      ].join("\n"),
+    );
   }
 
   const attached = findAttachedActiveRun(deps.store, input.sessionId);
@@ -322,12 +862,17 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
     const prepared = deps.store.withRead((tx) => {
       const handoff = getExecutionHandoffInTx(tx, pendingRun.runId);
       const state = handoff === null ? null : getExecutionHandoffStateInTx(tx, pendingRun.runId);
-      return handoff !== null && state?.status === "prepared"
-        ? { id: handoff.handoffId, hash: handoff.handoffHash }
-        : null;
+      if (handoff === null || state?.status !== "prepared") return null;
+      // E1 §13 — recovery reuses the SAME durable ExecutionRun; surfacing its
+      // identity makes the reuse observable in the recovery context.
+      const executionRun = getExecutionRunInTx(tx, pendingRun.runId);
+      return { id: handoff.handoffId, hash: handoff.handoffHash, executionRunId: executionRun?.executionRunId ?? null };
     });
     if (prepared !== null) {
       context.push(`Prepared handoff: ${prepared.id} (${prepared.hash}).`);
+      if (prepared.executionRunId !== null) {
+        context.push(`ExecutionRun prepared: ${prepared.executionRunId}. Retrying phase_plan.handoff reuses it.`);
+      }
     }
     if (input.permissionMode !== "plan") {
       context.push("Handoff can be retried directly in the current mode; Plan Mode restoration is not required.");
@@ -351,6 +896,17 @@ export async function handleSessionStart(deps: HookHandlerDeps, input: SessionSt
 // ---------------------------------------------------------------------------
 
 export function handleSessionEnd(deps: HookHandlerDeps, _input: SessionEndInput): HookOutput {
+  // E12C amendment §8 — the /clear boundary detach is owned exclusively by
+  // SessionStart(source=clear). The installed Host runtime awaits the
+  // SessionEnd(reason=clear) hooks BEFORE the clear-created session's
+  // SessionStart fires (2.1.259 probe), but the adapter never leans on that
+  // ordering: a reason=clear SessionEnd is a structural no-op, so a reordered
+  // or late pre-clear SessionEnd can never detach a context that explicitly
+  // reacquired ownership after the boundary (amendment §8/D — session_id
+  // reuse alone must never be the fence). Genuine exits detach below.
+  if (_input.reason === "clear") {
+    return emptyOutput();
+  }
   const bindings = createBindingService(deps.store, deps.clock);
   for (const entry of listSessionRuns(deps.store, _input.sessionId)) {
     if (entry.binding.state !== "attached") continue;
@@ -373,6 +929,21 @@ export function handleSessionEnd(deps: HookHandlerDeps, _input: SessionEndInput)
       );
     } catch {
       // swallow: SessionEnd is advisory; generation fencing provides correctness
+    }
+  }
+  // E2 §8/§12 — the SupervisorBinding detaches best-effort as well, WITHOUT a
+  // generation change (reattachment is not takeover); the ExecutionRun stays
+  // active. Correctness never depends on SessionEnd firing — explicit
+  // takeover plus generation fencing supersedes a crashed session.
+  const supervisorBindings = deps.store.withRead((tx) => listSupervisorBindingsForSessionInTx(tx, _input.sessionId));
+  for (const binding of supervisorBindings) {
+    if (binding.state !== "attached") continue;
+    try {
+      deps.store.withWrite((tx) =>
+        detachSupervisorBindingInTx(tx, { executionRunId: binding.executionRunId, sessionId: _input.sessionId }, deps.clock.nowIso()),
+      );
+    } catch {
+      // swallow: SessionEnd is advisory; takeover fencing provides correctness
     }
   }
   return emptyOutput();
@@ -604,6 +1175,7 @@ function handleHandoffDeliveryPostToolUse(deps: HookHandlerDeps, input: PostTool
       "PostToolUse",
       [
         "Phase Plan execution handoff delivered.",
+        "ExecutionRun is active.",
         "PlanningRun is completed.",
         "Build under the immutable ExecutionHandoff contract.",
         "Plan Memory is read-only.",
@@ -723,6 +1295,20 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
     return emptyOutput();
   }
 
+  // E12 (§3 audit finding) — the E5 execution surfaces route through the SAME
+  // phase-plan PreToolUse handler but are NOT planning tools: without this
+  // dispatch the execution-domain signing (and the worker-tool signing) was
+  // unreachable and live supervisor/worker MCP calls failed closed with no
+  // injected context. Planning membership (isPhasePlanTool) is unchanged.
+  if (
+    (SUPERVISOR_EXECUTION_OP_TOOLS as readonly string[]).includes(logical)
+    || logical === "worker_claim"
+    || logical === "worker_get_assignment"
+    || logical === "worker_submit_report"
+  ) {
+    return handlePhasePlanPreToolUse(deps, input, eventName, logical as HostContextLogicalTool);
+  }
+
   if (isPhasePlanTool(logical)) {
     return handlePhasePlanPreToolUse(deps, input, eventName, logical);
   }
@@ -757,11 +1343,16 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
   // implemented as-is, repository-mutating execution PAUSES fail-closed until
   // an explicit /phase-plan successor run. Read-only inspection stays
   // available (§20); with no open issue Phase 14 behavior is preserved.
+  let openExecutionIssues = 0;
   if (EXECUTION_MUTATION_TOOLS.has(logical)) {
     const guardBinding = deps.store.withRead((tx) => {
       const binding = findAttachedExecutionBindingForSessionInTx(tx, input.sessionId);
       if (binding === null) return null;
-      return { runId: binding.runId, openIssues: countOpenExecutionIssuesInTx(tx, binding.runId) };
+      // A1 §16 — issues are scoped by the canonical ExecutionRunID; the
+      // legacy ExecutionBinding names the source PlanningRunID.
+      const executionRun = getExecutionRunBySourcePlanningRunInTx(tx, binding.runId);
+      if (executionRun === null) return null;
+      return { runId: binding.runId, openIssues: countOpenExecutionIssuesInTx(tx, executionRun.executionRunId) };
     });
     if (guardBinding !== null && guardBinding.openIssues > 0) {
       return deny(
@@ -771,6 +1362,86 @@ export async function handlePreToolUse(deps: HookHandlerDeps, input: PreToolUseI
           + `Invoke /phase-plan to start the successor PlanningRun from the immutable baseline (${guardBinding.openIssues} open issue(s)).`,
       );
     }
+    // E9 §29 — the REPLAN GAP is fail-closed too: while a replan_required
+    // ExecutionRun this session supervised still has its pending replan
+    // ExecutionIssue (no successor PlanningRun has adopted it), ordinary
+    // repository mutation is denied. Phase Plan read/context operations,
+    // /phase-plan entry, and user interaction stay available; the guard lifts
+    // deterministically the moment the successor adopts the issue.
+    const replanGap = deps.store.withRead((tx) => {
+      for (const binding of listSupervisorBindingsForSessionInTx(tx, input.sessionId)) {
+        const run = getExecutionRunInTx(tx, binding.executionRunId);
+        if (run === null || run.lifecycle !== "replan_required") continue;
+        const open = tx
+          .prepare(
+            "SELECT i.issue_id AS id FROM execution_issues i "
+            + "LEFT JOIN execution_issue_adoptions a ON a.run_id = i.run_id AND a.issue_id = i.issue_id "
+            + "WHERE i.run_id = ? AND i.kind = 'replan_required' AND a.issue_id IS NULL LIMIT 1",
+          )
+          .get(binding.executionRunId) as { id: string } | undefined;
+        if (open !== undefined) return { executionRunId: binding.executionRunId, issueId: open.id };
+      }
+      return null;
+    });
+    if (replanGap !== null) {
+      return deny(
+        eventName,
+        "REPLAN_REQUIRED",
+        `ExecutionRun '${replanGap.executionRunId}' is replan_required (ExecutionIssue ${replanGap.issueId}); ordinary repository mutation is paused `
+          + `until the user re-enters formal planning via /phase-plan (E9 §29). Phase Plan reads and context remain available.`,
+      );
+    }
+  }
+
+  // E5 §19/§20/§21 — supervised execution boundary for the MAIN (Supervisor)
+  // session: no direct repository/runtime work; only the approved
+  // execution-worker launch path through the generic Agent tool. The older
+  // planning-state guards above keep precedence (handoff-pending, drift, and
+  // the paused-Build state keep their own semantics; the boundary governs
+  // NORMAL supervised execution only).
+  const isMainSession = input.agentId === undefined && input.agentType === undefined;
+  if (isMainSession) {
+    const supervisedRun = findSupervisorGuardRunInTx(deps, input);
+    if (supervisedRun !== null) {
+      openExecutionIssues = deps.store.withRead((tx) => countOpenExecutionIssuesInTx(tx, supervisedRun.runId));
+    }
+    if (supervisedRun !== null && openExecutionIssues === 0) {
+      if ((AGENT_LAUNCH_TOOLS as readonly string[]).includes(logical)) {
+        const subagentType =
+          typeof input.toolInput.subagent_type === "string" ? input.toolInput.subagent_type : undefined;
+        if (subagentType !== undefined && subagentType.endsWith(":execution-worker")) {
+          return emptyOutput();
+        }
+        return deny(
+          eventName,
+          "SUPERVISOR_DIRECT_TOOL_FORBIDDEN",
+          "during supervised execution the Supervisor may launch ONLY the phase-plan execution-worker; arbitrary repository-working subagents are denied (E5 §21)",
+        );
+      }
+      if ((SUPERVISOR_FORBIDDEN_DIRECT_TOOLS as readonly string[]).includes(logical)) {
+        return deny(
+          eventName,
+          "SUPERVISOR_DIRECT_TOOL_FORBIDDEN",
+          "you are the execution Supervisor of an active run: read Phase Plan state, direct workers, and judge results — repository/runtime work is performed by ExecutionWorkers (E5 §19)",
+        );
+      }
+    }
+    // E12 §30/§31/§33 — the non-owner side of the same fence: a main session
+    // with NO current Supervisor authority in a workspace that an active
+    // supervised ExecutionRun owns is denied ordinary execution mutation and
+    // subagent launches (fail closed). Claimed workers are a separate surface
+    // (below) and never reach this main-session block (E12 §32).
+    const nonOwnerDenial = nonOwnerExecutionGuardDenial(deps, input, logical);
+    if (nonOwnerDenial !== null) {
+      return deny(eventName, "EXECUTION_SESSION_NOT_OWNER", nonOwnerDenial);
+    }
+  }
+
+  // E5 §16/§23/§38 — the execution-worker's host-tool surface: claim first,
+  // then narrow strictly by the bound Directive capability envelope. Store
+  // verification failures deny fail-closed (never allow while unverifiable).
+  if (input.agentType === EXECUTION_WORKER_AGENT_TYPE) {
+    return handleWorkerCapabilityGuard(deps, input, eventName, logical);
   }
 
   // §43 — normal Plan Mode stays governed by Claude Code; no duplication.
@@ -784,6 +1455,18 @@ async function handlePhasePlanPreToolUse(
   logical: HostContextLogicalTool,
 ): Promise<HookOutput> {
   const toolInput = input.toolInput;
+
+  // E5 §10/§12/§17 — the ExecutionWorker's three-tool surface: the authority
+  // is the signed worker host context (the host's subagent identity) plus the
+  // one-time claim token; the session binding and Core checks do the rest.
+  if (logical === "worker_claim" || logical === "worker_get_assignment" || logical === "worker_submit_report") {
+    return handleWorkerToolSigning(deps, input, eventName);
+  }
+  // E5 §42 / E6 §6/§19 — the fenced supervisor's execution operations: an
+  // EXECUTION-domain context bound to the active run's supervision generation.
+  if ((SUPERVISOR_EXECUTION_OP_TOOLS as readonly string[]).includes(logical)) {
+    return handleSupervisorExecutionOpSigning(deps, input, eventName);
+  }
 
   if (logical === "start_or_resume") {
     // §14 — verify the EntryIntent BEFORE anything else.
@@ -898,6 +1581,102 @@ async function handlePhasePlanPreToolUse(
     }
   }
 
+  // E13 §4/§5/§6 — the human-authorized ExecutionRun abort. Control-plane
+  // exception: unlike supervisor mutations there is NO ownership or binding
+  // precondition — a detached/fenced/recovery session may request the abort
+  // on the user's behalf, and the current owner may too. The signed envelope
+  // carries NO run/generation authority (the exact target stays model input
+  // revalidated by the MCP handler and the Store; the human dialog is the
+  // authority). Subagent contexts are signed WITH their attestation so the
+  // MCP handler can deny them (§7 — workers can never request abort).
+  if (logical === "abort_execution_run") {
+    if (input.cwd === undefined || input.cwd.trim() === "") {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; workspace cannot be discovered");
+    }
+    try {
+      const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
+      const abortAgent =
+        input.agentId === undefined && input.agentType === undefined
+          ? undefined
+          : {
+              ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+              ...(input.agentType === undefined ? {} : { agentType: input.agentType }),
+            };
+      const abortToken = encodeHostContextTokenV2(
+        deps.secret,
+        buildHostContextEnvelopeV2({
+          sessionId: input.sessionId,
+          ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+          workspaceId: registration.workspace.workspaceId,
+          permissionMode: input.permissionMode ?? "unknown",
+          toolUseId: input.toolUseId,
+          toolName: input.toolName,
+          businessInputHash: businessInputHashOf(toolInput),
+          ...(abortAgent === undefined ? {} : { agent: abortAgent }),
+        }),
+      );
+      // §4 — the mandatory human dialog is the authorization (_meta
+      // requiresUserInteraction); the hook never allows and never decides.
+      return askWithUpdatedInput(
+        eventName,
+        { ...toolInput, _hostContext: abortToken },
+        "abort_execution_run permanently terminates the target ExecutionRun (no rollback, no resume) and requires explicit user authorization.",
+      );
+    } catch (err) {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // A1-II §9/§11/§12 — the human-authorized same-FinalPlan reexecution.
+  // Control-plane exception with NO ownership precondition (the requesting
+  // session may be detached after an abort/completion). The signed envelope
+  // carries NO run/generation authority: the authorization target is the
+  // exact FinalPlanRef + WorkspaceIdentity carried in the model-supplied
+  // business fields, revalidated by the MCP handler and the Store; the human
+  // dialog is the authority. Subagent contexts are signed WITH their
+  // attestation so the MCP handler can deny them (§49 — supervisors may
+  // request reexecution only through the dialog; workers/validator/resolvers/
+  // reconciliation inspectors can never initiate it).
+  if (logical === "reexecute_final_plan") {
+    if (input.cwd === undefined || input.cwd.trim() === "") {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", "hook input carries no cwd; workspace cannot be discovered");
+    }
+    try {
+      const { registration } = await discoverAndRegisterWorkspace(deps.store, input.cwd, deps.clock);
+      const reexecuteAgent =
+        input.agentId === undefined && input.agentType === undefined
+          ? undefined
+          : {
+              ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+              ...(input.agentType === undefined ? {} : { agentType: input.agentType }),
+            };
+      const reexecuteToken = encodeHostContextTokenV2(
+        deps.secret,
+        buildHostContextEnvelopeV2({
+          sessionId: input.sessionId,
+          ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
+          workspaceId: registration.workspace.workspaceId,
+          permissionMode: input.permissionMode ?? "unknown",
+          toolUseId: input.toolUseId,
+          toolName: input.toolName,
+          businessInputHash: businessInputHashOf(toolInput),
+          ...(reexecuteAgent === undefined ? {} : { agent: reexecuteAgent }),
+        }),
+      );
+      // §9 — the mandatory human dialog is the reexecution authorization
+      // (_meta requiresUserInteraction); the hook never allows and never
+      // decides. A user rejection means the tool call never executes: zero
+      // Store mutation, no authorization row, no ExecutionRun.
+      return askWithUpdatedInput(
+        eventName,
+        { ...toolInput, _hostContext: reexecuteToken },
+        "reexecute_final_plan creates a NEW ExecutionRun of the exact named FinalPlan in this workspace (the previous run is never reused or reactivated) and requires explicit user authorization.",
+      );
+    } catch (err) {
+      return deny(eventName, "WORKSPACE_UNAVAILABLE", err instanceof Error ? err.message : String(err));
+    }
+  }
+
   // approve_proposal, promote_evidence, revalidate_evidence, select_section,
   // prepare_proposal, submit_synthesis, submit_validation, request_reopen,
   // request_finalization, and handoff require an owned active run for their
@@ -925,7 +1704,14 @@ async function handlePhasePlanPreToolUse(
         const handoff = getExecutionHandoffInTx(tx, binding.runId);
         const state = handoff === null ? null : getExecutionHandoffStateInTx(tx, binding.runId);
         if (handoff === null || state?.status !== "delivered") return null;
-        return binding;
+        // A1 §16 — the token binds the exact ExecutionRunID; the Class-D
+        // binding row keeps only the planning provenance, so resolve through
+        // it (initial-delivery stores hold exactly one execution world).
+        const executionRun = tx
+          .prepare("SELECT execution_run_id AS executionRunId FROM execution_runs WHERE run_id = ?")
+          .get(binding.runId) as { executionRunId: string } | undefined;
+        if (executionRun === undefined) return null;
+        return { ...binding, executionRunId: executionRun.executionRunId };
       });
       if (executionBinding !== null) {
         const execToken = encodeExecutionHostContextToken(
@@ -934,7 +1720,7 @@ async function handlePhasePlanPreToolUse(
             sessionId: input.sessionId,
             ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
             workspaceId: executionBinding.workspaceId,
-            runId: executionBinding.runId,
+            executionRunId: executionBinding.executionRunId,
             finalPlanId: executionBinding.finalPlanId,
             executionBindingGeneration: executionBinding.generation,
             permissionMode: input.permissionMode ?? "unknown",
@@ -962,13 +1748,21 @@ async function handlePhasePlanPreToolUse(
         findDeliveredHandoffForSessionToolUseInTx(tx, { sessionId: input.sessionId, toolUseId: input.toolUseId }),
       );
       if (replay !== null) {
+        const replayRun = deps.store.withRead((tx) =>
+          tx
+            .prepare("SELECT execution_run_id AS executionRunId FROM execution_runs WHERE run_id = ?")
+            .get(replay.runId) as { executionRunId: string } | undefined,
+        );
+        if (replayRun === undefined) {
+          return deny(eventName, "STALE_SESSION_BINDING", "the delivered handoff no longer resolves to an execution world");
+        }
         const execToken = encodeExecutionHostContextToken(
           deps.secret,
           buildExecutionHostContextEnvelope({
             sessionId: input.sessionId,
             ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
             workspaceId: replay.workspaceId,
-            runId: replay.runId,
+            executionRunId: replayRun.executionRunId,
             finalPlanId: replay.finalPlanId,
             executionBindingGeneration: replay.generation,
             permissionMode: input.permissionMode ?? "unknown",
@@ -1229,6 +2023,23 @@ export function handlePermissionRequest(deps: HookHandlerDeps, input: Permission
     // Phase 16 §2/§39 — the mandatory host dialog IS the authorization; this
     // hook never allows (auto-allow may never impersonate it) and takeover
     // performs no host-mode transition.
+    return emptyOutput();
+  }
+
+  if (logical === "abort_execution_run") {
+    // E13 §4/§11 — the mandatory host dialog IS the abort authorization; this
+    // hook never allows (auto-allow may never impersonate it) and the abort
+    // performs no host-mode transition. A user rejection means the tool call
+    // never executes: zero Store mutation, no abort record, no event (§11).
+    return emptyOutput();
+  }
+
+  if (logical === "reexecute_final_plan") {
+    // A1-II §9 — the mandatory host dialog IS the reexecution authorization;
+    // this hook never allows (auto-allow may never impersonate it) and
+    // reexecution performs no host-mode transition. A user rejection means
+    // the tool call never executes: zero Store mutation, no authorization
+    // row, no ExecutionRun.
     return emptyOutput();
   }
 

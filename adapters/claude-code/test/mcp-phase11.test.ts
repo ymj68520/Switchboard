@@ -127,6 +127,33 @@ describe("Phase 11 MCP surface (§74)", () => {
       "report_execution_issue",
       "takeover_run",
       "abort_run",
+    "abort_execution_run",
+    "reexecute_final_plan",
+      // v0.2.0 E5 — the ExecutionWorker runtime + supervisor execution ops.
+      "issue_execution_directive",
+      "start_worker_attempt",
+      "worker_claim",
+      "worker_get_assignment",
+      "worker_submit_report",
+      // v0.2.0 E6 — the supervisor acceptance surface.
+      "get_execution_acceptance_context",
+      "submit_supervisor_assessment",
+      // v0.2.0 E7 — the execution progression surface.
+      "get_execution_progression_context",
+      "continue_execution_stage",
+      "activate_execution_stage",
+      // v0.2.0 E8 — verification policy + bounded conflict orchestration.
+      // v0.2.0 E9 — the controlled return-to-planning boundary.
+      "get_execution_final_closure_context",
+      "begin_execution_final_closure",
+      "get_attempt_recovery_context",
+      "retry_unclaimed_worker_launch",
+      "issue_attempt_reconciliation",
+      "resolve_indeterminate_attempt",
+      "request_execution_replan",
+      "get_verification_policy_context",
+      "declare_verification_conflict",
+      "resolve_verification_conflict",
     ]);
     const select = PHASE_PLAN_TOOLS.find((tool) => tool.name === "select_section")!;
     expect(Object.keys(select.inputSchema.properties as Record<string, unknown>).sort()).toEqual(["_hostContext", "section_id"]);

@@ -54,6 +54,7 @@ import type { StoreTx } from "../store/transaction.js";
 function successorError(
   code:
     | "EXECUTION_ISSUE_REQUIRED"
+    | "EXECUTION_ISSUE_AMBIGUOUS"
     | "SUCCESSOR_RUN_ALREADY_STARTED"
     | "HANDOFF_NOT_AUTHORIZED"
     | "STALE_EXECUTION_BINDING",
@@ -86,6 +87,12 @@ export interface SuccessorCreationResult {
   affectedScope: DerivedAffectedScope;
   predecessorExecutionBinding: { state: "detached"; generation: number };
   planningBinding: { state: "attached"; generation: number };
+  /**
+   * E9 §31 — present exactly when this successor was created through the
+   * CONTROLLED RETURN from a replan_required ExecutionRun: the exact terminal
+   * execution world and its ONE replan ExecutionIssue.
+   */
+  replan?: { predecessorExecutionRunId: string; issueId: string };
 }
 
 /** A FinalPlan decision's declared scope string, read from committed content. */
@@ -116,24 +123,53 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
      */
     createSuccessor(input: CreateSuccessorInput): SuccessorCreationResult {
       return store.withWrite((tx) => {
-        // §22 — the entry authority is the attached ExecutionBinding of the
-        // exact session; without it this is not a Build-bound session.
-        const binding = tx
+        // A1 §23/§28 — the entry authority is the session's attached
+        // SupervisorBinding (canonical current supervision ownership). The
+        // legacy ExecutionBinding is initial-handoff metadata and is NEVER
+        // consulted as live authority.
+        const supervision = tx
           .prepare(
-            "SELECT run_id AS runId, workspace_id AS workspaceId, final_plan_id AS finalPlanId, "
-            + "session_id AS sessionId, state, generation FROM execution_bindings "
+            "SELECT execution_run_id AS executionRunId, workspace_id AS workspaceId, "
+            + "session_id AS sessionId, state, generation FROM supervisor_bindings "
             + "WHERE session_id = ? AND state = 'attached'",
           )
           .get(input.sessionId) as
-          | { runId: string; workspaceId: string; finalPlanId: string; sessionId: string; state: "attached" | "detached"; generation: number }
+          | { executionRunId: string; workspaceId: string; sessionId: string; state: "attached" | "detached"; generation: number }
           | undefined;
-        if (binding === undefined || binding.workspaceId !== input.workspaceId) {
-          throw successorError(
-            "STALE_EXECUTION_BINDING",
-            "successor creation requires the session's attached ExecutionBinding in this workspace",
-          );
+        const boundRun =
+          supervision !== undefined && supervision.workspaceId === input.workspaceId
+            ? (tx
+                .prepare("SELECT run_id AS runId, final_plan_id AS finalPlanId, lifecycle FROM execution_runs WHERE execution_run_id = ?")
+                .get(supervision.executionRunId) as { runId: string; finalPlanId: string; lifecycle: string } | undefined)
+            : undefined;
+        let predecessorRunId: string;
+        let predecessorExecutionRunId: string;
+        let boundFinalPlanId: string | null = null;
+        let replanProvenance: { predecessorExecutionRunId: string; issueId: string } | null = null;
+        if (supervision !== undefined && boundRun !== undefined && boundRun.lifecycle !== "replan_required") {
+          predecessorRunId = boundRun.runId;
+          predecessorExecutionRunId = supervision.executionRunId;
+          boundFinalPlanId = boundRun.finalPlanId;
+        } else {
+          // E9 §30–§33 — no attached Build binding: this may be the CONTROLLED
+          // RETURN from a replan_required ExecutionRun (a session with a
+          // pending replan ExecutionIssue). Core resolves the context — never
+          // the model — and the SAME baseline/adoptions/scope machinery below
+          // creates the successor PlanningRun.
+          // §22/§73 — a session with NO replan heritage keeps the exact v0.1
+          // STALE refusal (a vanished binding is never silently reinterpreted
+          // as replan entry).
+          const replan = tryResolveReplanEntryInTx(tx, input);
+          if (replan === null) {
+            throw successorError(
+              "STALE_EXECUTION_BINDING",
+              "successor creation requires the session's attached ExecutionBinding in this workspace",
+            );
+          }
+          replanProvenance = { predecessorExecutionRunId: replan.predecessorExecutionRunId, issueId: replan.issueId };
+          predecessorRunId = replan.predecessorRunId;
+          predecessorExecutionRunId = replan.predecessorExecutionRunId;
         }
-        const predecessorRunId = binding.runId;
 
         const runRow = tx
           .prepare(
@@ -157,7 +193,7 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
         // §83 — the race loser names the existing successor, never a silent
         // second creation: if the open set is gone, an adoption table row
         // proves the successor already started.
-        const openIssues = listOpenExecutionIssuesInTx(tx, predecessorRunId);
+        const openIssues = listOpenExecutionIssuesInTx(tx, predecessorExecutionRunId);
         if (openIssues.length === 0) {
           const existing = getPlanningRunBaselineForPredecessorInTx(tx, predecessorRunId);
           if (existing !== null) {
@@ -178,7 +214,7 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
         const handoffState = getExecutionHandoffStateInTx(tx, predecessorRunId);
         if (
           finalPlanRow === null ||
-          finalPlanRow.finalPlanId !== binding.finalPlanId ||
+          (boundFinalPlanId !== null && finalPlanRow.finalPlanId !== boundFinalPlanId) ||
           handoffRow === null ||
           handoffState?.status !== "delivered"
         ) {
@@ -195,13 +231,16 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
         const entries: BaselineIssueEntry[] = sortedIssues.map((issue) => {
           const canonical = JSON.parse(issue.canonicalJson) as {
             kind: ExecutionIssueKind;
-            affectedRefs: ExecutionIssueAffectedRef[];
+            // v1 build issues carry affectedRefs; the E9 replan issue carries
+            // affectedNormativeRefs — the same exact-ref vocabulary.
+            affectedRefs?: ExecutionIssueAffectedRef[];
+            affectedNormativeRefs?: ExecutionIssueAffectedRef[];
           };
           return {
             issueId: issue.issueId,
             issueHash: issue.issueHash,
             kind: canonical.kind,
-            affectedRefs: canonical.affectedRefs,
+            affectedRefs: canonical.affectedRefs ?? canonical.affectedNormativeRefs ?? [],
           };
         });
         const issueSetHash = baselineIssueSetHash(entries);
@@ -281,7 +320,7 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
             tx,
             {
               issueId: entry.issueId,
-              runId: predecessorRunId,
+              executionRunId: predecessorExecutionRunId,
               successorRunId,
               baselineId,
               position: index + 1,
@@ -323,12 +362,15 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
 
         // §39 — the predecessor ExecutionBinding detaches (+1): every
         // outstanding signed execution context fences as STALE immediately.
+        // E9 — on the replan-controlled-return path the Build binding already
+        // detached at handoff delivery, so a null detach is the EXPECTED
+        // terminal-world state, not a failure.
         const detachedBinding = detachExecutionBindingInTx(
           tx,
           { runId: predecessorRunId, sessionId: input.sessionId },
           now,
         );
-        if (detachedBinding === null) {
+        if (detachedBinding === null && replanProvenance === null) {
           throw successorError(
             "STALE_EXECUTION_BINDING",
             "the execution binding vanished during successor creation",
@@ -356,9 +398,64 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
             affectedRefs: entry.affectedRefs,
           })),
           affectedScope,
-          predecessorExecutionBinding: { state: "detached" as const, generation: detachedBinding.generation },
+          predecessorExecutionBinding: { state: "detached" as const, generation: detachedBinding?.generation ?? 0 },
           planningBinding: { state: "attached" as const, generation: planningBinding.generation },
+          ...(replanProvenance === null ? {} : { replan: replanProvenance }),
         };
+      });
+    },
+
+    /**
+     * E9 §33 — replan-boundary classification for the entry flow: the
+     * session's replan context (or the workspace's unique one), the pending
+     * issue, and whether the successor already exists.
+     */
+    classifyReplanEntry(workspaceId: string, sessionId: string): {
+      replanRunId: string | null;
+      issueId: string | null;
+      successorRunId: string | null;
+      ambiguous: boolean;
+    } {
+      return store.withRead((tx) => {
+        try {
+          const resolved = resolveReplanEntryInTx(tx, { workspaceId, sessionId });
+          const baseline = getPlanningRunBaselineForPredecessorInTx(tx, resolved.predecessorRunId);
+          return {
+            replanRunId: resolved.predecessorRunId,
+            issueId: resolved.issueId,
+            successorRunId: baseline?.successorRunId ?? null,
+            ambiguous: false,
+          };
+        } catch (err) {
+          if (err instanceof RuntimeError && err.code === "EXECUTION_ISSUE_AMBIGUOUS") {
+            return { replanRunId: null, issueId: null, successorRunId: null, ambiguous: true };
+          }
+          // E9 §32 — an ADOPTED replan issue (the successor already started)
+          // still resolves: converge on the existing successor.
+          for (const bindingRow of tx
+            .prepare("SELECT execution_run_id AS executionRunId FROM supervisor_bindings WHERE session_id = ? ORDER BY created_at, execution_run_id")
+            .all(sessionId) as Array<{ executionRunId: string }>) {
+            const adopted = tx
+              .prepare(
+                "SELECT i.issue_id AS issueId, a.successor_run_id AS successorRunId FROM execution_issues i "
+                + "JOIN execution_issue_adoptions a ON a.execution_run_id = i.execution_run_id AND a.issue_id = i.issue_id "
+                + "WHERE i.execution_run_id = ? AND i.kind = 'replan_required' LIMIT 1",
+              )
+              .get(bindingRow.executionRunId) as { issueId: string; successorRunId: string } | undefined;
+            if (adopted !== undefined) {
+              const provenance = tx
+                .prepare("SELECT run_id AS runId FROM execution_runs WHERE execution_run_id = ?")
+                .get(bindingRow.executionRunId) as { runId: string } | undefined;
+              return {
+                replanRunId: provenance?.runId ?? bindingRow.executionRunId,
+                issueId: adopted.issueId,
+                successorRunId: adopted.successorRunId,
+                ambiguous: false,
+              };
+            }
+          }
+          return { replanRunId: null, issueId: null, successorRunId: null, ambiguous: false };
+        }
       });
     },
 
@@ -374,6 +471,10 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
       successorRunId: string | null;
     } {
       return store.withRead((tx) => {
+        // §23 — classification rides the session's ExecutionBinding (it
+        // survives the replan's supervision detach). A1 §16 — the open-issue
+        // count is scoped by the canonical ExecutionRunID resolved from the
+        // binding's source-planning provenance.
         const binding = tx
           .prepare(
             "SELECT run_id AS runId, workspace_id AS workspaceId FROM execution_bindings "
@@ -383,10 +484,14 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
         if (binding === undefined || binding.workspaceId !== workspaceId) {
           return { bound: false, openIssues: 0, successorRunId: null };
         }
+        const boundExecutionRun = tx
+          .prepare("SELECT execution_run_id AS executionRunId FROM execution_runs WHERE run_id = ?")
+          .get(binding.runId) as { executionRunId: string } | undefined;
+        const executionRunId = boundExecutionRun?.executionRunId ?? binding.runId;
         const existing = getPlanningRunBaselineForPredecessorInTx(tx, binding.runId);
         return {
           bound: true,
-          openIssues: countOpenExecutionIssuesInTx(tx, binding.runId),
+          openIssues: countOpenExecutionIssuesInTx(tx, executionRunId),
           successorRunId: existing?.successorRunId ?? null,
         };
       });
@@ -404,3 +509,74 @@ export function createSuccessorRunService(store: PlanStore, clock: StoreClock) {
 }
 
 export type SuccessorRunService = ReturnType<typeof createSuccessorRunService>;
+
+/**
+ * E9 §33 — resolve the replan-controlled-return context. The session's own
+ * supervisor binding (attached or detached provenance) on a replan_required
+ * ExecutionRun with a pending issue proves a UNIQUE replan context; otherwise
+ * the workspace's replan context must be unique — multiple pending issues are
+ * never guessed (EXECUTION_ISSUE_AMBIGUOUS).
+ */
+function tryResolveReplanEntryInTx(
+  tx: StoreTx,
+  input: CreateSuccessorInput,
+): { predecessorRunId: string; predecessorExecutionRunId: string; issueId: string } | null {
+  try {
+    return resolveReplanEntryInTx(tx, input);
+  } catch (err) {
+    if (err instanceof RuntimeError && err.code === "EXECUTION_ISSUE_AMBIGUOUS") {
+      throw err;
+    }
+    return null;
+  }
+}
+
+function resolveReplanEntryInTx(
+  tx: StoreTx,
+  input: CreateSuccessorInput,
+): { predecessorRunId: string; predecessorExecutionRunId: string; issueId: string } {
+  // The replan issue resolves whether OPEN or already ADOPTED: an adopted
+  // issue routes re-entry into the body's SUCCESSOR_RUN_ALREADY_STARTED
+  // convergence (E9 §32) instead of a misleading "no pending issue".
+  for (const bindingRow of tx
+    .prepare("SELECT execution_run_id AS executionRunId FROM supervisor_bindings WHERE session_id = ? ORDER BY created_at, execution_run_id")
+    .all(input.sessionId) as Array<{ executionRunId: string }>) {
+    const issue = tx
+      .prepare("SELECT issue_id AS id FROM execution_issues WHERE execution_run_id = ? AND kind = 'replan_required' ORDER BY created_at LIMIT 1")
+      .get(bindingRow.executionRunId) as { id: string } | undefined;
+    if (issue === undefined) continue;
+    const executionRun = tx
+      .prepare("SELECT run_id AS runId, lifecycle FROM execution_runs WHERE execution_run_id = ?")
+      .get(bindingRow.executionRunId) as { runId: string | null; lifecycle: string } | undefined;
+    if (executionRun !== undefined && executionRun.lifecycle === "replan_required") {
+      return { predecessorRunId: executionRun.runId ?? bindingRow.executionRunId, predecessorExecutionRunId: bindingRow.executionRunId, issueId: issue.id };
+    }
+  }
+  const candidates = tx
+    .prepare(
+      "SELECT DISTINCT er.run_id AS runId, er.execution_run_id AS executionRunId FROM execution_runs er "
+      + "JOIN execution_issues i ON i.execution_run_id = er.execution_run_id AND i.kind = 'replan_required' "
+      + "WHERE er.lifecycle = 'replan_required' "
+      + "AND er.workspace_id IN (SELECT workspace_id FROM execution_runs WHERE execution_run_id IN "
+      + "(SELECT execution_run_id FROM supervisor_bindings WHERE session_id = ?))",
+    )
+    .all(input.sessionId) as Array<{ runId: string; executionRunId: string | null }>;
+  if (candidates.length === 0) {
+    throw successorError("EXECUTION_ISSUE_REQUIRED", "no pending replan ExecutionIssue exists for this session's workspace (E9 §30)");
+  }
+  if (candidates.length > 1) {
+    throw successorError(
+      "EXECUTION_ISSUE_AMBIGUOUS",
+      "multiple pending replan ExecutionIssues exist in this workspace; disambiguate through the exact issue's entry flow (E9 §33)",
+      { detail: { runs: candidates.map((c) => c.runId) } },
+    );
+  }
+  const candidate = candidates[0]!;
+  const issue = tx
+    .prepare("SELECT issue_id AS id FROM execution_issues WHERE run_id = ? AND kind = 'replan_required' ORDER BY created_at LIMIT 1")
+    .get(candidate.runId) as { id: string } | undefined;
+  if (issue === undefined) {
+    throw successorError("EXECUTION_ISSUE_REQUIRED", "the replan issue vanished during entry resolution (E9 §33)");
+  }
+  return { predecessorRunId: candidate.runId, predecessorExecutionRunId: candidate.executionRunId ?? "", issueId: issue.id };
+}

@@ -13,9 +13,6 @@ import { describe, expect, it } from "vitest";
 import { createProductionMigrations, type StoreMigration } from "../src/store/migrations/index.js";
 import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import { initializePlanStore, type PlanStore } from "../src/store/sqlite-store.js";
-import { getPlanningRunBaselineForSuccessorInTx, listBaselineScopesInTx } from "../src/store/successor-baselines.js";
-import { createExecutionIssueService } from "../src/application/execution-issue-service.js";
-import { createSuccessorRunService } from "../src/application/successor-run-service.js";
 import { createHandoffService } from "../src/application/handoff-service.js";
 import { callHandoff, makeApprovedFinalPlanFixture, type ApprovedFinalPlanFixture } from "./phase14-helpers.js";
 import type { PhasePlanToolContext } from "../src/mcp/tools.js";
@@ -56,6 +53,12 @@ interface Phase15World {
 
 /** The full §52 fixture world: delivered predecessor + issue + successor baseline. */
 async function makePhase15World(sessionId = "S1"): Promise<Phase15World> {
+  // A1-I §46 — the historical Phase-15 world (an issue adopted by a successor
+  // WITHOUT any surviving ExecutionRun) is not v26-representable: A1 §24
+  // requires every issue to carry exact ExecutionRun provenance, and the
+  // depth-12 rewind drops execution_runs (014-era). The rewind leg therefore
+  // runs on the directive-free active world; the migration itself fails
+  // closed (A1 §42) on any issue whose run is unresolved.
   const { f, ctx } = await makeApprovedFinalPlanFixture(sessionId);
   const prepared = callHandoff(ctx, f, { toolUseId: `${sessionId}-DELIVER-1` });
   createHandoffService(ctx.store, ctx.clock).finalizeDelivery({
@@ -65,24 +68,7 @@ async function makePhase15World(sessionId = "S1"): Promise<Phase15World> {
     responseHandoffId: prepared.handoff_id,
     responseHandoffHash: prepared.handoff_hash,
   });
-  const issue = createExecutionIssueService(ctx.store, ctx.clock).reportIssue({
-    runId: f.runId,
-    workspaceId: f.workspaceId,
-    workspaceRoot: f.workspaceRoot,
-    sessionId: f.sessionId,
-    toolUseId: `${sessionId}-ISSUE-1`,
-    finalPlanId: f.finalPlanId,
-    executionBindingGeneration: 1,
-    kind: "section_contract",
-    summary: "live fixture conflict",
-    detail: "the delivered contract cannot be implemented as approved",
-    affectedRefs: [{ type: "section", id: "SEC-1", revision: 1 }],
-  });
-  const successor = createSuccessorRunService(ctx.store, ctx.clock).createSuccessor({
-    workspaceId: f.workspaceId,
-    sessionId: f.sessionId,
-  });
-  return { f, ctx, successorRunId: successor.successorRun.runId, issueId: issue.issueId };
+  return { f, ctx, successorRunId: "", issueId: "" };
 }
 
 describe("migration 12 → 13 run-control-authorizations (§52–§54, E1/E64/E65)", () => {
@@ -121,20 +107,17 @@ describe("migration 12 → 13 run-control-authorizations (§52–§54, E1/E64/E6
         same(before.sessions, store.withRead((tx) => tx.prepare("SELECT * FROM session_bindings ORDER BY run_id").all()));
         // §52 — the control table exists and starts EMPTY; no backfill.
         expect(store.withRead((tx) => tx.prepare("SELECT COUNT(*) AS n FROM run_control_authorizations").get())).toEqual({ n: 0 });
-        // The migrated seam stays live: successor baseline + scopes readable.
-        const baseline = store.withRead((tx) => getPlanningRunBaselineForSuccessorInTx(tx, world.successorRunId));
-        expect(baseline).not.toBeNull();
-        expect(store.withRead((tx) => listBaselineScopesInTx(tx, baseline!.baselineId)).length).toBeGreaterThan(0);
-        // The issue was ADOPTED by the successor (open == no adoption row), so
-        // the durable fact is the issue row itself.
-        expect((store.withRead((tx) => tx.prepare("SELECT COUNT(*) AS n FROM execution_issues").get()) as { n: number }).n).toBe(1);
+        // A1-I §46 — the reshaped world carries no successor/issue (an issue
+        // without a surviving ExecutionRun is not v26-representable, A1 §24);
+        // the planning-side seam (control + handoff + bindings above) is the
+        // depth-12-representable surface this leg preserves.
       } finally {
         store.close();
       }
       const raw = rawConnection(databasePath, 5000);
       try {
         const rows = raw.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>;
-        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
       } finally {
         raw.close();
       }
@@ -165,7 +148,9 @@ describe("migration 12 → 13 run-control-authorizations (§52–§54, E1/E64/E6
       await expect(
         initializePlanStore({
           pluginDataRoot: root,
-          migrations: [...production.filter((m) => m.to <= 12), failing],
+          // The registry must still reach the supported schema: the real 13→14
+      // step follows the injected 12→13 failure.
+      migrations: [...production.filter((m) => m.to <= 12), failing, ...production.filter((m) => m.to >= 14)],
         }),
       ).rejects.toMatchObject({ code: "STORE_MIGRATION_FAILED", causeText: expect.stringContaining("injected 013 failure") });
 
@@ -183,7 +168,7 @@ describe("migration 12 → 13 run-control-authorizations (§52–§54, E1/E64/E6
       // A normal open migrates it forward again.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(13);
+        expect(store.getSchemaVersion()).toBe(26);
       } finally {
         store.close();
       }

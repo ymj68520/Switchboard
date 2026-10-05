@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { isNodeVersionSupported } from "../src/runtime/node-version.js";
 import { RUNTIME_VERSION } from "../src/runtime/version.js";
+import { PHASE_PLAN_TOOLS } from "../src/mcp/tools.js";
 import { runMcpSmoke, runtimeBundlePath } from "./helpers.js";
 import {
   makeTempPluginDataRoot,
@@ -47,43 +48,24 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
         expect(parsed.find((m) => m.id === 1)?.result).toMatchObject({
           serverInfo: { name: "phase-plan", version: RUNTIME_VERSION },
         });
-        // Phase 13 (§87): fourteen tools — the Phase 12 set plus
-        // request_finalization; approve_proposal keeps the flag.
+        // The served surface must equal the source-declared frozen registry
+        // exactly (currently the v0.2.0 40-tool surface, incl. the execution
+        // protocol family and the human-control tools).
         const tools = (
           parsed.find((m) => m.id === 2)?.result as {
             tools: Array<{ name: string; _meta?: Record<string, unknown> }>;
           }
         ).tools;
-        expect(tools.map((tool) => tool.name)).toEqual([
-          "start_or_resume",
-          "get_state",
-          "get_context",
-          "read_memory",
-          "list_observations",
-          "promote_evidence",
-          "revalidate_evidence",
-          "select_section",
-          "prepare_proposal",
-          "approve_proposal",
-          "submit_synthesis",
-          "submit_validation",
-          "request_reopen",
-          "request_finalization",
-      "handoff",
-          "report_execution_issue",
-          "takeover_run",
-          "abort_run",
-        ]);
+        expect(tools.map((tool) => tool.name)).toEqual(PHASE_PLAN_TOOLS.map((tool) => tool.name));
         expect(tools.find((tool) => tool.name === "approve_proposal")?._meta).toEqual({
           "anthropic/requiresUserInteraction": true,
         });
-        // Phase 16 §2 — both control tools always require explicit human approval.
-        expect(tools.find((tool) => tool.name === "takeover_run")?._meta).toEqual({
-          "anthropic/requiresUserInteraction": true,
-        });
-        expect(tools.find((tool) => tool.name === "abort_run")?._meta).toEqual({
-          "anthropic/requiresUserInteraction": true,
-        });
+        // Human-control tools always require explicit human approval.
+        for (const control of ["takeover_run", "abort_run", "abort_execution_run", "reexecute_final_plan"]) {
+          expect(tools.find((tool) => tool.name === control)?._meta).toEqual({
+            "anthropic/requiresUserInteraction": true,
+          });
+        }
         expect(result.stderr).toContain("[phase-plan]");
 
         // Store-first: the canonical database exists after a served session.
@@ -118,7 +100,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       await fs.writeFile(databasePath, "");
       // Leave a future-schema marker via raw connection (test-only manipulation).
       const raw = rawConnection(databasePath, 500);
-      raw.exec("PRAGMA user_version = 14");
+      raw.exec("PRAGMA user_version = 27");
       raw.close();
 
       const result = await runMcpSmoke(process.execPath, BUNDLE, {
@@ -132,7 +114,7 @@ describe("mcp bootstrap (built bundle, real stdio, store-first)", () => {
       expect(result.stderr).toContain("STORE_SCHEMA_TOO_NEW");
       expect(result.stdoutLines).toEqual([]);
       // Untouched: still the too-new marker, never downgraded.
-      expect(rawConnectionQueried(databasePath)).toBe(14);
+      expect(rawConnectionQueried(databasePath)).toBe(27);
     } finally {
       removeTempPluginDataRoot(pluginDataRoot);
     }

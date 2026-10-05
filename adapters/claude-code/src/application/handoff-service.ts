@@ -41,8 +41,16 @@ import {
 import type { MemoryArtifactKind } from "../core/memory-refs.js";
 import { parsePlanningRunRow, type PlanningRun } from "../core/planning-run.js";
 import { RuntimeError } from "../runtime/errors.js";
-import { observeGitHeadSync } from "../evidence/fingerprint-check.js";
 import { detachBindingInTx } from "../store/session-bindings.js";
+import {
+  activateExecutionRunInTx,
+  getExecutionRunBySourcePlanningRunInTx,
+} from "../store/execution-runs.js";
+import { insertAttachedSupervisorBindingInTx } from "../store/supervisor-bindings.js";
+import type { ExecutionRun } from "../core/execution-run.js";
+import { prepareExecutionRunForFinalPlanInTx } from "./execution-run-service.js";
+import { ensureExecutionStructureInTx } from "./execution-structure-service.js";
+import { deriveRepositoryBaseline } from "./repository-baseline.js";
 import {
   findDeliveryAttemptInTx,
   getExecutionBindingInTx,
@@ -73,6 +81,7 @@ function handoffError(
     | "STALE_EXECUTION_BINDING"
     | "EXECUTION_CONTEXT_NOT_AVAILABLE"
     | "EXECUTION_MEMORY_REF_NOT_AUTHORIZED"
+    | "EXECUTION_HANDOFF_INVARIANT"
     | "CAPABILITY_NOT_AVAILABLE",
   message: string,
   detail?: Record<string, unknown>,
@@ -80,24 +89,9 @@ function handoffError(
   return new RuntimeError(code, message, { detail });
 }
 
-/** The FinalPlan canonical persisted by the Final PlanCommit (Phase 13 §54). */
-export function parseFinalPlanCanonical(raw: unknown, runId: string): FinalPlanV1 {
-  if (typeof raw === "string") {
-    try {
-      raw = JSON.parse(raw);
-    } catch {
-      throw handoffError("HANDOFF_NOT_AUTHORIZED", `FinalPlan canonical payload in run '${runId}' is unparsable`);
-    }
-  }
-  if (typeof raw !== "object" || raw === null) {
-    throw handoffError("HANDOFF_NOT_AUTHORIZED", `FinalPlan canonical payload in run '${runId}' is not an object`);
-  }
-  const plan = raw as FinalPlanV1;
-  if (plan.version !== 1 || !Array.isArray(plan.sections) || !Array.isArray(plan.decisions) || !Array.isArray(plan.constraints)) {
-    throw handoffError("HANDOFF_NOT_AUTHORIZED", `FinalPlan canonical payload in run '${runId}' has an unsupported shape`);
-  }
-  return plan;
-}
+/** The FinalPlan canonical parser now lives in its shared module. */
+export { parseFinalPlanCanonical } from "./final-plan-canonical.js";
+import { parseFinalPlanCanonical } from "./final-plan-canonical.js";
 
 function loadRunInTx(tx: StoreTx, runId: string): PlanningRun {
   const row = tx
@@ -195,20 +189,8 @@ export function deriveExecutionHandoffInTx(
   return { handoff, handoffHash: executionHandoffHash(handoff) };
 }
 
-/** §24/§25 — repository baseline frozen at handoff creation; never re-derived. */
-export function deriveRepositoryBaseline(kind: string, workspaceRoot: string): RepositoryBaseline {
-  if (kind !== "git_worktree") {
-    return { kind: "directory", revision: null };
-  }
-  const head = observeGitHeadSync(workspaceRoot);
-  if (head === null) {
-    throw handoffError(
-      "HANDOFF_NOT_AUTHORIZED",
-      "the git repository baseline is unavailable; the execution handoff cannot be derived",
-    );
-  }
-  return { kind: "git", revision: head };
-}
+/** §24/§25 — repository baseline derivation now lives in its shared module. */
+export { deriveRepositoryBaseline } from "./repository-baseline.js";
 
 // ---------------------------------------------------------------------------
 // §43 — the derived handoffPending condition
@@ -250,6 +232,7 @@ export interface PrepareHandoffResult {
   finalPlan: { id: string; revision: number; hash: string };
   reused: boolean;
   binding: { state: "attached" | "detached"; generation: number };
+  executionRun: { executionRunId: string; lifecycle: ExecutionRun["lifecycle"]; reused: boolean };
 }
 
 export interface FinalizeDeliveryInput {
@@ -263,6 +246,7 @@ export interface FinalizeDeliveryInput {
 export interface FinalizeDeliveryResult {
   alreadyDelivered: boolean;
   runRevision: number;
+  executionRun: { executionRunId: string; lifecycle: ExecutionRun["lifecycle"] } | null;
 }
 
 export interface BuildReadAuthority {
@@ -402,6 +386,24 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
             lastEventSeq: preparedSeq,
           }, now);
         }
+        // E1 §10 step 4 — the durable ExecutionRun is prepared in the SAME
+        // transaction that derives/reuses the handoff, before the host handoff
+        // is attempted (the MCP return alone is still not delivery, §36). The
+        // execution-start baseline is exactly the handoff's frozen repository
+        // baseline (E1 §7 — reuse, never a second derivation).
+        const executionRun = prepareExecutionRunForFinalPlanInTx(
+          tx,
+          {
+            run,
+            finalPlanRow,
+            workspaceId: input.workspaceId,
+            executionStartBaseline: handoff.repositoryBaseline,
+            sessionId: input.sessionId,
+            toolUseId: input.toolUseId,
+          },
+          clock,
+          now,
+        );
         const binding = ensureExecutionBindingInTx(tx, {
           runId: input.runId,
           workspaceId: input.workspaceId,
@@ -442,6 +444,11 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
           },
           reused,
           binding: { state: binding.state, generation: binding.generation },
+          executionRun: {
+            executionRunId: executionRun.executionRun.executionRunId,
+            lifecycle: executionRun.executionRun.lifecycle,
+            reused: executionRun.reused,
+          },
         };
       });
     },
@@ -465,7 +472,23 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
           if (input.responseHandoffId !== handoffRow.handoffId) {
             throw handoffError("HANDOFF_DELIVERY_INVALID", "delivery response names a different handoff");
           }
-          return { alreadyDelivered: true, runRevision: run.revision };
+          // E1 §13 — converged replay: the exact ExecutionRun must be active
+          // (T6/T10 — recovery never creates another run). A missing row is a
+          // legacy v0.1 completion (delivered before the ExecutionRun domain
+          // existed) and stays converged; anything else is invariant corruption.
+          const converged = getExecutionRunBySourcePlanningRunInTx(tx, input.runId);
+          if (converged !== null && converged.lifecycle !== "active") {
+            throw handoffError(
+              "EXECUTION_HANDOFF_INVARIANT",
+              `PlanningRun '${input.runId}' is completed but ExecutionRun '${converged.executionRunId}' is ${converged.lifecycle}`,
+              { runId: input.runId, lifecycle: converged.lifecycle },
+            );
+          }
+          return {
+            alreadyDelivered: true,
+            runRevision: run.revision,
+            executionRun: converged === null ? null : { executionRunId: converged.executionRunId, lifecycle: converged.lifecycle },
+          };
         }
         // §93 — never trust the response alone: exact attempt + stored hashes.
         if (input.responseHandoffId !== handoffRow.handoffId || input.responseHandoffHash !== handoffRow.handoffHash) {
@@ -485,6 +508,21 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
         if (run.lifecycle !== "active") {
           throw handoffError("HANDOFF_DELIVERY_INVALID", `PlanningRun '${input.runId}' is ${run.lifecycle}; delivery cannot complete`);
         }
+        // E1 §10/§13 — the completion gate: the exact prepared ExecutionRun
+        // must exist BEFORE the host transition completes. A missing or
+        // non-prepared run is invariant corruption (never silently healed by
+        // inventing history); recovery is to re-invoke the handoff, which
+        // prepares the run idempotently (T11).
+        const prepared = getExecutionRunBySourcePlanningRunInTx(tx, input.runId);
+        if (prepared === null || prepared.lifecycle !== "prepared") {
+          throw handoffError(
+            "EXECUTION_HANDOFF_INVARIANT",
+            prepared === null
+              ? `no ExecutionRun exists for run '${input.runId}'; invoke phase_plan.handoff again to prepare it`
+              : `ExecutionRun '${prepared.executionRunId}' is ${prepared.lifecycle}; delivery requires a prepared run`,
+            { runId: input.runId, ...(prepared === null ? {} : { lifecycle: prepared.lifecycle }) },
+          );
+        }
         const now = clock.nowIso();
         const deliveredSeq = insertExecutionHandoffEventInTx(tx, {
           runId: input.runId,
@@ -501,6 +539,23 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
           currentAttemptToolUseId: input.toolUseId,
           deliveredAt: now,
         }, now);
+        // E1 §10 step 6 — prepared → active durably (the host handoff has
+        // succeeded above); step 7 below completes the PlanningRun in the
+        // SAME transaction so completion can never precede activation (T11).
+        const activated = activateExecutionRunInTx(tx, prepared.executionRunId, now);
+        // E2 §7 — the initial SupervisorBinding attaches in the SAME
+        // transaction as activation: a newly active run can never be reported
+        // as handed off while having lost its ownership identity.
+        insertAttachedSupervisorBindingInTx(
+          tx,
+          { executionRunId: prepared.executionRunId, workspaceId: run.workspaceId, sessionId: input.sessionId },
+          now,
+        );
+        // E3 §21 — the deterministic initial execution structure (Stage set +
+        // first active Stage + genesis Window rev0) materializes in the SAME
+        // transaction, so a successful fresh handoff reports an active run
+        // whose structure is already durable; the crash boundary is this tx.
+        ensureExecutionStructureInTx(tx, prepared.executionRunId, clock, now);
         // §49/§50 — active → completed, revision +1 exactly once, stage stays final.
         tx.prepare(
           "UPDATE planning_runs SET lifecycle = 'completed', revision = revision + 1, updated_at = ? "
@@ -524,7 +579,11 @@ export function createHandoffService(store: PlanStore, clock: StoreClock) {
           // Recovery paths may have detached already; detached planning
           // authority at delivery time is the correct end state.
         }
-        return { alreadyDelivered: false, runRevision: completed.revision };
+        return {
+          alreadyDelivered: false,
+          runRevision: completed.revision,
+          executionRun: { executionRunId: activated.executionRunId, lifecycle: activated.lifecycle },
+        };
       });
     },
 

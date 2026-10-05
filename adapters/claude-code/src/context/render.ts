@@ -31,9 +31,9 @@ export function runSegment(context: PhasePlanContext): CapsuleSegment {
     name: "run",
     required: true,
     text: [
-      "Run:",
+      "PlanningRun:",
       indent([
-        `id=${context.run.runId}`,
+        `planning_run_id=${context.run.runId}`,
         `lifecycle=${context.run.lifecycle}`,
         `stage=${context.run.stage}`,
         `revision=${context.run.revision}`,
@@ -281,7 +281,7 @@ export function successorBaselineSegment(context: PhasePlanContext): CapsuleSegm
       indent([
         `Successor PlanningRun: ${context.run.runId} (${context.run.stage}, revision ${context.run.revision})`,
         `Baseline FinalPlan: ${successor.finalPlan.id} (${successor.finalPlan.hash})`,
-        `Predecessor run: ${successor.predecessorRunId} (completed, immutable)`,
+        `Predecessor PlanningRun: ${successor.predecessorRunId} (completed, immutable)`,
         `Execution issues adopted: ${successor.issueSummaries.length} (issue set ${successor.issueSetHash})`,
         indent(issues),
         `Reopened scope: needs_review=[${successor.needsReviewSections.join(", ") || "none"}]`,

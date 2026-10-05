@@ -8,6 +8,7 @@ import * as esbuild from "esbuild";
 
 import { sqliteBackupAvailable } from "../src/store/connection.js";
 import { initializePlanStore } from "../src/store/sqlite-store.js";
+import { SUPPORTED_SCHEMA_VERSION } from "../src/store/constants.js";
 import {
   createSchema0Database,
   ensureStoreDir,
@@ -102,7 +103,7 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // Every caller ends in a valid state reporting the SAME store identity.
       for (const result of results) {
         expect(result.ok, JSON.stringify(result)).toBe(true);
-        expect(result.schemaVersion).toBe(13);
+        expect(result.schemaVersion).toBe(26);
       }
       const storeIds = new Set(results.map((r) => r.storeId));
       expect(storeIds.size).toBe(1);
@@ -111,26 +112,39 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
       // sentinel preserved, integrity clean, exactly one published backup.
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(13);
+        expect(store.getSchemaVersion()).toBe(26);
         expect(store.getStoreMetadata().storeId).toBe(results[0]?.storeId);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
         ) as { version: number; name: string }[];
         expect(history).toEqual([
-          { version: 1, name: "initialize-plan-store" },
-          { version: 2, name: "workspace-and-session-binding" },
-          { version: 3, name: "planning-run-foundation" },
-          { version: 4, name: "plan-memory-foundation" },
-          { version: 5, name: "proposal-approval-plan-commit" },
-          { version: 6, name: "observation-evidence-foundation" },
-          { version: 7, name: "evidence-freshness-foundation" },
-          { version: 8, name: "section-workflow" },
-          { version: 9, name: "synthesis-validation-foundation" },
-	  { version: 10, name: "finalization-final-plan" },
-	  { version: 11, name: "execution-handoff-foundation" },
-			{ version: 12, name: "execution-issue-successor-baseline" },
-		{ version: 13, name: "run-control-authorizations" },
-        ]);
+        { version: 1, name: "initialize-plan-store" },
+        { version: 2, name: "workspace-and-session-binding" },
+        { version: 3, name: "planning-run-foundation" },
+        { version: 4, name: "plan-memory-foundation" },
+        { version: 5, name: "proposal-approval-plan-commit" },
+        { version: 6, name: "observation-evidence-foundation" },
+        { version: 7, name: "evidence-freshness-foundation" },
+        { version: 8, name: "section-workflow" },
+        { version: 9, name: "synthesis-validation-foundation" },
+        { version: 10, name: "finalization-final-plan" },
+        { version: 11, name: "execution-handoff-foundation" },
+        { version: 12, name: "execution-issue-successor-baseline" },
+        { version: 13, name: "run-control-authorizations" },
+        { version: 14, name: "execution-run-foundation" },
+        { version: 15, name: "supervisor-binding-foundation" },
+        { version: 16, name: "execution-structure-foundation" },
+        { version: 17, name: "execution-protocol-foundation" },
+        { version: 18, name: "worker-invocation-foundation" },
+        { version: 19, name: "acceptance-foundation" },
+        { version: 20, name: "stage-completion-provenance" },
+        { version: 21, name: "verification-policy-conflict-foundation" },
+        { version: 22, name: "replan-required-foundation" },
+        { version: 23, name: "execution-scope-foundation" },
+        { version: 24, name: "attempt-reconciliation-foundation" },
+        { version: 25, name: "execution-abort-foundation" },
+        { version: 26, name: "execution-run-identity-foundation" },
+      ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -155,13 +169,27 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "evidence_observation_refs",
         "evidence_revisions",
         "evidence_validation_events",
+        "execution_abort_records",
+      "execution_acceptance_events",
+        "execution_attempt_reconciliation_bindings",
+        "execution_attempt_reconciliations",
+        "execution_attempts",
         "execution_bindings",
+        "execution_commits",
+        "execution_directives",
         "execution_handoff_events",
         "execution_handoff_states",
         "execution_handoffs",
         "execution_issue_adoptions",
         "execution_issue_refs",
         "execution_issues",
+        "execution_protocol_events",
+        "execution_reports",
+        "execution_run_events",
+        "execution_runs",
+        "execution_stages",
+        "execution_worker_invocation_events",
+        "execution_worker_invocations",
         "final_plan_candidate_refs",
         "final_plan_candidates",
         "final_plans",
@@ -194,11 +222,17 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
         "snapshot_members",
         "sqlite_sequence",
         "store_metadata",
+        "supervisor_assessment_report_judgments",
+        "supervisor_assessments",
+        "supervisor_binding_events",
+        "supervisor_bindings",
         "synthesis_input_evidence",
         "synthesis_input_refs",
         "synthesis_inputs",
         "synthesis_manifest_refs",
         "synthesis_manifests",
+        "verification_conflicts",
+        "verification_windows",
         "workspaces",
       ]);
     } finally {
@@ -213,13 +247,13 @@ describe.skipIf(!backupSupported)("real multi-process initialization (E24/§36/E
     try {
       const store = await initializePlanStore({ pluginDataRoot: root });
       store.close();
-      rawSetSchemaVersion(storePathsFor(root).databasePath, 14);
+      rawSetSchemaVersion(storePathsFor(root).databasePath, SUPPORTED_SCHEMA_VERSION + 1);
 
       const worker = await bundleWorker(bundledDir);
       const result = await runWorker(worker, root, 2000);
       expect(result).toMatchObject({ ok: false, code: "STORE_SCHEMA_TOO_NEW" });
-      // Untouched.
-      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(14);
+      // Untouched — still at the unsupported version the worker refused.
+      expect(rawConnectionQueried(storePathsFor(root).databasePath)).toBe(SUPPORTED_SCHEMA_VERSION + 1);
     } finally {
       removeTempPluginDataRoot(root);
       fs.rmSync(bundledDir, { recursive: true, force: true });

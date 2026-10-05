@@ -1,5 +1,5 @@
 /**
- * Phase 17 §36 — tool-surface capability matrix (E37): all 18 tools invoked
+ * Phase 17 §36 — tool-surface capability matrix (E37): all 23 tools invoked
  * through the REAL MCP dispatcher in every major lifecycle state; every cell
  * must be either an allowed outcome or a STABLE TYPED DENIAL — never a raw
  * error, never a silent write.
@@ -70,7 +70,7 @@ function probeBusiness(tool: string): Record<string, unknown> {
 
 
 
-describe("Phase 17 §36 — 18-tool capability matrix across lifecycle states (E37)", () => {
+describe("Phase 17 §36 — 32-tool capability matrix across lifecycle states (E37)", () => {
   const matrix: Record<string, Record<string, string>> = {};
 
   for (const state of STATES) {
@@ -180,7 +180,11 @@ describe("Phase 17 §36 — 18-tool capability matrix across lifecycle states (E
       expect(matrix[state]!.handoff, state).toBe("HOST_CONTEXT_REQUIRED");
     }
     expect(matrix.discovery!.takeover_run).toBe("TAKEOVER_NOT_REQUIRED");
-    expect(matrix["completed-build"]!.takeover_run).toBe("RUN_TERMINAL");
+    // E2 §12 — the completed-build takeover now routes to the execution-
+    // supervision branch; the matrix probes as the session that delivered the
+    // handoff (already the supervision owner), so the typed refusal is
+    // "resume instead", never a silent second owner.
+    expect(matrix["completed-build"]!.takeover_run).toBe("TAKEOVER_NOT_REQUIRED");
     // Build reads under planning authority are refused (§66); under stale
     // execution authority the execution read degrades typed as well.
     expect(matrix["completed-build"]!.report_execution_issue).toBe("EXECUTION_ISSUE_SCOPE_INVALID");

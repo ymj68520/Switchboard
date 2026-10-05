@@ -81,7 +81,41 @@ export type HostContextLogicalTool =
   | "handoff"
   | "report_execution_issue"
   | "takeover_run"
-  | "abort_run";
+  | "abort_run"
+  // v0.2.0 E13 — the human-authorized ExecutionRun abort (control plane;
+  // explicitly NOT supervisor-owned mutation).
+  | "abort_execution_run"
+  // v0.2.0 A1-II — explicit human-authorized same-FinalPlan reexecution
+  // (control plane; the resulting ExecutionRun does not exist at
+  // authorization time, so the target is FinalPlanRef + WorkspaceIdentity).
+  | "reexecute_final_plan"
+  // v0.2.0 E5 — worker runtime + supervisor execution operations.
+  | "worker_claim"
+  | "worker_get_assignment"
+  | "worker_submit_report"
+  | "issue_execution_directive"
+  | "start_worker_attempt"
+  // v0.2.0 E6 — supervisor acceptance surface.
+  | "get_execution_acceptance_context"
+  | "submit_supervisor_assessment"
+  // v0.2.0 E7 — execution progression surface.
+  | "get_execution_progression_context"
+  | "continue_execution_stage"
+  | "activate_execution_stage"
+  // v0.2.0 E8 — verification policy + bounded conflict orchestration surface.
+  | "get_verification_policy_context"
+  | "declare_verification_conflict"
+  | "resolve_verification_conflict"
+  // v0.2.0 E9 — the controlled return-to-planning boundary.
+  | "request_execution_replan"
+  // v0.2.0 E10 — final execution closure + ExecutionCompletionGate surface.
+  | "get_execution_final_closure_context"
+  | "begin_execution_final_closure"
+  // v0.2.0 E11 — crash/interruption recovery + reconciliation surface.
+  | "get_attempt_recovery_context"
+  | "retry_unclaimed_worker_launch"
+  | "issue_attempt_reconciliation"
+  | "resolve_indeterminate_attempt";
 
 export interface BuildHostContextInput {
   sessionId: string;

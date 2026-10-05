@@ -44,6 +44,7 @@ import {
   type ExecutionIssueRefRow,
   type ExecutionIssueRow,
 } from "../store/execution-issues.js";
+import { getExecutionRunInTx } from "../store/execution-runs.js";
 import type { PlanStore } from "../store/sqlite-store.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import type { StoreTx } from "../store/transaction.js";
@@ -60,7 +61,7 @@ function issueError(
 }
 
 export interface ReportExecutionIssueInput {
-  runId: string;
+  executionRunId: string;
   workspaceId: string;
   workspaceRoot: string;
   sessionId: string;
@@ -118,14 +119,24 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
         // §13 — the Store side of the execution authority: completed run +
         // approved FinalPlan + delivered handoff + attached exact-session
         // binding with the exact generation.
+        // A1 §16 — the build-read authority is PlanningRun-scoped (initial
+        // handoff/delivery metadata): resolve the exact run first and use its
+        // source-planning provenance for the Class-D authority check.
+        const executionRun = getExecutionRunInTx(tx, input.executionRunId);
+        if (executionRun === null) {
+          throw new RuntimeError("EXECUTION_RUN_NOT_FOUND", `no ExecutionRun exists for '${input.executionRunId}'`, {
+            detail: { executionRunId: input.executionRunId },
+            recoverable: false,
+          });
+        }
         const authority = handoffService.requireBuildReadAuthorityInTx(tx, {
           sessionId: input.sessionId,
           workspaceId: input.workspaceId,
-          runId: input.runId,
+          runId: executionRun.runId,
           finalPlanId: input.finalPlanId,
           generation: input.executionBindingGeneration,
         });
-        const plan = parseFinalPlanCanonical(authority.finalPlanRow.canonicalJson, input.runId);
+        const plan = parseFinalPlanCanonical(authority.finalPlanRow.canonicalJson, input.executionRunId);
 
         // §11 — no completely unscoped issue exists.
         if (input.affectedRefs.length === 0) {
@@ -146,7 +157,7 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
 
         const now = clock.nowIso();
         const operationId = `execution-issue:${input.toolUseId}`;
-        const prior = findExecutionIssueByOperationInTx(tx, input.runId, operationId);
+        const prior = findExecutionIssueByOperationInTx(tx, input.executionRunId, operationId);
         if (prior !== null) {
           // §15 — same operation id: the STORED semantic payload decides.
           // The repository context is server-derived, so git drift between
@@ -165,7 +176,7 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
               { detail: { issueId: prior.issueId } },
             );
           }
-          const openIssues = countOpenExecutionIssuesInTx(tx, input.runId);
+          const openIssues = countOpenExecutionIssuesInTx(tx, input.executionRunId);
           return {
             issueId: prior.issueId,
             issueHash: prior.issueHash,
@@ -202,7 +213,8 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
         insertExecutionIssueInTx(
           tx,
           {
-            runId: input.runId,
+            runId: executionRun.runId,
+            executionRunId: input.executionRunId,
             issueId,
             finalPlanId: authority.finalPlanRow.finalPlanId,
             finalPlanHash: authority.finalPlanRow.finalPlanHash,
@@ -221,7 +233,7 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
           refs,
           now,
         );
-        const openIssues = countOpenExecutionIssuesInTx(tx, input.runId);
+        const openIssues = countOpenExecutionIssuesInTx(tx, input.executionRunId);
         return {
           issueId,
           issueHash,
@@ -237,16 +249,16 @@ export function createExecutionIssueService(store: PlanStore, clock: StoreClock)
     },
 
     /** §19 — the Build-view projection: open issues + replanRequired. */
-    openIssuesForRun(runId: string): { issues: ExecutionIssueRow[]; openCount: number; replanRequired: boolean } {
+    openIssuesForRun(executionRunId: string): { issues: ExecutionIssueRow[]; openCount: number; replanRequired: boolean } {
       return store.withRead((tx) => {
-        const issues = listOpenExecutionIssuesInTx(tx, runId);
+        const issues = listOpenExecutionIssuesInTx(tx, executionRunId);
         return { issues, openCount: issues.length, replanRequired: issues.length > 0 };
       });
     },
 
     /** §19 — the count the PreToolUse mutation guard checks. */
-    countOpenIssues(runId: string): number {
-      return store.withRead((tx) => countOpenExecutionIssuesInTx(tx, runId));
+    countOpenIssues(executionRunId: string): number {
+      return store.withRead((tx) => countOpenExecutionIssuesInTx(tx, executionRunId));
     },
   };
 }

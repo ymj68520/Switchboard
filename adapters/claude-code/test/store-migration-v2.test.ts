@@ -130,20 +130,33 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
         ) as { version: number; name: string }[];
         expect(history).toEqual([
-          { version: 1, name: "initialize-plan-store" },
-          { version: 2, name: "workspace-and-session-binding" },
-          { version: 3, name: "planning-run-foundation" },
-          { version: 4, name: "plan-memory-foundation" },
-          { version: 5, name: "proposal-approval-plan-commit" },
-          { version: 6, name: "observation-evidence-foundation" },
-          { version: 7, name: "evidence-freshness-foundation" },
-          { version: 8, name: "section-workflow" },
-          { version: 9, name: "synthesis-validation-foundation" },
-	  { version: 10, name: "finalization-final-plan" },
-	  { version: 11, name: "execution-handoff-foundation" },
-			{ version: 12, name: "execution-issue-successor-baseline" },
-		{ version: 13, name: "run-control-authorizations" },
-        ]);
+        { version: 1, name: "initialize-plan-store" },
+        { version: 2, name: "workspace-and-session-binding" },
+        { version: 3, name: "planning-run-foundation" },
+        { version: 4, name: "plan-memory-foundation" },
+        { version: 5, name: "proposal-approval-plan-commit" },
+        { version: 6, name: "observation-evidence-foundation" },
+        { version: 7, name: "evidence-freshness-foundation" },
+        { version: 8, name: "section-workflow" },
+        { version: 9, name: "synthesis-validation-foundation" },
+        { version: 10, name: "finalization-final-plan" },
+        { version: 11, name: "execution-handoff-foundation" },
+        { version: 12, name: "execution-issue-successor-baseline" },
+        { version: 13, name: "run-control-authorizations" },
+        { version: 14, name: "execution-run-foundation" },
+        { version: 15, name: "supervisor-binding-foundation" },
+        { version: 16, name: "execution-structure-foundation" },
+        { version: 17, name: "execution-protocol-foundation" },
+        { version: 18, name: "worker-invocation-foundation" },
+        { version: 19, name: "acceptance-foundation" },
+        { version: 20, name: "stage-completion-provenance" },
+        { version: 21, name: "verification-policy-conflict-foundation" },
+        { version: 22, name: "replan-required-foundation" },
+        { version: 23, name: "execution-scope-foundation" },
+        { version: 24, name: "attempt-reconciliation-foundation" },
+        { version: 25, name: "execution-abort-foundation" },
+        { version: 26, name: "execution-run-identity-foundation" },
+      ]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM phase2_sentinel").all(),
         ) as { note: string }[];
@@ -154,7 +167,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-13-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-1-26-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       // The backup captures the SOURCE state (schema 1 + sentinel).
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
@@ -225,7 +238,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(13);
+      expect(retry.getSchemaVersion()).toBe(26);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);
@@ -241,7 +254,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       makeSchema1Store(root);
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(13);
+        expect(store.getSchemaVersion()).toBe(26);
       } finally {
         store.close();
       }
@@ -285,11 +298,11 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
       createSchema0Database(databasePath, "chain-sentinel");
       const store = await initializePlanStore({ pluginDataRoot: root });
       try {
-        expect(store.getSchemaVersion()).toBe(13);
+        expect(store.getSchemaVersion()).toBe(26);
         const history = store.withRead((tx) =>
           tx.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
         ) as { version: number }[];
-        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        expect(history.map((h) => h.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
         const sentinel = store.withRead((tx) =>
           tx.prepare("SELECT note FROM legacy_marker").all(),
         ) as { note: string }[];
@@ -298,7 +311,7 @@ describe("migration 1 → 2 (E1/E26/§43)", () => {
         store.close();
       }
       expect(publishedBackups(backupsDir)).toHaveLength(1);
-      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-13-/);
+      expect(publishedBackups(backupsDir)[0]).toMatch(/^phase-plan-pre-schema-0-26-/);
     } finally {
       removeTempPluginDataRoot(root);
     }

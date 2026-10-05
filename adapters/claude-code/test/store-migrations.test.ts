@@ -10,6 +10,19 @@ import { createFinalizationFinalPlanMigration } from "../src/store/migrations/01
 import { createExecutionHandoffMigration } from "../src/store/migrations/011-execution-handoff-foundation.js";
 import { createExecutionIssueSuccessorBaselineMigration } from "../src/store/migrations/012-execution-issue-successor-baseline.js";
 import { createRunControlAuthorizationsMigration } from "../src/store/migrations/013-run-control-authorizations.js";
+import { createExecutionRunMigration } from "../src/store/migrations/014-execution-run-foundation.js";
+import { createSupervisorBindingMigration } from "../src/store/migrations/015-supervisor-binding-foundation.js";
+import { createExecutionStructureMigration } from "../src/store/migrations/016-execution-structure-foundation.js";
+import { createExecutionProtocolMigration } from "../src/store/migrations/017-execution-protocol-foundation.js";
+import { createWorkerInvocationMigration } from "../src/store/migrations/018-worker-invocation-foundation.js";
+import { createAcceptanceFoundationMigration } from "../src/store/migrations/019-acceptance-foundation.js";
+import { createStageCompletionProvenanceMigration } from "../src/store/migrations/020-stage-completion-provenance.js";
+import { createVerificationPolicyConflictMigration } from "../src/store/migrations/021-verification-policy-conflict.js";
+import { createReplanRequiredFoundationMigration } from "../src/store/migrations/022-replan-required-foundation.js";
+import { createExecutionScopeFoundationMigration } from "../src/store/migrations/023-execution-scope-foundation.js";
+import { createAttemptReconciliationFoundationMigration } from "../src/store/migrations/024-attempt-reconciliation-foundation.js";
+import { createExecutionAbortFoundationMigration } from "../src/store/migrations/025-execution-abort-foundation.js";
+import { createExecutionRunIdentityMigration } from "../src/store/migrations/026-execution-run-identity-foundation.js";
 import { createInitializeMigration } from "../src/store/migrations/001-initialize.js";
 import { createPlanningRunMigration } from "../src/store/migrations/003-planning-run-foundation.js";
 import { createPlanMemoryMigration } from "../src/store/migrations/004-plan-memory-foundation.js";
@@ -103,6 +116,19 @@ describe("migration failure semantics (E14/§22)", () => {
             createExecutionHandoffMigration(),
             createExecutionIssueSuccessorBaselineMigration(),
             createRunControlAuthorizationsMigration(),
+            createExecutionRunMigration(),
+            createSupervisorBindingMigration(),
+            createExecutionStructureMigration(),
+            createExecutionProtocolMigration(),
+            createWorkerInvocationMigration(),
+            createAcceptanceFoundationMigration(),
+            createStageCompletionProvenanceMigration(),
+            createVerificationPolicyConflictMigration(),
+            createReplanRequiredFoundationMigration(),
+            createExecutionScopeFoundationMigration(),
+            createAttemptReconciliationFoundationMigration(),
+            createExecutionAbortFoundationMigration(),
+            createExecutionRunIdentityMigration(),
           ],
         }),
       ).rejects.toMatchObject({
@@ -155,6 +181,19 @@ describe("migration failure semantics (E14/§22)", () => {
             createExecutionHandoffMigration(),
             createExecutionIssueSuccessorBaselineMigration(),
             createRunControlAuthorizationsMigration(),
+            createExecutionRunMigration(),
+            createSupervisorBindingMigration(),
+            createExecutionStructureMigration(),
+            createExecutionProtocolMigration(),
+            createWorkerInvocationMigration(),
+            createAcceptanceFoundationMigration(),
+            createStageCompletionProvenanceMigration(),
+            createVerificationPolicyConflictMigration(),
+            createReplanRequiredFoundationMigration(),
+            createExecutionScopeFoundationMigration(),
+            createAttemptReconciliationFoundationMigration(),
+            createExecutionAbortFoundationMigration(),
+            createExecutionRunIdentityMigration(),
           ],
           clock,
         }),

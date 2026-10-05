@@ -82,9 +82,60 @@ import {
   type ExecutionIssueKind,
 } from "../core/execution-issue.js";
 import { getExecutionHandoffInTx, getExecutionHandoffStateInTx, findAttachedExecutionBindingForSessionInTx } from "../store/execution.js";
+import { getExecutionRunInTx, listExecutionRunsBySourcePlanningRunInTx } from "../store/execution-runs.js";
+import { getSupervisorBindingInTx } from "../store/supervisor-bindings.js";
 import { assertExecutionHostContextForTool, parseSignedHostContext, type ExecutionHostContextV1 } from "../host/execution-context.js";
+import { assertWorkerHostContextForTool } from "../host/worker-context.js";
+import {
+  claimWorkerAttemptInTx,
+  loadWorkerAssignment,
+  startWorkerAttemptAndPrepareLaunchInTx,
+  submitWorkerReportAndFinishInTx,
+} from "../application/worker-runtime-service.js";
+import {
+  issueExecutionDirectiveInTx,
+  type IssueExecutionDirectiveInput,
+} from "../application/execution-directive-service.js";
+import {
+  loadExecutionAcceptanceContextInTx,
+  normalizeSnakeRecord,
+  submitSupervisorAssessmentInTx,
+} from "../application/acceptance-service.js";
+import {
+  loadVerificationPolicyStateInTx,
+} from "../application/verification-policy-service.js";
+import {
+  declareVerificationConflictInTx,
+  resolveVerificationConflictInTx,
+} from "../application/verification-conflict-service.js";
+import {
+  activateExecutionStageInTx,
+  continueExecutionStageInTx,
+  loadExecutionProgressionContextInTx,
+} from "../application/execution-progression-service.js";
+import { requestExecutionReplanInTx } from "../application/execution-replan-service.js";
+import {
+  beginExecutionFinalClosureInTx,
+  loadExecutionFinalClosureContextInTx,
+} from "../application/final-closure-service.js";
+import {
+  issueAttemptReconciliationInTx,
+  loadAttemptRecoveryContextInTx,
+  resolveIndeterminateAttemptInTx,
+  retryUnclaimedLaunchInTx,
+} from "../application/attempt-recovery-service.js";
+import {
+  SUPERVISOR_ASSESSMENT_DISPOSITIONS,
+  type SupervisorAssessmentDisposition,
+} from "../core/supervisor-assessment.js";
+import type { DirectivePlanRef, ExecutionDirective, ExecutionDirectiveKind } from "../core/execution-directive.js";
+import type { ExecutionReportResult } from "../core/execution-report.js";
+import type { StartExecutionAttemptInput } from "../application/execution-attempt-service.js";
+import type { SubmitExecutionReportInput } from "../application/execution-report-service.js";
 import { assertWritableBindingInTx, getBinding } from "../store/session-bindings.js";
 import { createRunControlService } from "../application/run-control-service.js";
+import { createExecutionAbortService } from "../application/execution-abort-service.js";
+import { createReexecutionService } from "../application/reexecution-service.js";
 import { runControlRequestHash } from "../store/run-control.js";
 import {
   getLatestSynthesisInputInTx,
@@ -581,6 +632,9 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       + "selects the exact run from selection_required. Ownership moves to this session with binding generation G → G+1 and "
       + "the previous owner is fenced immediately — even while still alive (no liveness checks exist). Control-plane only: "
       + "the run's revision, stage, HEAD, Plan Memory, Proposals, and Evidence are untouched and no new run is created. "
+      + "If the named run's planning lifecycle is completed but its ExecutionRun is ACTIVE, this performs the explicit "
+      + "execution-supervision takeover instead: supervision ownership moves to this session with the supervision generation "
+      + "advanced by exactly one (an unbound run establishes generation 1) and the prior generation is permanently fenced. "
       + "This tool always requires explicit human approval and cannot be pre-authorized.",
     inputSchema: {
       type: "object",
@@ -589,7 +643,10 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         expected_binding_generation: {
           type: "integer",
           minimum: 1,
-          description: "The binding generation reported in selection_required; a stale-precondition fence, never authority.",
+          description:
+            "The binding generation reported in selection_required or the execution recovery context; a stale-precondition "
+            + "fence, never authority. For an execution-supervision takeover this is the SUPERVISION generation (an unbound "
+            + "run establishes generation 1 regardless).",
         },
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
@@ -617,6 +674,708 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
     },
     _meta: REQUIRES_USER_INTERACTION_META,
   },
+  {
+    name: "abort_execution_run",
+    description:
+      "Human-authorized terminal abort of an EXACT ExecutionRun (E13): the control-plane exception that stops the execution "
+      + "protocol permanently. Unlike supervisor mutations it does NOT require current writable supervision ownership — a "
+      + "detached, fenced, or recovery session may request it on the user's behalf, because the HUMAN authorization (mandatory "
+      + "confirmation dialog) is the sole abort authority. abort means STOP: the open VerificationWindow (if any) closes as "
+      + "aborted, prepared Worker launch credentials are revoked, claimed Workers lose all future Phase Plan authority, the "
+      + "SupervisorBinding detaches, and the run becomes terminal (aborted) forever. It is NOT acceptance, failure, rollback, "
+      + "or replanning: acceptedHead, candidateRevision, Stage states, Attempts, Reports, Commits, and Issues are preserved "
+      + "exactly, the workspace is never rolled back, and no cleanup work is issued. The run_id must be the exact target "
+      + "(never inferred); the reason is required and becomes durable provenance.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "The EXACT ExecutionRun id to abort (from the recovery context or the user; never inferred)." },
+        reason: { type: "string", description: "Required non-empty: why the user is aborting this run (durable audit provenance)." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+    required: ["run_id", "reason", "_hostContext"],
+    additionalProperties: false,
+  },
+  _meta: REQUIRES_USER_INTERACTION_META,
+  },
+  {
+    name: "reexecute_final_plan",
+    description:
+      "Human-authorized explicit reexecution (A1-II): create a NEW ExecutionRun of an EXACT previously executed FinalPlan "
+      + "(id@revision + hash — no latest/current-plan resolution) in a workspace, after that FinalPlan's initial delivery is "
+      + "complete. Reexecution is NOT replanning and NOT the initial handoff: it creates no PlanningRun, no FinalPlan, no "
+      + "PlanCommit, no Approval, and no ExecutionIssue; it never reopens the completed source PlanningRun, never reactivates "
+      + "or rebinds a prior ExecutionRun, never touches the initial handoff or ExecutionBinding history, and never inherits "
+      + "execution memory (fresh acceptedHead, Stages, Windows, Directives, Attempts, Commits). The authorization target is "
+      + "the exact FinalPlanRef + this workspace — you never name a predecessor run. The same workspace holds at most one "
+      + "prepared|active ExecutionRun; terminal prior runs never block. Retrying the same authorized request converges on "
+      + "the SAME new run; a changed target under the same operation id fails closed. This tool always requires explicit "
+      + "human approval and cannot be pre-authorized.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_planning_run_id: { type: "string", description: "The completed PlanningRun whose approved FinalPlan is being reexecuted (provenance plan_…)." },
+        final_plan_id: { type: "string", description: "The EXACT committed FinalPlan id (never a latest/current resolution)." },
+        final_plan_revision: { type: "integer", minimum: 1, description: "The EXACT committed FinalPlan revision." },
+        final_plan_hash: { type: "string", description: "The EXACT committed FinalPlan hash; a mismatch fails closed." },
+        reason: { type: "string", description: "Optional audit note; never affects legality." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["source_planning_run_id", "final_plan_id", "final_plan_revision", "final_plan_hash", "_hostContext"],
+      additionalProperties: false,
+    },
+    _meta: REQUIRES_USER_INTERACTION_META,
+  },
+
+  {
+    name: "issue_execution_directive",
+    description:
+      "Supervisor-only: issue an immutable ExecutionDirective revision under this session's fenced execution supervision. "
+      + "Scope is explicit (E10): a STAGE directive binds stage_id (the current active Stage's open window); a FINAL-CLOSURE "
+      + "directive omits stage_id and sets scope_kind='final_closure' (the open Final Closure Window — run-level integration, "
+      + "inspection, verification, or semantic-preserving rework). Core binds the exact run/FinalPlan/scope/Window/candidateRevision "
+      + "and accepted base; the capability envelope must be the complete explicit 8-field object. Once issued the revision is "
+      + "immutable — changing instructions requires a new revision, and a logical directive can never switch scope (E10 §19).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["implementation", "inspection", "verification"] },
+        stage_id: { type: "string", description: "The CURRENT active execution stage id. Omit exactly when scope_kind='final_closure'." },
+        scope_kind: {
+          type: "string",
+          enum: ["final_closure"],
+          description: "Final-closure scope: omit stage_id and set this to issue a run-level final-closure directive (E10 §5/§16).",
+        },
+        window_id: { type: "string", description: "The CURRENT open verification window id." },
+        objective: { type: "string" },
+        body: { type: "string", description: "Detailed worker instruction; structured fields stay the machine-checkable authority." },
+        directive_id: { type: "string", description: "Logical directive id; generated when omitted." },
+        revision: { type: "integer", minimum: 1, description: "Exact revision; defaults to the next revision of the logical directive." },
+        final_plan_ref: {
+          type: "object",
+          properties: { id: { type: "string" }, revision: { type: "integer", minimum: 1 }, hash: { type: "string" } },
+          required: ["id", "revision", "hash"],
+          additionalProperties: false,
+          description: "Optional; must equal the run's permanent FinalPlan binding when supplied.",
+        },
+        base_candidate_revision: { type: "integer", minimum: 0, description: "Optional; must equal the window's current revision when supplied." },
+        plan_refs: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } },
+            required: ["kind", "id", "revision"],
+            additionalProperties: false,
+          },
+          description: "Exact approved plan refs provable from the bound FinalPlan.",
+        },
+        expected_execution_scope: {
+          type: "object",
+          properties: {
+            files: { type: "array", items: { type: "string" } },
+            symbols: { type: "array", items: { type: "string" } },
+            callPaths: { type: "array", items: { type: "string" } },
+            tests: { type: "array", items: { type: "string" } },
+          },
+          additionalProperties: false,
+          description: "Guidance only — never a path allowlist.",
+        },
+        capability_envelope: {
+          type: "object",
+          properties: {
+            repositoryRead: { type: "boolean" },
+            repositoryWrite: { type: "boolean" },
+            commandExecution: { type: "boolean" },
+            networkAccess: { type: "boolean" },
+            dependencyMutation: { type: "boolean" },
+            gitCommit: { type: "boolean" },
+            gitPush: { type: "boolean" },
+            externalServiceMutation: { type: "boolean" },
+          },
+          required: [
+            "repositoryRead",
+            "repositoryWrite",
+            "commandExecution",
+            "networkAccess",
+            "dependencyMutation",
+            "gitCommit",
+            "gitPush",
+            "externalServiceMutation",
+          ],
+          additionalProperties: false,
+          description: "Complete, explicit, role-independent. commandExecution=true with any restricted semantic category refuses to launch (unenforceable).",
+        },
+        invariants: { type: "array", items: { type: "object", properties: { statement: { type: "string" } }, required: ["statement"], additionalProperties: false } },
+        required_actions: { type: "array", items: { type: "object", properties: { action: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["action", "detail"], additionalProperties: false } },
+        forbidden_actions: { type: "array", items: { type: "object", properties: { action: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["action", "detail"], additionalProperties: false } },
+        validation_requirements: { type: "array", items: { type: "object", properties: { requirement: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["requirement", "detail"], additionalProperties: false } },
+        deliverables: { type: "array", items: { type: "object", properties: { name: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["name", "detail"], additionalProperties: false } },
+        stop_conditions: { type: "array", items: { type: "object", properties: { condition: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["condition", "detail"], additionalProperties: false } },
+        report_contract: {
+          type: "object",
+          properties: {
+            requireActionsPerformed: { type: "boolean" },
+            requireFilesExamined: { type: "boolean" },
+            requireFilesChanged: { type: "boolean" },
+            requireCommandsRun: { type: "boolean" },
+            requireTestsRun: { type: "boolean" },
+            requireFindings: { type: "boolean" },
+            requireDeviations: { type: "boolean" },
+            requireBlockers: { type: "boolean" },
+            requireDeliverables: { type: "boolean" },
+          },
+          required: [
+            "requireActionsPerformed",
+            "requireFilesExamined",
+            "requireFilesChanged",
+            "requireCommandsRun",
+            "requireTestsRun",
+            "requireFindings",
+            "requireDeviations",
+            "requireBlockers",
+            "requireDeliverables",
+          ],
+          additionalProperties: false,
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["kind", "window_id", "objective", "body", "capability_envelope", "report_contract", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "start_worker_attempt",
+    description:
+      "Supervisor-only: start the one logical running Attempt for an exact Directive revision and prepare the one-time worker "
+      + "launch package. Returns the plaintext launch token EXACTLY ONCE (only its hash is durable). Launch the native "
+      + "phase-plan execution-worker subagent with ONLY attempt_id + launch_token + claim instruction — never the Directive. "
+      + "An already claimed/finished attempt cannot be relaunched; an unenforceable capability envelope refuses here.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        directive_id: { type: "string" },
+        directive_revision: { type: "integer", minimum: 1 },
+        directive_hash: { type: "string", description: "The exact issued revision hash — a mismatched hash is refused." },
+        worker_role: { type: "string", enum: ["executor", "verifier"] },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["directive_id", "directive_revision", "directive_hash", "worker_role", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "worker_claim",
+    description:
+      "ExecutionWorker-only: claim your exact Attempt with the one-time launch token from your launch package. The worker "
+      + "session identity is the signed host subagent identity — a second session can never claim the same attempt. After a "
+      + "successful claim, load your assignment and never accept the launch prompt as authority.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        attempt_id: { type: "string" },
+        launch_token: { type: "string", description: "The one-time token from your launch package; consumed by this call." },
+        _hostContext: { type: "string", description: "Signed worker host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["attempt_id", "launch_token", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "worker_get_assignment",
+    description:
+      "ExecutionWorker-only: load your exact assignment — the bound Directive (id/revision/hash/kind/objective/envelope/body/"
+      + "report contract), ONLY your Directive's resolved approved plan refs, run/stage/window identity, and the accepted base. "
+      + "No other Plan Memory, no supervisor reasoning, and (for verifiers) no Executor context is included — by design.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed worker host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "worker_submit_report",
+    description:
+      "ExecutionWorker-only: submit exactly one structured ExecutionReport for YOUR claimed attempt (identity is derived from "
+      + "your claim, never from arguments). result=blocked requires at least one structured blocker; blockers are invalid on "
+      + "non-blocked results. candidate_mutated=true atomically advances the window candidateRevision. The report is immutable; "
+      + "the invocation finishes on success — return a compact acknowledgement afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        result: { type: "string", enum: ["completed", "partial", "blocked", "failed"] },
+        candidate_mutated: { type: "boolean", description: "Explicit factual record: did this attempt change the current candidate? Never inferred." },
+        actions_performed: { type: "array", items: { type: "object", properties: { action: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["action", "detail"], additionalProperties: false } },
+        files_examined: { type: "array", items: { type: "string" } },
+        files_changed: { type: "array", items: { type: "string" } },
+        commands_run: { type: "array", items: { type: "object", properties: { command: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["command", "detail"], additionalProperties: false } },
+        tests_run: { type: "array", items: { type: "object", properties: { name: { type: "string" }, outcome: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["name", "outcome", "detail"], additionalProperties: false } },
+        findings: { type: "array", items: { type: "object", properties: { summary: { type: "string" }, details: { type: ["string", "null"] } }, required: ["summary", "details"], additionalProperties: false } },
+        deviations: { type: "array", items: { type: "object", properties: { summary: { type: "string" }, details: { type: ["string", "null"] } }, required: ["summary", "details"], additionalProperties: false } },
+        blockers: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              kind: {
+                type: "string",
+                enum: [
+                  "MISSING_CONTEXT",
+                  "AMBIGUOUS_DIRECTIVE",
+                  "REPOSITORY_MISMATCH",
+                  "UNEXPECTED_SCOPE",
+                  "CONFLICTING_REQUIREMENTS",
+                  "MISSING_PREREQUISITE",
+                  "EXECUTION_ENVIRONMENT_BLOCKER",
+                ],
+              },
+              summary: { type: "string" },
+              details: { type: ["string", "null"] },
+              relevantRefs: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } },
+                  required: ["kind", "id", "revision"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["kind", "summary", "details", "relevantRefs"],
+            additionalProperties: false,
+          },
+        },
+        deliverables: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              ref: { type: ["object", "null"], properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } }, required: ["kind", "id", "revision"], additionalProperties: false },
+              detail: { type: ["string", "null"] },
+            },
+            required: ["name", "ref", "detail"],
+            additionalProperties: false,
+          },
+        },
+        _hostContext: { type: "string", description: "Signed worker host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["result", "candidate_mutated", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_execution_acceptance_context",
+    description:
+      "Supervisor-only: the canonical acceptance context for the current candidate — accepted head, active stage, open window "
+      + "(with its durable accepted base and candidateRevision), every Directive/Attempt/Report of the window split into "
+      + "current-candidate vs historical evidence, per-report worker-role/result/mutation/session facts, qualifying fresh "
+      + "verification, and existing SupervisorAssessments (current vs stale). Store-derived facts only — no repository reads, "
+      + "no worker or supervisor hidden reasoning. After a commit this reports the post-commit acceptance boundary (no open window).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "submit_supervisor_assessment",
+    description:
+      "Supervisor-only: submit one immutable semantic assessment of the current candidate. disposition=rework | "
+      + "need_more_verification | blocked | request_replan persists the judgment ONLY — no state mutation. disposition=accept "
+      + "runs the Core acceptance gate: every current-candidate report must carry exactly one judgment (negative results may "
+      + "only be blocking/superseded), no blocking judgment may remain, fresh independent E5-verifier evidence must cover the "
+      + "exact candidate, and Core then atomically creates the ExecutionCommit, closes the window, and advances acceptedHead. "
+      + "You never create commits or set the accepted head directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        disposition: { type: "string", enum: ["accept", "rework", "need_more_verification", "blocked", "request_replan"] },
+        rationale: { type: "string", description: "Non-empty audit provenance for this judgment; never parsed by Core." },
+        report_judgments: {
+          type: "array",
+          description: "Exactly one judgment per current-candidate report (required for accept).",
+          items: {
+            type: "object",
+            properties: {
+              report_id: { type: "string" },
+              disposition: { type: "string", enum: ["supporting", "informational", "superseded", "blocking"] },
+              superseded_by_report_id: { type: "string", description: "Required for superseded: a LATER current-candidate report in this window." },
+              rationale: { type: "string", description: "Required non-empty for superseded." },
+            },
+            required: ["report_id", "disposition"],
+            additionalProperties: false,
+          },
+        },
+        covered_obligations: {
+          type: "array",
+          description: "Structured acceptance provenance resolving into existing Directive validationRequirements / approved plan refs / the active Stage's immutable objective (E7 §5).",
+          items: {
+            type: "object",
+            properties: {
+              source: { type: "string", enum: ["directive_validation_requirement", "plan_ref", "stage_objective"] },
+              directive_id: { type: "string" },
+              directive_revision: { type: "integer", minimum: 1 },
+              index: { type: "integer", minimum: 0 },
+              ref: { type: "object", properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } }, required: ["kind", "id", "revision"], additionalProperties: false },
+              stage_id: { type: "string", description: "For stage_objective: the exact active Stage whose satisfaction this accepted candidate asserts." },
+              objective_hash: { type: "string", description: "For stage_objective: the deterministic sha256 over the Stage's immutable semantics (from the acceptance context)." },
+              contentHash: { type: "string" },
+            },
+            required: ["source", "contentHash"],
+            additionalProperties: false,
+          },
+        },
+        plan_refs: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } },
+            required: ["kind", "id", "revision"],
+            additionalProperties: false,
+          },
+          description: "Optional exact approved plan refs the assessment rests on.",
+        },
+        expected_candidate_revision: {
+          type: "integer",
+          minimum: 0,
+          description: "The window candidateRevision you assessed; a stale value is refused (SUPERVISOR_ASSESSMENT_STALE).",
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["disposition", "rationale", "expected_candidate_revision", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_execution_progression_context",
+    description:
+      "Supervisor-only: the canonical execution progression state after an accepted commit — accepted head, active stage, open "
+      + "window, latest commit, every pending/completed Stage, and the dependency-derived eligible vs ineligible pending Stages "
+      + "(with unsatisfied predecessor step ids), plus the progression boundary: active_candidate | post_commit_same_stage | "
+      + "between_stages | all_stages_completed. Eligibility follows ONLY the approved explicit dependsOn edges — ordinal is never "
+      + "a dependency. default_suggested_stage is a UX hint (lowest ordinal), never authority: you select the next Stage.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "continue_execution_stage",
+    description:
+      "Supervisor-only, post-commit: explicitly continue the ACTIVE Stage by opening a NEW verification window at "
+      + "candidateRevision 0 rooted in the exact acceptedHead. Requires an active Stage, no open window, no running Attempt, and "
+      + "a latest accepted Commit belonging to this Stage. Pure orchestration: the acceptedHead is never touched; issue new "
+      + "Directives through the normal E4 protocol.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "activate_execution_stage",
+    description:
+      "Supervisor-only, between stages: activate one eligible pending Stage you select by stage_id (Core validates the exact "
+      + "explicit dependencies; ordinal never decides). Atomically transitions pending → active and opens the Stage's first "
+      + "verification window at candidateRevision 0 rooted in the exact acceptedHead. Requires no active Stage, no open window, "
+      + "no running Attempt, and an existing acceptedHead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_stage_id: { type: "string", description: "The exact pending Stage to activate (from get_execution_progression_context eligible stages)." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["target_stage_id", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_execution_final_closure_context",
+    description:
+      "Supervisor-only (E10 §55): the run-level final-closure surface. Returns the run identity, the exact FinalPlan ref, the "
+      + "acceptedHead, every ordinary Stage with its completion provenance and objective hash, the Final Closure Window state "
+      + "(absent/open with its exact candidate revision), the Core-derived execution_run_completion obligation and the exact "
+      + "verify_execution_completion requirement your final VerificationDirective must carry, the verification policy state, "
+      + "current conflicts, and the completion blockers (running/indeterminate attempts, incomplete stages). Store-derived only — "
+      + "no repository access, no hidden reasoning.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "begin_execution_final_closure",
+    description:
+      "Supervisor-only (E10 §9/§10), explicit: open the run-level Final Closure Window after ALL ordinary Stages are completed. "
+      + "Never auto-started — you decide when the all_stages_completed boundary enters final closure. One atomic transaction "
+      + "validates the boundary (active run, acceptedHead exists, no active/pending Stage, exact completion provenance, no open "
+      + "window, no running Attempt) and creates the window scoped final_closure (NO Stage — never a synthetic one) at "
+      + "candidateRevision 0 rooted in the exact acceptedHead. Returns the Core-derived execution_run_completion obligation and "
+      + "the exact verifier requirement. Opening the window never completes the run: run the final window protocol (integration, "
+      + "rework if needed, fresh final verifier), then submit an accept assessment carrying the exact completion obligation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_attempt_recovery_context",
+    description:
+      "Supervisor-only (E11 §46): the run-level attempt-recovery surface. For every nonterminal Attempt it returns the "
+      + "logical state (running | indeterminate), the Store-derived runtime state (prepared-unclaimed | claimed | "
+      + "reported-but-runtime-not-finished | authoritative-stop | liveness-unknown), the reconciliation state (not-required | "
+      + "required | in-progress | resolved-*), the ORIGINAL Directive ref/hash/kind/baseCandidateRevision, the side-effect "
+      + "capability classification, the bound reconciliation Directive revisions with their Reports, whether a deterministic "
+      + "no_effect_by_capability resolution is available, and whether ordinary execution is currently fenced. Store-derived "
+      + "projection only — never authority, no launch secrets, no hidden Worker context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "retry_unclaimed_worker_launch",
+    description:
+      "Supervisor-only (E11 §40/§41): transport recovery for a crash BEFORE the Worker claimed — the SAME logical Attempt "
+      + "and invocation binding receive a freshly rotated one-time launch credential (the old token stops working). Requires "
+      + "the Attempt still running, the invocation still prepared and unclaimed, and the Directive still exact/current for "
+      + "the open window. Never creates a second Attempt; never a semantic retry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        attempt_id: { type: "string", description: "The exact running Attempt whose prepared unclaimed launch is retried." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["attempt_id", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "issue_attempt_reconciliation",
+    description:
+      "Supervisor-only (E11 §11/§12): bind an indeterminate Attempt to a NEW logical reconciliation inspection Directive. "
+      + "One atomic transaction issues the exact kind=inspection Directive on the CURRENT open window (stage or final_closure "
+      + "scope — never a synthetic Stage/Window), carrying the hash-covered requiredAction reconcile_indeterminate_attempt:"
+      + "<attemptId>, and persists the immutable binding. The target must be indeterminate, unresolved, and belong to the "
+      + "current window. Run the inspection through the normal E5 worker protocol, then resolve_indeterminate_attempt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        attempt_id: { type: "string", description: "The exact indeterminate Attempt to reconcile." },
+        objective: { type: "string" },
+        body: { type: "string", description: "Detailed inspection instruction: establish CURRENT repository reality for the uncertain Attempt." },
+        capability_envelope: {
+          type: "object",
+          properties: {
+            repositoryRead: { type: "boolean" },
+            repositoryWrite: { type: "boolean" },
+            commandExecution: { type: "boolean" },
+            networkAccess: { type: "boolean" },
+            dependencyMutation: { type: "boolean" },
+            gitCommit: { type: "boolean" },
+            gitPush: { type: "boolean" },
+            externalServiceMutation: { type: "boolean" },
+          },
+          required: [
+            "repositoryRead",
+            "repositoryWrite",
+            "commandExecution",
+            "networkAccess",
+            "dependencyMutation",
+            "gitCommit",
+            "gitPush",
+            "externalServiceMutation",
+          ],
+          additionalProperties: false,
+          description: "Complete, explicit. Reconciliation inspections are read-only in practice; any side-effect-capable grant is deliberate Supervisor authority.",
+        },
+        report_contract: {
+          type: "object",
+          properties: {
+            requireActionsPerformed: { type: "boolean" },
+            requireFilesExamined: { type: "boolean" },
+            requireFilesChanged: { type: "boolean" },
+            requireCommandsRun: { type: "boolean" },
+            requireTestsRun: { type: "boolean" },
+            requireFindings: { type: "boolean" },
+            requireDeviations: { type: "boolean" },
+            requireBlockers: { type: "boolean" },
+            requireDeliverables: { type: "boolean" },
+          },
+          required: [
+            "requireActionsPerformed",
+            "requireFilesExamined",
+            "requireFilesChanged",
+            "requireCommandsRun",
+            "requireTestsRun",
+            "requireFindings",
+            "requireDeviations",
+            "requireBlockers",
+            "requireDeliverables",
+          ],
+          additionalProperties: false,
+        },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["attempt_id", "objective", "body", "capability_envelope", "report_contract", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "resolve_indeterminate_attempt",
+    description:
+      "Supervisor-only (E11 §24–§29): the FINAL immutable reconciliation of an indeterminate Attempt. resolution=no_effect: "
+      + "the inspection proved no durable effect; candidateRevision unchanged. resolution=no_effect_by_capability: the "
+      + "deterministic capability proof — allowed ONLY when the interrupted Directive's effective envelope was provably "
+      + "non-mutating and the candidate never moved; no inspection Worker needed. resolution=candidate_changed: the "
+      + "inspection found previously unaccounted durable mutation — candidateRevision advances N→N+1 exactly once under the "
+      + "same CAS discipline as Report-driven mutation, making all verification at N stale. The original Attempt stays "
+      + "indeterminate forever; no Report is fabricated; no replay happens.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        attempt_id: { type: "string" },
+        resolution: { type: "string", enum: ["no_effect", "no_effect_by_capability", "candidate_changed"] },
+        inspection_report_id: {
+          type: "string",
+          description: "The exact completed non-mutating reconciliation inspection Report. Required for no_effect and candidate_changed; forbidden for no_effect_by_capability.",
+        },
+        rationale: { type: "string", description: "Non-empty audit provenance for the semantic judgment." },
+        expected_candidate_revision: { type: "integer", minimum: 0, description: "Stale-precondition fence over the open window's current revision." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["attempt_id", "resolution", "rationale", "expected_candidate_revision", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "request_execution_replan",
+    description:
+      "Supervisor-only, terminal: declare that the current immutable FinalPlan can no longer provide a legal, sufficiently-defined "
+      + "continuation without a new normative decision, and terminate execution. One atomic Core transaction persists the immutable "
+      + "ExecutionIssue snapshot (accepted history + exact execution context), terminal-closes the open window (NO commit is fabricated), "
+      + "transitions the run active → replan_required (terminal forever), and detaches your supervisor binding. This is a semantic "
+      + "judgment — never a response to difficulty, defects, failed tests, verification debt, or conflicts. Afterwards invoke /phase-plan: "
+      + "a NEW PlanningRun is created from the old FinalPlan baseline; the old run never resumes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reason: { type: "string", description: "Non-empty statement of the normative insufficiency — the durable semantic intent." },
+        affected_normative_refs: {
+          type: "array",
+          minItems: 1,
+          description: "Exact Plan refs reachable from the bound FinalPlan (architecture/section/section_contract/decision/constraint, exact revision) — at least one anchor.",
+          items: {
+            type: "object",
+            properties: { type: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } },
+            required: ["type", "id", "revision"],
+            additionalProperties: false,
+          },
+        },
+        relevant_report_refs: { type: "array", items: { type: "string" }, description: "Exact ExecutionReport ids of THIS run that evidence the insufficiency (any state)." },
+        trigger_assessment_id: { type: "string", description: "Optional: an immutable request_replan SupervisorAssessment as trigger provenance." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["reason", "affected_normative_refs", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_verification_policy_context",
+    description:
+      "Supervisor-only: the deterministic verification-pressure state of the current candidate — latestVerifiedRevision, "
+      + "unverifiedMutationSpan out of the frozen bound (3), whether verificationRequired, the machine-readable reason "
+      + "(immediate | max_unverified_span | unexpected_mutation | legacy_policy_unknown), the blocking report ref, the "
+      + "qualifying normal-verification reports, and whether legacy policy-unknown mutation is present. Derived from Store "
+      + "facts on every read; never authoritative, never cached.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "declare_verification_conflict",
+    description:
+      "Supervisor-only: declare ONE durable verification conflict when two or more trusted current-candidate reports make "
+      + "materially mutually exclusive claims about an acceptance-relevant fact. Core validates structure only — exact "
+      + "current-candidate report binding, two claim variants, deterministic duplicate fingerprint. The conflict is created "
+      + "open; nothing launches automatically. Ordinary executor-completed/verifier-defect evidence is NOT a conflict.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fact: { type: "string", description: "Neutral statement of the disputed acceptance-relevant fact." },
+        claims: {
+          type: "array",
+          minItems: 2,
+          description: "The mutually exclusive claim variants (>= 2), each bound to its exact source report ids.",
+          items: {
+            type: "object",
+            properties: {
+              variant: { type: "string", description: "Stable variant label, e.g. A / B." },
+              statement: { type: "string", description: "Neutral statement of this side's claim." },
+              source_report_ids: { type: "array", minItems: 1, items: { type: "string" } },
+            },
+            required: ["variant", "statement", "source_report_ids"],
+            additionalProperties: false,
+          },
+        },
+        rationale: { type: "string", description: "Optional audit provenance for the declaration." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["fact", "claims", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "resolve_verification_conflict",
+    description:
+      "Supervisor-only: settle the ONE dedicated conflict-resolution verifier's report — outcome=resolved or "
+      + "verification_blocked, with a non-empty rationale naming the exact resolution report id. Core validates the report is "
+      + "the resolver's exact completed non-mutating report; it never infers the outcome from findings. verification_blocked "
+      + "blocks commits for this candidate but never deadlocks rework or inspection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        conflict_id: { type: "string" },
+        outcome: { type: "string", enum: ["resolved", "verification_blocked"] },
+        resolution_report_id: { type: "string", description: "The exact report id of the dedicated resolver attempt." },
+        rationale: { type: "string", description: "Required non-empty audit provenance for the outcome." },
+        _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
+      },
+      required: ["conflict_id", "outcome", "resolution_report_id", "rationale", "_hostContext"],
+      additionalProperties: false,
+    },
+  },
+
 ];
 
 function inputInvalid(message: string, cause?: string): RuntimeError {
@@ -767,6 +1526,63 @@ export function handleStartOrResume(ctx: PhasePlanToolContext, rawArgs: Record<s
         "successor PlanningRun started from the immutable baseline; the predecessor run remains completed. "
         + "Re-opened scope is needs_review — select an affected section or prepare the first baseline-bound proposal.",
     };
+  }
+
+  // E9 §30–§33 — the CONTROLLED RETURN: a supervisor-bound session over a
+  // replan_required ExecutionRun with a pending replan ExecutionIssue enters
+  // formal planning; the successor PlanningRun is created from the OLD
+  // immutable FinalPlan. Core resolves the exact issue (a workspace with
+  // several pending replan issues is ambiguous, never guessed).
+  if (!ownsPlanningLife) {
+    const classifiedReplan = createSuccessorRunService(ctx.store, ctx.clock).classifyReplanEntry(envelope.workspaceId, envelope.sessionId);
+    if (classifiedReplan.ambiguous) {
+      throw new RuntimeError(
+        "EXECUTION_ISSUE_AMBIGUOUS",
+        "multiple pending replan ExecutionIssues exist in this workspace; re-enter through the exact issue's entry flow (E9 §33)",
+      );
+    }
+    if (classifiedReplan.replanRunId !== null) {
+      verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });
+      const successors = createSuccessorRunService(ctx.store, ctx.clock);
+      try {
+        const created = successors.createSuccessor({ workspaceId: envelope.workspaceId, sessionId: envelope.sessionId });
+        return {
+          status: "started_successor",
+          started: true,
+          run: runView(created.successorRun),
+          binding: created.planningBinding,
+          initialStage: created.initialStage,
+          baseline: {
+            baseline_id: created.baseline.baselineId,
+            baseline_hash: created.baseline.baselineHash,
+            issue_set_hash: created.baseline.issueSetHash,
+            predecessor_run_id: created.baseline.predecessorRunId,
+            final_plan: { id: created.baseline.finalPlanId, hash: created.baseline.finalPlanHash },
+            repository_at_replan_start: created.baseline.repositoryAtReplanStart,
+          },
+          replan: created.replan ?? null,
+          affectedScope: {
+            stage: created.affectedScope.initialStage,
+            needsReviewSections: created.affectedScope.needsReviewSections,
+            inheritedCompletedSections: created.affectedScope.inheritedCompletedSections,
+          },
+          next:
+            "successor PlanningRun started from the OLD immutable FinalPlan baseline (E9 §30). The old ExecutionRun stays replan_required forever; "
+            + "the replan ExecutionIssue is adopted as provenance, and only the affected normative scope is reopened (needs_review).",
+        };
+      } catch (err) {
+        // E9 §32 — idempotent re-entry: the successor already exists; converge.
+        if (err instanceof RuntimeError && err.code === "SUCCESSOR_RUN_ALREADY_STARTED") {
+          return {
+            status: "successor_exists",
+            successor_run_id: classifiedReplan.successorRunId,
+            replan: { issue_id: classifiedReplan.issueId, predecessor_run_id: classifiedReplan.replanRunId },
+            next: "The successor PlanningRun already exists for this replan issue — resume it with its session binding.",
+          };
+        }
+        throw err;
+      }
+    }
   }
 
   verifyEntryIntentCurrent(ctx.secret, args._entryIntent, { sessionId: envelope.sessionId, promptId: envelope.promptId });
@@ -2191,16 +3007,23 @@ export function handleRequestFinalization(ctx: PhasePlanToolContext, rawArgs: Re
 /** §58 — the compact completed-run view. Never exposes other session ids. */
 function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostContextV1): Record<string, unknown> {
   return ctx.store.withRead((tx) => {
+    // A1 §16 — the authority is PlanningRun-scoped: resolve the canonical
+    // ExecutionRunID to its source planning provenance.
+    const planningRunId = getExecutionRunInTx(tx, exec.executionRunId)?.runId ?? exec.executionRunId;
     const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
       sessionId: exec.sessionId,
       workspaceId: exec.workspaceId,
-      runId: exec.runId,
+      runId: planningRunId,
       finalPlanId: exec.finalPlanId,
       generation: exec.executionBindingGeneration,
     });
     const handoff = JSON.parse(authority.handoff.canonicalJson) as ExecutionHandoffV1;
     // Phase 15 §19 — the open-issue projection over the delivered contract.
-    const openIssues = listOpenExecutionIssuesInTx(tx, exec.runId);
+    const openIssues = listOpenExecutionIssuesInTx(tx, exec.executionRunId);
+    // E2 — the durable supervision-ownership view of the active ExecutionRun:
+    // state + generation + ownership relative to the signed session (the
+    // legacy ExecutionBinding above remains session/read metadata only).
+    const supervisorBinding = getSupervisorBindingInTx(tx, exec.executionRunId);
     return {
       authority: "execution",
       run: { id: authority.run.runId, lifecycle: authority.run.lifecycle, stage: authority.run.stage },
@@ -2215,6 +3038,19 @@ function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostConte
         delivered: true,
       },
       executionBinding: { generation: authority.binding.generation, state: authority.binding.state },
+      supervisor: (() => {
+        if (supervisorBinding === null) {
+          return { state: null, generation: null, ownership: "none" as const };
+        }
+        return {
+          state: supervisorBinding.state,
+          generation: supervisorBinding.generation,
+          ownership:
+            supervisorBinding.sessionId === exec.sessionId
+              ? ("current-session" as const)
+              : ("other-session" as const),
+        };
+      })(),
       repositoryBaseline: handoff.repositoryBaseline,
       executionIssues: {
         openCount: openIssues.length,
@@ -2228,8 +3064,11 @@ function executionBuildState(ctx: PhasePlanToolContext, exec: ExecutionHostConte
  * because FinalPlan and handoff are immutable — the handoff hash is the anchor. */
 function executionBuildContext(ctx: PhasePlanToolContext, exec: ExecutionHostContextV1): Record<string, unknown> {
   const state = executionBuildState(ctx, exec);
+  // A1 §16 — handoffs are planning-scoped: resolve the canonical
+  // ExecutionRunID to its source planning provenance.
+  const planningRunId = ctx.store.withRead((tx) => getExecutionRunInTx(tx, exec.executionRunId)?.runId) ?? exec.executionRunId;
   const handoff = ctx.store.withRead((tx) => {
-    const row = getExecutionHandoffInTx(tx, exec.runId);
+    const row = getExecutionHandoffInTx(tx, planningRunId);
     return row === null ? null : (JSON.parse(row.canonicalJson) as ExecutionHandoffV1);
   });
   if (handoff === null) {
@@ -2238,7 +3077,7 @@ function executionBuildContext(ctx: PhasePlanToolContext, exec: ExecutionHostCon
   const canonical = state as Record<string, unknown>;
   // Phase 15 §19 — the compact open-issue list; full detail stays opt-in via
   // read tools, never a default injection.
-  const compactIssues = ctx.store.withRead((tx) => listOpenExecutionIssuesInTx(tx, exec.runId)).map((issue) => {
+  const compactIssues = ctx.store.withRead((tx) => listOpenExecutionIssuesInTx(tx, exec.executionRunId)).map((issue) => {
     const parsed = JSON.parse(issue.canonicalJson) as { kind: string };
     return {
       issue_id: issue.issueId,
@@ -2273,7 +3112,7 @@ function executionReadMemory(
     const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
       sessionId: exec.sessionId,
       workspaceId: exec.workspaceId,
-      runId: exec.runId,
+      runId: getExecutionRunInTx(tx, exec.executionRunId)?.runId ?? exec.executionRunId,
       finalPlanId: exec.finalPlanId,
       generation: exec.executionBindingGeneration,
     });
@@ -2330,6 +3169,7 @@ function handoffResponse(
   identity: { handoffId: string; handoffHash: string },
   finalPlan: { id: string; hash: string },
   idempotent: boolean,
+  executionRun: { id: string; lifecycle: string } | null,
 ): Record<string, unknown> {
   return {
     status: "ok",
@@ -2337,6 +3177,7 @@ function handoffResponse(
     handoff_id: identity.handoffId,
     handoff_hash: identity.handoffHash,
     final_plan: { id: finalPlan.id, hash: finalPlan.hash },
+    ...(executionRun === null ? {} : { execution_run: { id: executionRun.id, lifecycle: executionRun.lifecycle } }),
     repository_baseline: handoff.repositoryBaseline,
     execution_contract: renderExecutionContract(handoff, identity),
     // §92 — no session id, no binding generation, no plugin-data paths.
@@ -2358,16 +3199,18 @@ export function handleHandoff(ctx: PhasePlanToolContext, rawArgs: Record<string,
       const authority = createHandoffService(ctx.store, ctx.clock).requireBuildReadAuthorityInTx(tx, {
         sessionId: exec.sessionId,
         workspaceId: exec.workspaceId,
-        runId: exec.runId,
+        runId: getExecutionRunInTx(tx, exec.executionRunId)?.runId ?? exec.executionRunId,
         finalPlanId: exec.finalPlanId,
         generation: exec.executionBindingGeneration,
       });
       const handoff = JSON.parse(authority.handoff.canonicalJson) as ExecutionHandoffV1;
+      const executionRun = getExecutionRunInTx(tx, exec.executionRunId);
       return handoffResponse(
         handoff,
         { handoffId: authority.handoff.handoffId, handoffHash: authority.handoff.handoffHash },
         { id: authority.finalPlanRow.finalPlanId, hash: authority.finalPlanRow.finalPlanHash },
         true,
+        executionRun === null ? null : { id: executionRun.executionRunId, lifecycle: executionRun.lifecycle },
       );
     });
   }
@@ -2418,6 +3261,7 @@ export function handleHandoff(ctx: PhasePlanToolContext, rawArgs: Record<string,
     { handoffId: result.handoffId, handoffHash: result.handoffHash },
     { id: result.finalPlan.id, hash: result.finalPlan.hash },
     result.reused,
+    { id: result.executionRun.executionRunId, lifecycle: result.executionRun.lifecycle },
   );
 }
 
@@ -2477,7 +3321,7 @@ export function handleReportExecutionIssue(ctx: PhasePlanToolContext, rawArgs: R
   }
   const service = createExecutionIssueService(ctx.store, ctx.clock);
   const result = service.reportIssue({
-    runId: exec.runId,
+    executionRunId: exec.executionRunId,
     workspaceId: exec.workspaceId,
     workspaceRoot: workspace.canonicalRoot,
     sessionId: exec.sessionId,
@@ -2514,16 +3358,76 @@ export function handleReportExecutionIssue(ctx: PhasePlanToolContext, rawArgs: R
 // explicit human-authorized control-plane operations (never design facts)
 // ---------------------------------------------------------------------------
 
-function controlRequestHashOf(
-  operation: Parameters<typeof runControlRequestHash>[0]["operation"],
-  args: { runId: string; workspaceId: string; expectedBindingGeneration: number },
+/** A1 §49 — the typed target hash for a planning_run control request. */
+function planningControlRequestHashOf(
+  operation: "takeover" | "abort",
+  args: { planningRunId: string; workspaceId: string; expectedBindingGeneration: number },
 ): string {
   return runControlRequestHash({
     operation,
-    runId: args.runId,
+    targetKind: "planning_run",
+    planningRunId: args.planningRunId,
     workspaceId: args.workspaceId,
     expectedBindingGeneration: args.expectedBindingGeneration,
   });
+}
+
+/**
+ * A1 §37/§38 — model-facing execution identity normalization. The canonical
+ * field is execution_run_id; the legacy run_id is accepted only while it
+ * resolves to exactly one execution world (0 → EXECUTION_RUN_NOT_FOUND,
+ * >1 → EXECUTION_RUN_AMBIGUOUS — never "newest"). Both supplied → they must
+ * resolve to the same exact run. Returns null when the legacy id names a run
+ * with no execution world (the caller decides whether that is legal).
+ */
+export function resolveExecutionRunIdentity(
+  ctx: PhasePlanToolContext,
+  rawArgs: Record<string, unknown>,
+  options: { requireExisting: boolean },
+): { executionRunId?: string; legacyRunId: string } {
+  const canonical = typeof rawArgs.execution_run_id === "string" && rawArgs.execution_run_id.trim() !== ""
+    ? rawArgs.execution_run_id.trim()
+    : undefined;
+  const legacy = typeof rawArgs.run_id === "string" && rawArgs.run_id.trim() !== "" ? rawArgs.run_id.trim() : undefined;
+  if (canonical === undefined && legacy === undefined) {
+    throw inputInvalid("execution_run_id (or legacy run_id) must be a non-empty string");
+  }
+  if (canonical !== undefined && legacy !== undefined) {
+    const exact = ctx.store.withRead((tx) => getExecutionRunInTx(tx, canonical));
+    if (exact === null || exact.runId !== legacy) {
+      throw domainError(
+        "EXECUTION_RUN_AMBIGUOUS",
+        "execution_run_id and run_id resolve to different execution worlds (A1 §38)",
+      );
+    }
+    return { executionRunId: canonical, legacyRunId: legacy };
+  }
+  if (canonical !== undefined) {
+    if (options.requireExisting) {
+      const exact = ctx.store.withRead((tx) => getExecutionRunInTx(tx, canonical));
+      if (exact === null) {
+        throw domainError("EXECUTION_RUN_NOT_FOUND", `no ExecutionRun exists for '${canonical}'`);
+      }
+    }
+    return { executionRunId: canonical, legacyRunId: canonical };
+  }
+  if (legacy === undefined) {
+    throw inputInvalid("run_id must be a non-empty string");
+  }
+  const worlds = ctx.store.withRead((tx) => listExecutionRunsBySourcePlanningRunInTx(tx, legacy));
+  if (worlds.length === 0) {
+    if (options.requireExisting) {
+      throw domainError("EXECUTION_RUN_NOT_FOUND", `no ExecutionRun exists for legacy run_id '${legacy}'`);
+    }
+    return { legacyRunId: legacy };
+  }
+  if (worlds.length > 1) {
+    throw domainError(
+      "EXECUTION_RUN_AMBIGUOUS",
+      `legacy run_id '${legacy}' resolves to ${worlds.length} execution worlds; pass the exact execution_run_id (A1 §37)`,
+    );
+  }
+  return { executionRunId: worlds[0]!.executionRunId, legacyRunId: legacy };
 }
 
 /** Main-session attestation check shared by both control tools (§46/§47). */
@@ -2537,14 +3441,19 @@ function assertMainSessionControl(envelope: { version: number; agent?: unknown }
 }
 
 export function handleTakeoverRun(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
-  // §12 — the model supplies ONLY run_id + expected_binding_generation. No
-  // workspace/session/force/owner_is_dead/new_generation field exists to accept.
-  assertExactBusinessFields(rawArgs, ["run_id", "expected_binding_generation"]);
+  // §12/A1 §37 — the model supplies the execution identity (canonical
+  // execution_run_id, or the legacy run_id while it resolves to exactly one
+  // execution world) + expected_binding_generation. No
+  // workspace/session/force/owner_is_dead/new_generation field exists.
+  assertExactBusinessFields(rawArgs, ["run_id", "execution_run_id", "expected_binding_generation"]);
   const token = requireHostContext(rawArgs);
   const envelope = assertHostContextForTool(ctx.secret, token, { tool: "takeover_run", businessInput: rawArgs });
   assertMainSessionControl(envelope, "takeover_run");
 
-  if (typeof rawArgs.run_id !== "string" || rawArgs.run_id.trim() === "") {
+  // A1 §38 — one identity path only; the legacy id MAY stay a pure planning
+  // run (pre-handoff takeover), so requireExisting is false here.
+  const identity = resolveExecutionRunIdentity(ctx, rawArgs, { requireExisting: false });
+  if (identity.executionRunId === undefined && typeof identity.legacyRunId !== "string") {
     throw inputInvalid("run_id must be a non-empty string");
   }
   if (
@@ -2562,22 +3471,77 @@ export function handleTakeoverRun(ctx: PhasePlanToolContext, rawArgs: Record<str
 
   const service = createRunControlService(ctx.store, ctx.clock);
   const result = service.takeoverRun({
-    runId: rawArgs.run_id,
+    runId: identity.legacyRunId,
+    ...(identity.executionRunId === undefined ? {} : { executionRunId: identity.executionRunId }),
     workspaceId: envelope.workspaceId,
     callerSessionId: envelope.sessionId,
     expectedBindingGeneration: rawArgs.expected_binding_generation,
     authorization: {
       authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
       operationId: `takeover:${envelope.toolUseId}`,
-      requestHash: controlRequestHashOf("takeover", {
-        runId: rawArgs.run_id,
-        workspaceId: envelope.workspaceId,
-        expectedBindingGeneration: rawArgs.expected_binding_generation,
-      }),
+      requestHash:
+        identity.executionRunId === undefined
+          ? planningControlRequestHashOf("takeover", {
+              planningRunId: identity.legacyRunId,
+              workspaceId: envelope.workspaceId,
+              expectedBindingGeneration: rawArgs.expected_binding_generation,
+            })
+          : runControlRequestHash({
+              operation: "takeover",
+              targetKind: "execution_run",
+              executionRunId: identity.executionRunId,
+              workspaceId: envelope.workspaceId,
+              expectedBindingGeneration: rawArgs.expected_binding_generation,
+            }),
     },
   });
+  // A1-I closure §6/§8 — a migrated legacy_pre_a1 replay converges on the
+  // durable historical outcome, read-only. Session identities stay in the
+  // durable record and are never returned to the model (§4/§13).
+  if ("legacyHistorical" in result) {
+    const snapshot = result.legacyHistorical.planningSnapshot;
+    return {
+      status: "historical_outcome",
+      idempotent: true,
+      control_id: result.control.controlId,
+      target_kind: "legacy_pre_a1",
+      historical: {
+        operation: result.control.operation,
+        resulting_binding_generation: result.legacyHistorical.resultingBindingGeneration,
+        resulting_run_revision: result.legacyHistorical.resultingRunRevision,
+        planning_snapshot_available: snapshot !== null,
+      },
+      ...(snapshot === null ? {} : { run: runView(snapshot.run), binding: bindingView(snapshot.binding) }),
+      next:
+        "This authorization is migrated pre-A1 history: the exact retry converged on the already-committed durable outcome. "
+        + "No new authority, generation, authorization, or lifecycle object was created.",
+    };
+  }
   // §4/§13 — session identities stay in the durable record, never in the
-  // model-visible response.
+  // model-visible response. E2: an execution-supervision takeover reports the
+  // new supervision generation instead of planning-binding language.
+  if (result.supervisor !== undefined && result.supervisor !== null) {
+    return {
+      status: "taken_over",
+      idempotent: result.idempotent,
+      control_id: result.control.controlId,
+      run: runView(result.run),
+      binding: bindingView(result.binding),
+      supervisor: {
+        execution_run_id: result.supervisor.executionRunId,
+        generation: result.supervisor.generation,
+        state: result.supervisor.state,
+        // E12 §37/§38 — the launch credentials this takeover invalidated.
+        revoked_launch_credentials: result.supervisor.revokedLaunchCredentials,
+      },
+      next:
+        "Execution supervision ownership transferred (supervision generation advanced by exactly one; for an unbound run the initial generation 1 was established); the previous owner is fenced immediately. "
+        + "Continue supervising this active ExecutionRun under its immutable FinalPlan; planning history is completed and unchanged."
+        + (result.supervisor.revokedLaunchCredentials.length > 0
+          ? ` Prepared launch credential(s) for attempt(s) [${result.supervisor.revokedLaunchCredentials.join(", ")}] were invalidated; re-credential the SAME attempt with retry_unclaimed_worker_launch if a worker still needs to start.`
+          : ""),
+    };
+  }
   return {
     status: "taken_over",
     idempotent: result.idempotent,
@@ -2615,14 +3579,36 @@ export function handleAbortRun(ctx: PhasePlanToolContext, rawArgs: Record<string
     authorization: {
       authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
       operationId: `abort:${envelope.toolUseId}`,
-      requestHash: runControlRequestHash({
-        operation: "abort",
-        runId: envelope.runId as string,
+      requestHash: planningControlRequestHashOf("abort", {
+        planningRunId: envelope.runId as string,
         workspaceId: envelope.workspaceId,
         expectedBindingGeneration: envelope.bindingGeneration as number,
       }),
     },
   });
+  // A1-I closure §6/§8 — a migrated legacy_pre_a1 replay converges on the
+  // durable historical outcome, read-only (session identities never ride the
+  // model-visible response, §4/§13).
+  if ("legacyHistorical" in result) {
+    const snapshot = result.legacyHistorical.planningSnapshot;
+    return {
+      status: "historical_outcome",
+      idempotent: true,
+      control_id: result.control.controlId,
+      target_kind: "legacy_pre_a1",
+      historical: {
+        operation: result.control.operation,
+        resulting_binding_generation: result.legacyHistorical.resultingBindingGeneration,
+        resulting_run_revision: result.legacyHistorical.resultingRunRevision,
+        planning_snapshot_available: snapshot !== null,
+      },
+      ...(snapshot === null ? {} : { run: runView(snapshot.run), binding: bindingView(snapshot.binding) }),
+      next:
+        "This authorization is migrated pre-A1 history: the exact retry converged on the already-committed durable outcome. "
+        + "No new authority, generation, authorization, or lifecycle object was created. "
+        + "No Plan Mode exit is requested: the historical operation is already durable and nothing was re-executed.",
+    };
+  }
   // Amendment A2 §27 — the response commits the Abort and reports the mode
   // exit as REQUESTED only; whether the host applied it is observed later by
   // the abort PostToolUse hook and is never claimed here.
@@ -2641,6 +3627,1157 @@ export function handleAbortRun(ctx: PhasePlanToolContext, rawArgs: Record<string
   };
 }
 
+/**
+ * phase_plan.reexecute_final_plan (A1-II §9–§17) — the human-authorized
+ * same-FinalPlan reexecution. Control-plane exception like abort_execution_run:
+ * NO supervisor binding or generation is required (a detached session may
+ * request it after an abort/completion); the mandatory host user-confirmation
+ * dialog (PreToolUse ask + the requiresUserInteraction meta) is the
+ * authorization. The authorization target is the exact FinalPlanRef + the
+ * signed workspace — the resulting ExecutionRun does not exist yet and is
+ * never a model-chosen fact (§12). Zero-to-one business fields: the exact
+ * FinalPlan identity + optional audit reason.
+ */
+export function handleReexecuteFinalPlan(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["source_planning_run_id", "final_plan_id", "final_plan_revision", "final_plan_hash", "reason"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "reexecute_final_plan", businessInput: rawArgs });
+  assertMainSessionControl(envelope, "reexecute_final_plan");
+
+  for (const field of ["source_planning_run_id", "final_plan_id", "final_plan_hash"] as const) {
+    const value = rawArgs[field];
+    if (typeof value !== "string" || value.trim() === "") {
+      throw inputInvalid(`${field} must be a non-empty string`);
+    }
+  }
+  if (
+    typeof rawArgs.final_plan_revision !== "number"
+    || !Number.isInteger(rawArgs.final_plan_revision)
+    || rawArgs.final_plan_revision < 1
+  ) {
+    throw inputInvalid("final_plan_revision must be a positive integer");
+  }
+  if (rawArgs.reason !== undefined && (typeof rawArgs.reason !== "string" || rawArgs.reason.trim() === "")) {
+    throw inputInvalid("reason must be a non-empty string when present");
+  }
+
+  const workspace = getWorkspaceById(ctx.store, envelope.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
+  }
+
+  const finalPlanExecution = {
+    sourcePlanningRunId: rawArgs.source_planning_run_id as string,
+    finalPlanId: rawArgs.final_plan_id as string,
+    finalPlanRevision: rawArgs.final_plan_revision as number,
+    finalPlanHash: rawArgs.final_plan_hash as string,
+  };
+  const service = createReexecutionService(ctx.store, ctx.clock);
+  const result = service.reexecuteFinalPlan({
+    ...finalPlanExecution,
+    workspaceId: envelope.workspaceId,
+    requesterSessionId: envelope.sessionId,
+    toolUseId: envelope.toolUseId,
+    ...(typeof rawArgs.reason === "string" ? { reason: rawArgs.reason } : {}),
+    authorization: {
+      authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
+      operationId: `reexecute_final_plan:${envelope.toolUseId}`,
+      // §15 — the hash pins operation + exact FinalPlanRef + workspace; the
+      // resulting ExecutionRunID is never hashed (it does not exist yet).
+      requestHash: runControlRequestHash({
+        operation: "reexecute_final_plan",
+        targetKind: "final_plan_execution",
+        finalPlanExecution,
+        workspaceId: envelope.workspaceId,
+        expectedBindingGeneration: 1,
+      }),
+    },
+  });
+
+  // §31/§32 — the control flow then acquires E2 supervision canonically:
+  // activation (prepared → active + generation-1 SupervisorBinding + genesis
+  // structure) rides its OWN transaction, so a crash between the two commits
+  // leaves the durable prepared boundary recoverable (§32/§34) and the SAME
+  // authorized retry converges on E2 and completes activation (§16 — a retry
+  // never creates a second run). A converged non-prepared E2 is reported
+  // read-only; it is never re-activated or re-created.
+  let activation: Record<string, unknown> | null = null;
+  if (result.lifecycle === "prepared") {
+    try {
+      const activated = service.activateReexecutionRun({
+        executionRunId: result.executionRunId,
+        workspaceId: envelope.workspaceId,
+        sessionId: envelope.sessionId,
+      });
+      activation = {
+        status: activated.status,
+        supervisor_generation: activated.supervisor.generation,
+      };
+    } catch (err) {
+      activation = {
+        status: "prepared",
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+  const executionRun = ctx.store.withRead((tx) => getExecutionRunInTx(tx, result.executionRunId));
+
+  return {
+    status: result.status === "created" ? "reexecution_created" : "reexecution_converged",
+    idempotent: result.idempotent,
+    control_id: result.control.controlId,
+    target_kind: "final_plan_execution",
+    execution_run: {
+      execution_run_id: result.executionRunId,
+      run_id: result.sourcePlanningRun.runId,
+      lifecycle: executionRun?.lifecycle ?? result.lifecycle,
+      workspace_id: result.workspaceId,
+      final_plan: result.finalPlan,
+    },
+    ...(activation === null ? {} : { activation }),
+    next:
+      result.status === "created"
+        ? activation !== null && activation.status !== "prepared"
+          ? "A NEW ExecutionRun was authorized and created for the exact FinalPlan; it is active under this session's supervision with a fresh identity, fresh baselines, and no inherited history. Drive execution through the canonical supervisor surface (issue_execution_directive …). The source PlanningRun stays completed and prior runs stay untouched."
+          : "A NEW ExecutionRun was authorized and created for the exact FinalPlan in the durable prepared state (the recoverable creation boundary). Retry this exact authorized request to complete activation, or use the recovery surface: the same run is found — never a second one."
+        : "The exact authorized retry converged on the SAME ExecutionRun: no second authorization, no second run, no replayed creation. The run's current lifecycle is reported as-is and was never mutated by this retry.",
+  };
+}
+
+
+/**
+ * phase_plan.abort_execution_run (E13 §5/§6) — the human-authorized
+ * ExecutionRun abort. Control-plane exception: NO supervisor binding or
+ * generation is required (a detached/fenced/recovery session may request it);
+ * the mandatory host user-confirmation dialog (PreToolUse ask + the
+ * requiresUserInteraction meta) is the authorization, exactly like
+ * takeover_run. Zero-to-one business fields: the exact run_id + required
+ * non-empty reason (durable provenance, §5/§9).
+ */
+export function handleAbortExecutionRun(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["run_id", "execution_run_id", "reason"]);
+  const token = requireHostContext(rawArgs);
+  const envelope = assertHostContextForTool(ctx.secret, token, { tool: "abort_execution_run", businessInput: rawArgs });
+  assertMainSessionControl(envelope, "abort_execution_run");
+
+  // A1 §37 — the abort targets the EXACT ExecutionRunID; the legacy run_id is
+  // accepted only while it resolves to exactly one execution world.
+  const identity = resolveExecutionRunIdentity(ctx, rawArgs, { requireExisting: true });
+  if (typeof rawArgs.reason !== "string" || rawArgs.reason.trim() === "") {
+    throw inputInvalid("reason must be a non-empty string (E13 §5 — the durable abort provenance)");
+  }
+
+  const workspace = getWorkspaceById(ctx.store, envelope.workspaceId);
+  if (workspace === null) {
+    throw domainError("HOST_CONTEXT_WORKSPACE_MISMATCH", `host context workspace '${envelope.workspaceId}' is not in the catalog`);
+  }
+
+  const service = createExecutionAbortService(ctx.store, ctx.clock);
+  const result = service.abortExecutionRun({
+    executionRunId: identity.executionRunId!,
+    workspaceId: envelope.workspaceId,
+    requesterSessionId: envelope.sessionId,
+    reason: rawArgs.reason,
+    authorization: {
+      authorizationRequestId: `mcp-control:${envelope.toolUseId}`,
+      operationId: `abort-execution:${envelope.toolUseId}`,
+      requestHash: runControlRequestHash({
+        operation: "abort",
+        targetKind: "execution_run",
+        executionRunId: identity.executionRunId!,
+        workspaceId: envelope.workspaceId,
+        expectedBindingGeneration: 1,
+      }),
+    },
+  });
+  // E13 §53 — the response reports the terminal state; the workspace may
+  // still contain unaccepted changes and NO rollback was performed.
+  return {
+    status: "aborted",
+    idempotent: result.idempotent,
+    control_id: result.controlId,
+    execution_run: {
+      execution_run_id: result.executionRun.executionRunId,
+      run_id: result.executionRun.runId,
+      lifecycle: result.executionRun.lifecycle,
+    },
+    closed_window_id: result.closedWindowId,
+    revoked_launch_credentials: result.revokedLaunchCredentials,
+    next:
+      "The ExecutionRun is terminal (aborted): the execution protocol stopped permanently and every execution mutation "
+      + "authority is gone. No rollback was performed — the workspace may contain unaccepted changes beyond the accepted "
+      + "head, and any later cleanup is a separate explicit decision. Historical state (acceptedHead, Stages, Attempts, "
+      + "Reports, Commits, Issues) remains readable; this run can never resume, complete, or replan. The same FinalPlan may "
+      + "later start a NEW, separately authorized ExecutionRun.",
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// E5 — ExecutionWorker runtime + supervisor execution operations
+// (architecture spec; E5 §16/§17/§33/§39/§42)
+// ---------------------------------------------------------------------------
+
+function requireWorkerAuthorityContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>, tool: string) {
+  const token = requireHostContext(rawArgs);
+  return assertWorkerHostContextForTool(ctx.secret, token, { tool, businessInput: rawArgs });
+}
+
+/**
+ * phase_plan.worker_claim (E5 §10) — the fresh ExecutionWorker claims its
+ * exact Attempt with the one-time launch token. The worker session identity
+ * comes from the signed worker host context (the host's subagent identity),
+ * never from a model argument; the token is consumed atomically.
+ */
+export function handleWorkerClaim(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["attempt_id", "launch_token"]);
+  const worker = requireWorkerAuthorityContext(ctx, rawArgs, "worker_claim");
+  if (typeof rawArgs.attempt_id !== "string" || rawArgs.attempt_id.trim() === "") {
+    throw inputInvalid("attempt_id must be a non-empty string");
+  }
+  if (typeof rawArgs.launch_token !== "string" || rawArgs.launch_token.trim() === "") {
+    throw inputInvalid("launch_token must be a non-empty string");
+  }
+  const facts = ctx.store.withWrite((tx) =>
+    claimWorkerAttemptInTx(
+      tx,
+      {
+        attemptId: rawArgs.attempt_id as string,
+        launchToken: rawArgs.launch_token as string,
+        workerSessionId: worker.sessionId,
+        workerAgentId: worker.agent.agentId,
+        workspaceId: worker.workspaceId,
+      },
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "claimed",
+    attempt_id: facts.invocation.attemptId,
+    worker_role: facts.attempt.workerRole,
+    execution_run_id: facts.invocation.executionRunId,
+    directive: { id: facts.directive.directiveId, revision: facts.directive.revision, hash: facts.directive.hash },
+    next: "Call phase_plan.worker_get_assignment — canonical authority lives in the Store, never in the launch prompt.",
+  };
+}
+
+/**
+ * phase_plan.worker_get_assignment (E5 §12/§13/§14) — the claimed worker's
+ * exact context package: the bound Directive (exact revision/hash), ONLY the
+ * Directive's resolved approved planRefs, run/stage/window identity, and the
+ * accepted base. No plan-memory closure, no supervisor reasoning, no previous
+ * Executor context for verifiers.
+ */
+export function handleWorkerGetAssignment(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const worker = requireWorkerAuthorityContext(ctx, rawArgs, "worker_get_assignment");
+  const assignment = loadWorkerAssignment(ctx.store, {
+    workerSessionId: worker.sessionId,
+    workspaceId: worker.workspaceId,
+  });
+  return {
+    status: "ok",
+    worker_role: assignment.workerRole,
+    attempt: assignment.attempt,
+    directive: assignment.directive,
+    plan_context: assignment.planContext,
+    execution: assignment.execution,
+    next: "Treat the Directive structured fields + body as exact current authority; submit exactly one phase_plan.worker_submit_report before normal exit.",
+  };
+}
+
+/**
+ * phase_plan.worker_submit_report (E5 §17/§35/§39) — worker-only report
+ * submission. Every binding (attempt/directive/role) is DERIVED from the
+ * claimed invocation; the model supplies only the factual payload. Durable
+ * before success: report + attempt transition + candidate advance + invocation
+ * finish commit in ONE transaction before this tool returns.
+ */
+export function handleWorkerSubmitReport(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, [
+    "result",
+    "candidate_mutated",
+    "actions_performed",
+    "files_examined",
+    "files_changed",
+    "commands_run",
+    "tests_run",
+    "findings",
+    "deviations",
+    "blockers",
+    "deliverables",
+  ]);
+  const worker = requireWorkerAuthorityContext(ctx, rawArgs, "worker_submit_report");
+  if (typeof rawArgs.result !== "string") throw inputInvalid("result must be a string (completed|partial|blocked|failed)");
+  if (typeof rawArgs.candidate_mutated !== "boolean") throw inputInvalid("candidate_mutated must be an explicit boolean");
+  const result = ctx.store.withWrite((tx) =>
+    submitWorkerReportAndFinishInTx(tx, {
+      workerSessionId: worker.sessionId,
+      workspaceId: worker.workspaceId,
+      clock: ctx.clock,
+      now: ctx.clock.nowIso(),
+      result: rawArgs.result as ExecutionReportResult,
+      candidateMutated: rawArgs.candidate_mutated as boolean,
+      actionPerformed: rawArgs.actions_performed as SubmitExecutionReportInput["actionPerformed"],
+      filesExamined: rawArgs.files_examined as string[] | undefined,
+      filesChanged: rawArgs.files_changed as string[] | undefined,
+      commandsRun: rawArgs.commands_run as SubmitExecutionReportInput["commandsRun"],
+      testsRun: rawArgs.tests_run as SubmitExecutionReportInput["testsRun"],
+      findings: rawArgs.findings as SubmitExecutionReportInput["findings"],
+      deviations: rawArgs.deviations as SubmitExecutionReportInput["deviations"],
+      blockers: rawArgs.blockers as SubmitExecutionReportInput["blockers"],
+      deliverables: rawArgs.deliverables as SubmitExecutionReportInput["deliverables"],
+    }),
+  );
+  // §18 — compact completion acknowledgement only: the authoritative facts
+  // are the persisted ExecutionReport, never the worker's final prose.
+  return {
+    status: "reported",
+    attempt_id: result.attempt.attemptId,
+    report_id: result.report.reportId,
+    result: result.report.result,
+    candidate_mutated: result.report.candidateMutated,
+    candidate_revision: result.window.candidateRevision,
+    invocation: result.invocation.state,
+    next: "Return a compact acknowledgement to the parent; the ExecutionReport is the authority.",
+  };
+}
+
+/**
+ * phase_plan.get_execution_acceptance_context (E6 §8/§54) — the fenced
+ * supervisor's canonical acceptance context. Everything is Store-derived; the
+ * tool adds no repository output and no hidden reasoning. After a commit the
+ * context reports the post-commit acceptance boundary instead of a candidate.
+ */
+export function handleGetExecutionAcceptanceContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_execution_acceptance_context");
+  const context = ctx.store.withRead((tx) => loadExecutionAcceptanceContextInTx(tx, envelope.executionRunId));
+  return {
+    status: "ok",
+    execution_run: context.executionRun,
+    accepted_head: context.acceptedHead,
+    accepted_base: context.acceptedHead === null ? "execution_start" : `execution_commit/${context.acceptedHead.commitId}`,
+    active_stage: context.activeStage,
+    open_window: context.openWindow,
+    boundary: context.boundary,
+    stage_completion: context.stageCompletion,
+    candidate: context.candidate,
+    next:
+      context.candidate === null
+        ? "No current candidate available for acceptance (post-commit acceptance boundary or no open window)."
+        : "Classify every current-candidate report and submit exactly one phase_plan.submit_supervisor_assessment.",
+  };
+}
+
+/**
+ * phase_plan.submit_supervisor_assessment (E6 §19/§20/§21) — the Supervisor
+ * expresses semantic judgment only; run/stage/window/head are derived from
+ * current authoritative state. Accept runs the Core gate in ONE transaction:
+ * any failure rolls back the assessment together with the commit, the window
+ * close, and the head advance.
+ */
+export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, [
+    "disposition",
+    "rationale",
+    "report_judgments",
+    "covered_obligations",
+    "plan_refs",
+    "expected_candidate_revision",
+  ]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "submit_supervisor_assessment");
+  if (
+    typeof rawArgs.disposition !== "string"
+    || !(SUPERVISOR_ASSESSMENT_DISPOSITIONS as readonly string[]).includes(rawArgs.disposition)
+  ) {
+    throw inputInvalid(`disposition must be one of: ${SUPERVISOR_ASSESSMENT_DISPOSITIONS.join(", ")}`);
+  }
+  if (typeof rawArgs.rationale !== "string" || rawArgs.rationale.trim() === "") {
+    throw inputInvalid("rationale must be a non-empty string (E6 §45)");
+  }
+  if (typeof rawArgs.expected_candidate_revision !== "number" || !Number.isInteger(rawArgs.expected_candidate_revision)) {
+    throw inputInvalid("expected_candidate_revision must be an integer");
+  }
+  if (rawArgs.report_judgments !== undefined && !Array.isArray(rawArgs.report_judgments)) {
+    throw inputInvalid("report_judgments must be an array");
+  }
+  if (rawArgs.covered_obligations !== undefined && !Array.isArray(rawArgs.covered_obligations)) {
+    throw inputInvalid("covered_obligations must be an array");
+  }
+  if (rawArgs.plan_refs !== undefined && !Array.isArray(rawArgs.plan_refs)) {
+    throw inputInvalid("plan_refs must be an array");
+  }
+  const result = ctx.store.withWrite((tx) =>
+    submitSupervisorAssessmentInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        disposition: rawArgs.disposition as SupervisorAssessmentDisposition,
+        rationale: rawArgs.rationale as string,
+        reportJudgments: ((rawArgs.report_judgments as Array<Record<string, unknown>> | undefined) ?? []).map((judgment) => ({
+          ...judgment,
+          ...(judgment.reportId === undefined && judgment.report_id !== undefined ? { reportId: judgment.report_id } : {}),
+          ...(judgment.supersededByReportId === undefined && judgment.superseded_by_report_id !== undefined
+            ? { supersededByReportId: judgment.superseded_by_report_id }
+            : {}),
+        })),
+        coveredObligations: ((rawArgs.covered_obligations as Array<Record<string, unknown>> | undefined) ?? []).map((obligation) => ({
+          ...obligation,
+          ...(obligation.directiveId === undefined && obligation.directive_id !== undefined
+            ? { directiveId: obligation.directive_id }
+            : {}),
+          ...(obligation.directiveRevision === undefined && obligation.directive_revision !== undefined
+            ? { directiveRevision: obligation.directive_revision }
+            : {}),
+          ...(obligation.stageId === undefined && obligation.stage_id !== undefined
+            ? { stageId: obligation.stage_id }
+            : {}),
+          ...(obligation.objectiveHash === undefined && obligation.objective_hash !== undefined
+            ? { objectiveHash: obligation.objective_hash }
+            : {}),
+          // E10 §22 — execution_run_completion identity fields (snake boundary).
+          ...(obligation.executionRunId === undefined && obligation.execution_run_id !== undefined
+            ? { executionRunId: obligation.execution_run_id }
+            : {}),
+          ...(obligation.finalPlanHash === undefined && obligation.final_plan_hash !== undefined
+            ? { finalPlanHash: obligation.final_plan_hash }
+            : {}),
+          ...(obligation.baseAcceptedHeadCommitId === undefined && obligation.base_accepted_head_commit_id !== undefined
+            ? { baseAcceptedHeadCommitId: obligation.base_accepted_head_commit_id }
+            : {}),
+          ...(obligation.completedStageSetHash === undefined && obligation.completed_stage_set_hash !== undefined
+            ? { completedStageSetHash: obligation.completed_stage_set_hash }
+            : {}),
+        })),
+        ...(rawArgs.plan_refs === undefined ? {} : { planRefs: rawArgs.plan_refs as DirectivePlanRef[] }),
+        expectedCandidateRevision: rawArgs.expected_candidate_revision as number,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  if (result.commit === null) {
+    // E6 §20 — a non-accept disposition persists the judgment only.
+    return {
+      status: "recorded",
+      assessment_id: result.assessment.assessmentId,
+      disposition: result.assessment.disposition,
+      candidate_revision: result.assessment.candidateRevision,
+      window_id: result.assessment.windowId,
+      next: "The assessment is durable history. Accepted state is unchanged; direct the next Directive or report an execution issue.",
+    };
+  }
+  return {
+    status: "accepted",
+    assessment_id: result.assessment.assessmentId,
+    commit: {
+      id: result.commit.commitId,
+      sequence: result.commit.sequence,
+      parent_commit_id: result.commit.parentCommitId,
+      scope_kind: result.commit.scopeKind,
+      window_id: result.commit.windowId,
+      candidate_revision: result.commit.candidateRevision,
+      directive_ref_count: result.commit.directiveRefs.length,
+      report_ref_count: result.commit.reportRefs.length,
+    },
+    accepted_head: result.acceptedHeadCommitId,
+    window_closed: true,
+    stage_completed: result.stageCompleted,
+    run_completed: result.runCompleted,
+    next: result.runCompleted
+      ? `EXECUTION RUN COMPLETE (E10 §37/§42): the ExecutionCompletionGate transitioned the run to completed inside this transaction. Final ExecutionCommit ${result.commit.commitId} is the acceptedHead and the completion provenance; your supervisor binding is detached. The run can never resume.`
+      : result.stageCompleted
+        ? "ExecutionCommit created and the Stage is COMPLETED (E7 §11): no open window remains. Read phase_plan.get_execution_progression_context and explicitly activate an eligible pending Stage when ready."
+        : "ExecutionCommit created: the acceptedHead advanced. No successor window is opened automatically (E6 §33); continue this Stage explicitly with phase_plan.continue_execution_stage or progress via phase_plan.get_execution_progression_context.",
+  };
+}
+
+/**
+ * phase_plan.get_execution_progression_context (E7 §18/§19) — the fenced
+ * supervisor's canonical progression projection: canonical Store facts, the
+ * dependency-derived eligible/ineligible Stage classification, and the exact
+ * progression boundary. Core never chooses the next Stage (E7 §17).
+ */
+export function handleGetExecutionProgressionContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_execution_progression_context");
+  const context = ctx.store.withRead((tx) => loadExecutionProgressionContextInTx(tx, envelope.executionRunId));
+  return {
+    status: "ok",
+    execution_run: context.executionRun,
+    accepted_head: context.acceptedHead,
+    active_stage: context.activeStage,
+    open_window: context.openWindow,
+    last_execution_commit: context.lastExecutionCommit,
+    pending_stages: context.pendingStages,
+    completed_stages: context.completedStages,
+    eligible_stages: context.eligibleStages,
+    ineligible_stages: context.ineligibleStages,
+    default_suggested_stage: context.defaultSuggestedStageId,
+    progression_boundary: context.progressionBoundary,
+    next:
+      context.progressionBoundary === "active_candidate"
+        ? "Normal execution is in progress under the open window."
+        : context.progressionBoundary === "post_commit_same_stage"
+          ? "Post-commit same-stage boundary: continue this Stage explicitly with phase_plan.continue_execution_stage."
+          : context.progressionBoundary === "between_stages"
+            ? "Between stages: select an eligible pending Stage and activate it with phase_plan.activate_execution_stage."
+            : "All Stages are completed: at the all_stages_completed boundary. When you decide to close the run, read phase_plan.get_execution_final_closure_context and explicitly begin final execution closure (phase_plan.begin_execution_final_closure) — it is never auto-started (E10 §10).",
+  };
+}
+
+/**
+ * phase_plan.continue_execution_stage (E7 §20/§21) — the explicit Supervisor
+ * decision to keep implementing the active Stage: opens the successor window
+ * (candidateRevision 0, base = exact acceptedHead). Orchestration only — the
+ * acceptedHead never moves here (E7 §39).
+ */
+export function handleContinueExecutionStage(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "continue_execution_stage");
+  const result = ctx.store.withWrite((tx) =>
+    continueExecutionStageInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "continued",
+    stage: { id: result.stage.id, ordinal: result.stage.ordinal },
+    window: {
+      id: result.window.id,
+      candidate_revision: result.window.candidateRevision,
+      base_kind: result.window.baseKind,
+      base_commit_id: result.window.baseCommitId,
+    },
+    accepted_head: result.baseCommitId,
+    next: "New verification window open for the same Stage at candidateRevision 0 (base = acceptedHead). Issue Directives through phase_plan.issue_execution_directive.",
+  };
+}
+
+/**
+ * phase_plan.activate_execution_stage (E7 §22) — the Supervisor selects one
+ * eligible pending Stage; Core validates the explicit dependencies and
+ * atomically transitions pending → active + opens the Stage's first window
+ * rooted in the exact acceptedHead. The acceptedHead never moves (E7 §39).
+ */
+export function handleActivateExecutionStage(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["target_stage_id"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "activate_execution_stage");
+  if (typeof rawArgs.target_stage_id !== "string" || rawArgs.target_stage_id === "") {
+    throw inputInvalid("target_stage_id must be a non-empty string");
+  }
+  const result = ctx.store.withWrite((tx) =>
+    activateExecutionStageInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        targetStageId: rawArgs.target_stage_id as string,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "activated",
+    stage: { id: result.stage.id, ordinal: result.stage.ordinal, objective: result.stage.objective },
+    window: {
+      id: result.window.id,
+      candidate_revision: result.window.candidateRevision,
+      base_kind: result.window.baseKind,
+      base_commit_id: result.window.baseCommitId,
+    },
+    accepted_head: result.baseCommitId,
+    next: "Stage activated with its first verification window at candidateRevision 0 (base = acceptedHead). Issue Directives through phase_plan.issue_execution_directive.",
+  };
+}
+
+/**
+ * phase_plan.get_verification_policy_context (E8 §23) — the derived
+ * verification-pressure projection. Store facts only; the Store stays
+ * canonical and nothing is cached.
+ */
+export function handleGetVerificationPolicyContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_verification_policy_context");
+  const state = ctx.store.withRead((tx) => loadVerificationPolicyStateInTx(tx, envelope.executionRunId));
+  if (state === null) {
+    return {
+      status: "no_open_window",
+      next: "No open verification window: verification pressure is derived only inside a window (E8 §10).",
+    };
+  }
+  return {
+    status: "ok",
+    window_id: state.windowId,
+    candidate_revision: state.candidateRevision,
+    latest_verified_revision: state.latestVerifiedRevision,
+    unverified_mutation_span: state.unverifiedMutationSpan,
+    max_unverified_mutations: state.maxUnverifiedMutations,
+    verification_required: state.verificationRequired,
+    reason: state.reason,
+    blocking_report_ref: state.blockingReportRef,
+    normal_verification_reports: state.normalVerificationReports,
+    legacy_policy_present: state.legacyPolicyPresent,
+    next: state.verificationRequired
+      ? "Implementation issuance and starts are blocked: issue and complete a fresh NORMAL verification at the exact current candidate (E8 §14–§22). Inspection and verification remain allowed."
+      : "Implementation work may continue within the frozen bound (E8 §14).",
+  };
+}
+
+/**
+ * phase_plan.declare_verification_conflict (E8 §30) — the Supervisor's durable
+ * factual-conflict declaration. Core validates structure only.
+ */
+export function handleDeclareVerificationConflict(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["fact", "claims", "rationale"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "declare_verification_conflict");
+  if (typeof rawArgs.fact !== "string" || rawArgs.fact.trim() === "") {
+    throw inputInvalid("fact must be a non-empty statement");
+  }
+  if (!Array.isArray(rawArgs.claims) || rawArgs.claims.length < 2) {
+    throw inputInvalid("claims must be an array of at least two claim variants");
+  }
+  const conflict = ctx.store.withWrite((tx) =>
+    declareVerificationConflictInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        fact: rawArgs.fact as string,
+        claims: rawArgs.claims as unknown[],
+        ...(rawArgs.rationale === undefined ? {} : { rationale: rawArgs.rationale as string }),
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "declared",
+    conflict: {
+      id: conflict.conflictId,
+      window_id: conflict.windowId,
+      candidate_revision: conflict.candidateRevision,
+      status: conflict.status,
+      claim_variants: conflict.claims.map((claim) => claim.variant),
+      fingerprint: conflict.fingerprint,
+    },
+    next:
+      "Conflict declared OPEN. Author exactly ONE dedicated resolution VerificationDirective (kind=verification, "
+      + "verification_purpose=conflict_resolution, verification_conflict_id) — Core binds it and no second resolver is possible. "
+      + "A fresh worker session, distinct from all source-report sessions, must run it.",
+  };
+}
+
+/**
+ * phase_plan.resolve_verification_conflict (E8 §35) — the Supervisor settles
+ * the conflict on the dedicated resolver's exact report.
+ */
+export function handleResolveVerificationConflict(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["conflict_id", "outcome", "resolution_report_id", "rationale"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "resolve_verification_conflict");
+  if (typeof rawArgs.conflict_id !== "string" || rawArgs.conflict_id === "") throw inputInvalid("conflict_id is required");
+  if (rawArgs.outcome !== "resolved" && rawArgs.outcome !== "verification_blocked") {
+    throw inputInvalid("outcome must be 'resolved' or 'verification_blocked'");
+  }
+  if (typeof rawArgs.resolution_report_id !== "string" || rawArgs.resolution_report_id === "") {
+    throw inputInvalid("resolution_report_id is required");
+  }
+  if (typeof rawArgs.rationale !== "string" || rawArgs.rationale.trim() === "") {
+    throw inputInvalid("rationale must be a non-empty string (E8 §35)");
+  }
+  const conflict = ctx.store.withWrite((tx) =>
+    resolveVerificationConflictInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        conflictId: rawArgs.conflict_id as string,
+        outcome: rawArgs.outcome as "resolved" | "verification_blocked",
+        resolutionReportId: rawArgs.resolution_report_id as string,
+        rationale: rawArgs.rationale as string,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: conflict.status,
+    conflict_id: conflict.conflictId,
+    candidate_revision: conflict.candidateRevision,
+    resolution_report_id: conflict.resolutionReportId,
+    next:
+      conflict.status === "resolved"
+        ? "Conflict resolved: it no longer blocks acceptance, but it never substitutes for fresh NORMAL verification (E8 §34)."
+        : "verification_blocked: commits are blocked for this candidate, but inspection and rework remain allowed — a mutation creates a new candidate and naturally stales the conflict (E8 §37/§42).",
+  };
+}
+
+/**
+ * phase_plan.request_execution_replan (E9 §6/§24) — the Supervisor's semantic
+ * replan judgment; Core validates protocol + authority and executes the ONE
+ * atomic terminal transaction. The model supplies intent only.
+ */
+export function handleRequestExecutionReplan(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["reason", "affected_normative_refs", "relevant_report_refs", "trigger_assessment_id"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "request_execution_replan");
+  if (typeof rawArgs.reason !== "string" || rawArgs.reason.trim() === "") {
+    throw inputInvalid("reason must be a non-empty statement");
+  }
+  if (rawArgs.affected_normative_refs !== undefined && !Array.isArray(rawArgs.affected_normative_refs)) {
+    throw inputInvalid("affected_normative_refs must be an array");
+  }
+  if (rawArgs.relevant_report_refs !== undefined && !Array.isArray(rawArgs.relevant_report_refs)) {
+    throw inputInvalid("relevant_report_refs must be an array of report ids");
+  }
+  const result = ctx.store.withWrite((tx) =>
+    requestExecutionReplanInTx(
+      tx,
+      {
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        reason: rawArgs.reason as string,
+        affectedNormativeRefs: (rawArgs.affected_normative_refs as unknown[]) ?? [],
+        relevantReportRefs: (rawArgs.relevant_report_refs as string[]) ?? [],
+        ...(rawArgs.trigger_assessment_id === undefined ? {} : { triggerAssessmentId: rawArgs.trigger_assessment_id as string }),
+        toolUseId: envelope.toolUseId,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: result.status,
+    execution_run_id: result.executionRunId,
+    issue_id: result.issueId,
+    issue_hash: result.issueHash,
+    window_terminal_closed: result.windowClosed,
+    supervisor_binding_detached: result.bindingDetached,
+    next:
+      result.status === "already_replan_required"
+        ? "This replan already happened: the run is terminal and the issue is durable. Invoke /phase-plan to create (or resume) the successor PlanningRun."
+        : "Execution is TERMINAL (replan_required): no further Directives, Attempts, or commits. Invoke /phase-plan — a NEW PlanningRun is created from the old FinalPlan baseline; ordinary repository mutation stays paused until then (E9 §29).",
+  };
+}
+
+/**
+ * phase_plan.get_execution_final_closure_context (E10 §55) — the run-level
+ * final-closure surface: completion obligation identity, verifier requirement,
+ * window state, policy/conflicts, and blockers. Store-derived only.
+ */
+export function handleGetExecutionFinalClosureContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_execution_final_closure_context");
+  const context = ctx.store.withRead((tx) => loadExecutionFinalClosureContextInTx(tx, envelope.executionRunId));
+  return {
+    status: "ok",
+    execution_run: context.executionRun,
+    final_plan: context.finalPlan,
+    accepted_head: context.acceptedHead,
+    stages: context.stages,
+    all_stages_completed: context.allStagesCompleted,
+    final_closure_window: context.finalClosureWindow,
+    completion_obligation: context.completionObligation,
+    completion_verification_requirement: context.completionVerificationRequirement,
+    verification_policy: context.verificationPolicy,
+    current_conflicts: context.currentConflicts,
+    completion_blockers: context.completionBlockers,
+    next:
+      context.finalClosureWindow.state === "open"
+        ? "Run the final-closure window protocol: final-closure directives (issue_execution_directive with scope_kind='final_closure'), worker attempts, reports; then submit_supervisor_assessment=accept carrying the exact execution_run_completion obligation."
+        : context.completionObligation === null
+          ? "Final closure is not available at this boundary — resolve the completion blockers first (get_execution_progression_context)."
+          : "At the all_stages_completed boundary: begin_execution_final_closure when you decide to enter final closure (never auto-started, E10 §10).",
+  };
+}
+
+/**
+ * phase_plan.begin_execution_final_closure (E10 §9/§10/§56) — the explicit
+ * Supervisor start of the run-level Final Closure Window. Returns the exact
+ * window identity + the Core-derived completion obligation + verifier
+ * requirement so the Supervisor can compile proper final-closure directives.
+ */
+export function handleBeginExecutionFinalClosure(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "begin_execution_final_closure");
+  const result = ctx.store.withWrite((tx) =>
+    beginExecutionFinalClosureInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "final_closure_open",
+    window: {
+      id: result.window.id,
+      scope_kind: result.window.scopeKind,
+      stage_id: result.window.stageId,
+      candidate_revision: result.window.candidateRevision,
+      base_kind: result.window.baseKind,
+      base_commit_id: result.window.baseCommitId,
+    },
+    base_accepted_head_commit_id: result.baseAcceptedHeadCommitId,
+    candidate_revision: result.candidateRevision,
+    completion_obligation: result.completionObligation,
+    completion_verification_requirement: result.completionVerificationRequirement,
+    next:
+      "Issue final-closure directives (issue_execution_directive with scope_kind='final_closure') for integration/inspection/verification/rework; the FINAL accept assessment must carry the exact execution_run_completion obligation and a fresh verifier whose directive carries verify_execution_completion. Opening this window never completes the run.",
+  };
+}
+
+/**
+ * phase_plan.get_attempt_recovery_context (E11 §46) — the read-only recovery
+ * surface. Store-derived projection; never authority (E11 §47).
+ */
+export function handleGetAttemptRecoveryContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, []);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_attempt_recovery_context");
+  const context = ctx.store.withRead((tx) => loadAttemptRecoveryContextInTx(tx, envelope.executionRunId));
+  return {
+    status: "ok",
+    execution_run: context.executionRun,
+    accepted_head: context.acceptedHead,
+    open_window: context.openWindow,
+    attempts: context.attempts,
+    unresolved_indeterminate_attempt_ids: context.unresolvedIndeterminateAttemptIds,
+    execution_fenced: context.executionFenced,
+    capability_resolution_available: context.capabilityResolutionAvailable,
+    next: context.executionFenced
+      ? "Ordinary execution is fenced (E11 §13): issue_attempt_reconciliation (or resolve_indeterminate_attempt with no_effect_by_capability where available), or request_execution_replan."
+      : "No unresolved indeterminate work in the current window.",
+  };
+}
+
+/**
+ * phase_plan.retry_unclaimed_worker_launch (E11 §40/§41) — the same-Attempt
+ * launch-credential retry. Rotates the one-time token on the SAME prepared
+ * unclaimed binding; the old token is invalidated.
+ */
+export function handleRetryUnclaimedWorkerLaunch(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["attempt_id"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "retry_unclaimed_worker_launch");
+  if (typeof rawArgs.attempt_id !== "string" || rawArgs.attempt_id === "") throw inputInvalid("attempt_id is required");
+  const result = ctx.store.withWrite((tx) =>
+    retryUnclaimedLaunchInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        attemptId: rawArgs.attempt_id as string,
+      },
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "relaunched",
+    attempt_id: result.attemptId,
+    directive: result.directive,
+    worker_role: result.workerRole,
+    launch_token: result.launchToken,
+    worker_agent_type: result.workerAgentType,
+    next: "Launch the native phase-plan execution-worker subagent with ONLY attempt_id + the NEW launch_token. The previous token no longer works.",
+  };
+}
+
+/**
+ * phase_plan.issue_attempt_reconciliation (E11 §11/§12) — binding + exact
+ * inspection Directive in ONE transaction; the requiredAction hash-covers the
+ * target (E11 §10 preferred option 1 — no protocol v4).
+ */
+export function handleIssueAttemptReconciliation(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["attempt_id", "objective", "body", "capability_envelope", "report_contract", "_hostContext"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "issue_attempt_reconciliation");
+  if (typeof rawArgs.attempt_id !== "string" || rawArgs.attempt_id === "") throw inputInvalid("attempt_id is required");
+  if (typeof rawArgs.objective !== "string" || rawArgs.objective === "") throw inputInvalid("objective is required");
+  if (typeof rawArgs.body !== "string") throw inputInvalid("body must be a string");
+  const result = ctx.store.withWrite((tx) =>
+    issueAttemptReconciliationInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        attemptId: rawArgs.attempt_id as string,
+        objective: rawArgs.objective as string,
+        body: rawArgs.body as string,
+        capabilityEnvelope: rawArgs.capability_envelope as ExecutionDirective["capabilityEnvelope"],
+        reportContract: rawArgs.report_contract as ExecutionDirective["reportContract"],
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "reconciliation_bound",
+    attempt_id: result.binding.attemptId,
+    directive: {
+      id: result.directive.directiveId,
+      revision: result.directive.revision,
+      hash: result.directive.hash,
+      kind: result.directive.kind,
+      scope_kind: result.directive.scopeKind,
+      stage_id: result.directive.stageId,
+      window_id: result.directive.windowId,
+      base_candidate_revision: result.directive.baseCandidateRevision,
+    },
+    side_effect_capable: result.sideEffectCapable,
+    next: result.sideEffectCapable
+      ? "Start the inspection attempt with start_worker_attempt (this exact revision + hash). The interrupted Directive had side-effect-capable authority: only a completed non-mutating inspection Report may resolve the Attempt."
+      : "The interrupted Directive was provably non-mutating: resolve_indeterminate_attempt with no_effect_by_capability is available without an inspection.",
+  };
+}
+
+/**
+ * phase_plan.resolve_indeterminate_attempt (E11 §24–§29) — the final immutable
+ * reconciliation.
+ */
+export function handleResolveIndeterminateAttempt(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["attempt_id", "resolution", "inspection_report_id", "rationale", "expected_candidate_revision", "_hostContext"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "resolve_indeterminate_attempt");
+  if (typeof rawArgs.attempt_id !== "string" || rawArgs.attempt_id === "") throw inputInvalid("attempt_id is required");
+  const resolution = rawArgs.resolution;
+  if (resolution !== "no_effect" && resolution !== "no_effect_by_capability" && resolution !== "candidate_changed") {
+    throw inputInvalid("resolution must be no_effect | no_effect_by_capability | candidate_changed");
+  }
+  if (typeof rawArgs.rationale !== "string" || rawArgs.rationale.trim() === "") throw inputInvalid("rationale must be a non-empty string");
+  if (typeof rawArgs.expected_candidate_revision !== "number") throw inputInvalid("expected_candidate_revision must be a number");
+  const result = ctx.store.withWrite((tx) =>
+    resolveIndeterminateAttemptInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        attemptId: rawArgs.attempt_id as string,
+        resolution,
+        ...(typeof rawArgs.inspection_report_id === "string" && rawArgs.inspection_report_id !== ""
+          ? { inspectionReportId: rawArgs.inspection_report_id as string }
+          : {}),
+        rationale: rawArgs.rationale as string,
+        expectedCandidateRevision: rawArgs.expected_candidate_revision as number,
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: result.status,
+    reconciliation: {
+      id: result.reconciliation.reconciliationId,
+      attempt_id: result.reconciliation.attemptId,
+      resolution: result.reconciliation.resolution,
+      candidate_revision_before: result.reconciliation.candidateRevisionBefore,
+      candidate_revision_after: result.reconciliation.candidateRevisionAfter,
+    },
+    window: { id: result.window.id, candidate_revision: result.window.candidateRevision },
+    next:
+      result.status === "already_resolved"
+        ? "The Attempt was already reconciled with this exact resolution; the durable fact is returned unchanged."
+        : result.reconciliation.resolution === "candidate_changed"
+          ? "Candidate recovered: all verification at the previous revision is stale. A fresh normal verification (and, for final closure, a fresh final verifier) is required before acceptance."
+          : "No durable effect: normal execution may resume (E11 §25).",
+  };
+}
+
+function requireExecutionSupervisorContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>, tool: string): ExecutionHostContextV1 {
+
+  const token = requireHostContext(rawArgs);
+  const signed = parseSignedHostContext(ctx.secret, token);
+  if (signed.authority !== "execution") {
+    throw domainError("WORKER_AUTHORITY_REQUIRED", tool + " requires an execution-domain supervisor context signed by the PreToolUse hook");
+  }
+  return assertExecutionHostContextForTool(ctx.secret, token, { tool, businessInput: rawArgs });
+}
+
+/**
+ * phase_plan.issue_execution_directive (E5 §42) — the fenced supervisor's
+ * domain-intent issuance. The FinalPlan/stage/window/base bindings are
+ * revalidated by the E4 core; the model supplies only directive intent.
+ */
+export function handleIssueExecutionDirective(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, [
+    "kind",
+    "stage_id",
+    "scope_kind",
+    "window_id",
+    "objective",
+    "body",
+    "directive_id",
+    "revision",
+    "final_plan_ref",
+    "base_candidate_revision",
+    "plan_refs",
+    "expected_execution_scope",
+    "capability_envelope",
+    "invariants",
+    "required_actions",
+    "forbidden_actions",
+    "validation_requirements",
+    "deliverables",
+    "stop_conditions",
+    "report_contract",
+    "verification_policy",
+  ]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "issue_execution_directive");
+  if (typeof rawArgs.kind !== "string") throw inputInvalid("kind must be a string");
+  // E10 §5/§16 — exactly one scope form: stage_id (stage scope) or
+  // scope_kind='final_closure' with no stage_id. The authority triangle is
+  // revalidated by the E10 core.
+  if (rawArgs.stage_id !== undefined && (typeof rawArgs.stage_id !== "string" || rawArgs.stage_id === "")) {
+    throw inputInvalid("stage_id must be a non-empty string when present");
+  }
+  if (
+    rawArgs.scope_kind !== undefined
+    && (rawArgs.scope_kind !== "final_closure" || rawArgs.stage_id !== undefined)
+  ) {
+    throw inputInvalid("scope_kind must be 'final_closure' and must be omitted when stage_id is present");
+  }
+  if (rawArgs.stage_id === undefined && rawArgs.scope_kind === undefined) {
+    throw inputInvalid("directive scope is required: stage_id (stage scope) or scope_kind='final_closure' (E10 §5)");
+  }
+  if (typeof rawArgs.window_id !== "string" || rawArgs.window_id === "") throw inputInvalid("window_id is required");
+  if (typeof rawArgs.objective !== "string" || rawArgs.objective === "") throw inputInvalid("objective is required");
+  if (typeof rawArgs.body !== "string") throw inputInvalid("body must be a string");
+  if (typeof rawArgs.capability_envelope !== "object" || rawArgs.capability_envelope === null) {
+    throw inputInvalid("capability_envelope is required and must be the complete 8-field object");
+  }
+  if (typeof rawArgs.report_contract !== "object" || rawArgs.report_contract === null) {
+    throw inputInvalid("report_contract is required and must be the complete contract object");
+  }
+  const directive = ctx.store.withWrite((tx) =>
+    issueExecutionDirectiveInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        kind: rawArgs.kind as ExecutionDirectiveKind,
+        ...(rawArgs.stage_id === undefined ? {} : { stageId: rawArgs.stage_id as string }),
+        ...(rawArgs.scope_kind === undefined ? {} : { scopeKind: rawArgs.scope_kind as "final_closure" }),
+        windowId: rawArgs.window_id as string,
+        objective: rawArgs.objective as string,
+        body: rawArgs.body as string,
+        ...(rawArgs.directive_id === undefined ? {} : { directiveId: rawArgs.directive_id as string }),
+        ...(rawArgs.revision === undefined ? {} : { revision: rawArgs.revision as number }),
+        ...(rawArgs.final_plan_ref === undefined ? {} : { finalPlanRef: rawArgs.final_plan_ref as IssueExecutionDirectiveInput["finalPlanRef"] }),
+        ...(rawArgs.base_candidate_revision === undefined ? {} : { baseCandidateRevision: rawArgs.base_candidate_revision as number }),
+        ...(rawArgs.plan_refs === undefined ? {} : { planRefs: rawArgs.plan_refs as DirectivePlanRef[] }),
+        ...(rawArgs.expected_execution_scope === undefined ? {} : { expectedExecutionScope: rawArgs.expected_execution_scope as IssueExecutionDirectiveInput["expectedExecutionScope"] }),
+        capabilityEnvelope: rawArgs.capability_envelope as IssueExecutionDirectiveInput["capabilityEnvelope"],
+        ...(rawArgs.invariants === undefined ? {} : { invariants: rawArgs.invariants as IssueExecutionDirectiveInput["invariants"] }),
+        ...(rawArgs.required_actions === undefined ? {} : { requiredActions: rawArgs.required_actions as IssueExecutionDirectiveInput["requiredActions"] }),
+        ...(rawArgs.forbidden_actions === undefined ? {} : { forbiddenActions: rawArgs.forbidden_actions as IssueExecutionDirectiveInput["forbiddenActions"] }),
+        ...(rawArgs.validation_requirements === undefined ? {} : { validationRequirements: rawArgs.validation_requirements as IssueExecutionDirectiveInput["validationRequirements"] }),
+        ...(rawArgs.deliverables === undefined ? {} : { deliverables: rawArgs.deliverables as IssueExecutionDirectiveInput["deliverables"] }),
+        ...(rawArgs.stop_conditions === undefined ? {} : { stopConditions: rawArgs.stop_conditions as IssueExecutionDirectiveInput["stopConditions"] }),
+        reportContract: rawArgs.report_contract as IssueExecutionDirectiveInput["reportContract"],
+        ...(rawArgs.verification_policy === undefined
+          ? {}
+          : {
+              verificationPolicy: normalizeSnakeRecord(rawArgs.verification_policy as Record<string, unknown>, [
+                ["implementation_requirement", "implementationRequirement"],
+                ["verification_purpose", "verificationPurpose"],
+                ["verification_conflict_id", "verificationConflictId"],
+              ]) as unknown as IssueExecutionDirectiveInput["verificationPolicy"],
+            }),
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "issued",
+    directive: {
+      id: directive.directiveId,
+      revision: directive.revision,
+      hash: directive.hash,
+      kind: directive.kind,
+      scope_kind: directive.scopeKind,
+      stage_id: directive.stageId,
+      window_id: directive.windowId,
+      base_candidate_revision: directive.baseCandidateRevision,
+    },
+    next: "Start a worker attempt with phase_plan.start_worker_attempt using this exact revision + hash.",
+  };
+}
+
+/**
+ * phase_plan.start_worker_attempt (E5 §9/§20/§42) — the fenced supervisor
+ * starts the exact Attempt and prepares the one-time worker launch package.
+ * The plaintext launch token is returned EXACTLY ONCE here; only its hash is
+ * durable. The Supervisor then launches the native phase-plan execution-worker
+ * subagent with the claim bootstrap (attempt_id + launch token) — never the
+ * Directive itself (E5 §43).
+ */
+export function handleStartWorkerAttempt(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  assertExactBusinessFields(rawArgs, ["directive_id", "directive_revision", "directive_hash", "worker_role"]);
+  const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "start_worker_attempt");
+  if (typeof rawArgs.directive_id !== "string" || rawArgs.directive_id === "") throw inputInvalid("directive_id is required");
+  if (typeof rawArgs.directive_revision !== "number" || !Number.isInteger(rawArgs.directive_revision)) {
+    throw inputInvalid("directive_revision must be an integer");
+  }
+  if (typeof rawArgs.directive_hash !== "string" || rawArgs.directive_hash === "") throw inputInvalid("directive_hash is required");
+  if (rawArgs.worker_role !== "executor" && rawArgs.worker_role !== "verifier") {
+    throw inputInvalid('worker_role must be "executor" or "verifier"');
+  }
+  const { attempt, launch } = ctx.store.withWrite((tx) =>
+    startWorkerAttemptAndPrepareLaunchInTx(
+      tx,
+      {
+        executionRunId: envelope.executionRunId,
+        sessionId: envelope.sessionId,
+        workspaceId: envelope.workspaceId,
+        generation: envelope.executionBindingGeneration,
+        directiveId: rawArgs.directive_id as string,
+        directiveRevision: rawArgs.directive_revision as number,
+        directiveHash: rawArgs.directive_hash as string,
+        workerRole: rawArgs.worker_role as StartExecutionAttemptInput["workerRole"],
+      },
+      ctx.clock,
+      ctx.clock.nowIso(),
+    ),
+  );
+  return {
+    status: "launched",
+    attempt_id: attempt.attemptId,
+    worker_role: attempt.workerRole,
+    directive: launch.directive,
+    worker_agent_type: launch.workerAgentType,
+    launch_token: launch.launchToken,
+    next: "Launch the phase-plan execution-worker subagent with ONLY attempt_id, this one-time launch_token, and the instruction to claim via phase_plan.worker_claim. Never paste the Directive into the launch prompt.",
+  };
+}
 // ---------------------------------------------------------------------------
 
 export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, rawArgs: Record<string, unknown>): Record<string, unknown> {
@@ -2681,6 +4818,50 @@ export function executePhasePlanTool(ctx: PhasePlanToolContext, name: string, ra
       return handleTakeoverRun(ctx, rawArgs);
     case "abort_run":
       return handleAbortRun(ctx, rawArgs);
+    case "abort_execution_run":
+      return handleAbortExecutionRun(ctx, rawArgs);
+    case "reexecute_final_plan":
+      return handleReexecuteFinalPlan(ctx, rawArgs);
+    case "worker_claim":
+      return handleWorkerClaim(ctx, rawArgs);
+    case "worker_get_assignment":
+      return handleWorkerGetAssignment(ctx, rawArgs);
+    case "worker_submit_report":
+      return handleWorkerSubmitReport(ctx, rawArgs);
+    case "issue_execution_directive":
+      return handleIssueExecutionDirective(ctx, rawArgs);
+    case "start_worker_attempt":
+      return handleStartWorkerAttempt(ctx, rawArgs);
+    case "get_execution_acceptance_context":
+      return handleGetExecutionAcceptanceContext(ctx, rawArgs);
+    case "submit_supervisor_assessment":
+      return handleSubmitSupervisorAssessment(ctx, rawArgs);
+    case "get_execution_progression_context":
+      return handleGetExecutionProgressionContext(ctx, rawArgs);
+    case "continue_execution_stage":
+      return handleContinueExecutionStage(ctx, rawArgs);
+    case "activate_execution_stage":
+      return handleActivateExecutionStage(ctx, rawArgs);
+    case "get_verification_policy_context":
+      return handleGetVerificationPolicyContext(ctx, rawArgs);
+    case "declare_verification_conflict":
+      return handleDeclareVerificationConflict(ctx, rawArgs);
+    case "resolve_verification_conflict":
+      return handleResolveVerificationConflict(ctx, rawArgs);
+    case "get_attempt_recovery_context":
+      return handleGetAttemptRecoveryContext(ctx, rawArgs);
+    case "retry_unclaimed_worker_launch":
+      return handleRetryUnclaimedWorkerLaunch(ctx, rawArgs);
+    case "issue_attempt_reconciliation":
+      return handleIssueAttemptReconciliation(ctx, rawArgs);
+    case "resolve_indeterminate_attempt":
+      return handleResolveIndeterminateAttempt(ctx, rawArgs);
+    case "get_execution_final_closure_context":
+      return handleGetExecutionFinalClosureContext(ctx, rawArgs);
+    case "begin_execution_final_closure":
+      return handleBeginExecutionFinalClosure(ctx, rawArgs);
+    case "request_execution_replan":
+      return handleRequestExecutionReplan(ctx, rawArgs);
     default:
       throw new RuntimeError("MCP_INPUT_INVALID", `unknown tool '${name}'`);
   }

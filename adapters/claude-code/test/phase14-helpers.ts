@@ -72,6 +72,7 @@ export function callHandoff(
     handoff_id: string;
     handoff_hash: string;
     final_plan: { id: string; hash: string };
+    execution_run: { id: string; lifecycle: string };
     repository_baseline: { kind: string; revision: string | null };
     execution_contract: string;
   };
@@ -96,7 +97,7 @@ export function executionToken(
   const envelope = buildExecutionHostContextEnvelope({
     sessionId: input.sessionId,
     workspaceId: input.workspaceId,
-    runId: input.runId,
+    executionRunId: input.runId,
     finalPlanId: input.finalPlanId,
     executionBindingGeneration: input.generation,
     permissionMode: input.permissionMode ?? "default",

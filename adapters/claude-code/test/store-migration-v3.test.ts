@@ -131,20 +131,33 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
           tx.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
         ) as { version: number; name: string }[];
         expect(history).toEqual([
-          { version: 1, name: "initialize-plan-store" },
-          { version: 2, name: "workspace-and-session-binding" },
-          { version: 3, name: "planning-run-foundation" },
-          { version: 4, name: "plan-memory-foundation" },
-          { version: 5, name: "proposal-approval-plan-commit" },
-          { version: 6, name: "observation-evidence-foundation" },
-          { version: 7, name: "evidence-freshness-foundation" },
-          { version: 8, name: "section-workflow" },
-          { version: 9, name: "synthesis-validation-foundation" },
-	  { version: 10, name: "finalization-final-plan" },
-	  { version: 11, name: "execution-handoff-foundation" },
-			{ version: 12, name: "execution-issue-successor-baseline" },
-		{ version: 13, name: "run-control-authorizations" },
-        ]);
+        { version: 1, name: "initialize-plan-store" },
+        { version: 2, name: "workspace-and-session-binding" },
+        { version: 3, name: "planning-run-foundation" },
+        { version: 4, name: "plan-memory-foundation" },
+        { version: 5, name: "proposal-approval-plan-commit" },
+        { version: 6, name: "observation-evidence-foundation" },
+        { version: 7, name: "evidence-freshness-foundation" },
+        { version: 8, name: "section-workflow" },
+        { version: 9, name: "synthesis-validation-foundation" },
+        { version: 10, name: "finalization-final-plan" },
+        { version: 11, name: "execution-handoff-foundation" },
+        { version: 12, name: "execution-issue-successor-baseline" },
+        { version: 13, name: "run-control-authorizations" },
+        { version: 14, name: "execution-run-foundation" },
+        { version: 15, name: "supervisor-binding-foundation" },
+        { version: 16, name: "execution-structure-foundation" },
+        { version: 17, name: "execution-protocol-foundation" },
+        { version: 18, name: "worker-invocation-foundation" },
+        { version: 19, name: "acceptance-foundation" },
+        { version: 20, name: "stage-completion-provenance" },
+        { version: 21, name: "verification-policy-conflict-foundation" },
+        { version: 22, name: "replan-required-foundation" },
+        { version: 23, name: "execution-scope-foundation" },
+        { version: 24, name: "attempt-reconciliation-foundation" },
+        { version: 25, name: "execution-abort-foundation" },
+        { version: 26, name: "execution-run-identity-foundation" },
+      ]);
         const runs = store.withRead((tx) => tx.prepare("SELECT count(*) AS n FROM planning_runs").get()) as { n: number };
         expect(runs.n).toBe(0);
         const sentinel = store.withRead((tx) => tx.prepare("SELECT note FROM phase3_sentinel").all()) as { note: string }[];
@@ -160,7 +173,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
 
       const backups = publishedBackups(backupsDir);
       expect(backups).toHaveLength(1);
-      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-13-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
+      expect(backups[0]).toMatch(/^phase-plan-pre-schema-2-26-\d{8}T\d{6}(\.\d+)?Z?-[0-9a-f-]{8,}\.sqlite3$/);
       const backupDb = openDatabase(path.join(backupsDir, backups[0]!), { readonly: true });
       try {
         const row = backupDb.prepare("PRAGMA user_version").get() as Record<string, unknown>;
@@ -236,7 +249,7 @@ describe("migration 2 → 3 planning-run-foundation (E1/E2/E31/§42)", () => {
       }
       // And the store still migrates cleanly afterwards.
       const retry = await initializePlanStore({ pluginDataRoot: root });
-      expect(retry.getSchemaVersion()).toBe(13);
+      expect(retry.getSchemaVersion()).toBe(26);
       retry.close();
     } finally {
       removeTempPluginDataRoot(root);

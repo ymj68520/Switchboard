@@ -42,7 +42,7 @@ export interface ExecutionHostContextV1 {
   sessionId: string;
   promptId?: string;
   workspaceId: string;
-  runId: string;
+  executionRunId: string;
   finalPlanId: string;
   executionBindingGeneration: number;
   permissionMode: string;
@@ -55,7 +55,7 @@ export interface BuildExecutionContextInput {
   sessionId: string;
   promptId?: string;
   workspaceId: string;
-  runId: string;
+  executionRunId: string;
   finalPlanId: string;
   executionBindingGeneration: number;
   permissionMode: string;
@@ -73,7 +73,7 @@ export function buildExecutionHostContextEnvelope(
     sessionId: input.sessionId,
     ...(input.promptId === undefined ? {} : { promptId: input.promptId }),
     workspaceId: input.workspaceId,
-    runId: input.runId,
+    executionRunId: input.executionRunId,
     finalPlanId: input.finalPlanId,
     executionBindingGeneration: input.executionBindingGeneration,
     permissionMode: input.permissionMode,
@@ -132,7 +132,7 @@ export function verifyExecutionHostContext(secret: Buffer, token: unknown): Exec
   for (const key of [
     "sessionId",
     "workspaceId",
-    "runId",
+    "executionRunId",
     "finalPlanId",
     "permissionMode",
     "toolUseId",
@@ -159,7 +159,7 @@ export function verifyExecutionHostContext(secret: Buffer, token: unknown): Exec
     sessionId: rest.sessionId as string,
     ...(rest.promptId === undefined ? {} : { promptId: rest.promptId as string }),
     workspaceId: rest.workspaceId as string,
-    runId: rest.runId as string,
+    executionRunId: rest.executionRunId as string,
     finalPlanId: rest.finalPlanId as string,
     executionBindingGeneration: rest.executionBindingGeneration as number,
     permissionMode: rest.permissionMode as string,

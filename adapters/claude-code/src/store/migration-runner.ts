@@ -160,6 +160,7 @@ export async function runMigrations(options: MigrationRunOptions): Promise<Migra
     // inconsistent store can never commit (history ↔ user_version).
     assertSchemaState(db, options.databasePath);
 
+
     db.exec("COMMIT");
     return { migrated: true, from: current, to: targetVersion, ...(backup ? { backup } : {}) };
   } catch (err) {

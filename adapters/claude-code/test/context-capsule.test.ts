@@ -111,7 +111,9 @@ describe("Recovery Capsule budget (§18/§19, E15/E16)", () => {
         compactProjection: "ARCH-1@1 | long projection | ".padEnd(400, "x"),
       });
       publishHead(fixture, [c, arch]);
-    }, { maxChars: 950 });
+    // The v4 capsule's P0 labels grew slightly (PlanningRun/planning_run_id);
+    // the tightened budget still drops the P1 architecture projection.
+    }, { maxChars: 1000 });
     expect(capsule.truncated).toBe(true);
     // P0 facts survive (E16 — never silently removed):
     expect(capsule.text).toContain("- C-1@1 (user): No network access at runtime");

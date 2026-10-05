@@ -181,12 +181,20 @@ export function auditStoreConsistency(db: AuditConnection): StoreConsistencyAudi
   if (!checks.executionBindingUnique) problems.push(`multiple execution binding rows on one run: ${dupExec.length}`);
 
   // Run-control lineage: resulting binding generation = expected + 1 and the
-  // resulting run revision is one the run actually reached.
+  // resulting run revision is one the run actually reached. A1 §49 — the
+  // revision check is target-aware: planning_run/legacy_pre_a1 rows compare
+  // against the planning run; execution_run rows compare against the exact
+  // ExecutionRun. Abort rows legitimately carry no resulting generation
+  // (E13 §34 — detachment preserves the generation).
   const badLineage = db
     .prepare(
-      "SELECT c.control_id, c.run_id FROM run_control_authorizations c "
-      + "WHERE c.resulting_binding_generation != c.expected_binding_generation + 1 "
-      + "OR c.resulting_run_revision > (SELECT r.revision FROM planning_runs r WHERE r.run_id = c.run_id)",
+      "SELECT c.control_id FROM run_control_authorizations c "
+      + "WHERE c.operation != 'abort' "
+      + "AND c.resulting_binding_generation != c.expected_binding_generation + 1 "
+      + "OR (c.target_kind IN ('planning_run', 'legacy_pre_a1') "
+      + "AND c.resulting_run_revision > (SELECT r.revision FROM planning_runs r WHERE r.run_id = c.run_id)) "
+      + "OR (c.target_kind = 'execution_run' "
+      + "AND c.resulting_run_revision > (SELECT e.revision FROM execution_runs e WHERE e.execution_run_id = c.execution_run_id))",
     )
     .all() as unknown[];
   checks.runControlLineage = badLineage.length === 0;
