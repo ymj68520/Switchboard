@@ -285,6 +285,8 @@ export interface ExecutionAcceptanceContext {
   stageCompletion: null | {
     stageId: string;
     objectiveHash: string;
+    /** Copy the complete Core-derived identity unchanged into coveredObligations. */
+    obligation: CoveredObligation;
     requiredVerificationRequirement: { requirement: string; detail: string };
     currentlyCovered: boolean;
   };
@@ -370,6 +372,7 @@ export function loadExecutionAcceptanceContextInTx(tx: StoreTx, executionRunId: 
         : {
             stageId: stage.id,
             objectiveHash: requiredCompletion.detail,
+            obligation: stageObjectiveObligation(stage),
             requiredVerificationRequirement: requiredCompletion,
             currentlyCovered:
               evidence !== null

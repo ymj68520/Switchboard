@@ -740,7 +740,7 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       type: "object",
       properties: {
         kind: { type: "string", enum: ["implementation", "inspection", "verification"] },
-        stage_id: { type: "string", description: "The CURRENT active execution stage id. Omit exactly when scope_kind='final_closure'." },
+        stage_id: { type: "string", description: "STAGE scope: the CURRENT active execution stage id; omit scope_kind entirely. FINAL-CLOSURE scope: omit stage_id and set scope_kind='final_closure'." },
         scope_kind: {
           type: "string",
           enum: ["final_closure"],
@@ -811,12 +811,23 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         validation_requirements: { type: "array", items: { type: "object", properties: { requirement: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["requirement", "detail"], additionalProperties: false } },
         deliverables: { type: "array", items: { type: "object", properties: { name: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["name", "detail"], additionalProperties: false } },
         stop_conditions: { type: "array", items: { type: "object", properties: { condition: { type: "string" }, detail: { type: ["string", "null"] } }, required: ["condition", "detail"], additionalProperties: false } },
+        verification_policy: {
+          type: "object",
+          properties: {
+            implementation_requirement: { type: "string", enum: ["batchable", "immediate"], description: "Required for implementation; omit verification_purpose and verification_conflict_id." },
+            verification_purpose: { type: "string", enum: ["normal", "conflict_resolution"], description: "Required for verification; omit implementation_requirement. Normal verification must omit verification_conflict_id." },
+            verification_conflict_id: { type: "string", minLength: 1, description: "Required only for conflict_resolution: the exact open conflict id." },
+          },
+          additionalProperties: false,
+          description: "Explicit frozen verification policy, required for implementation and verification directives. Omit for inspection. Core validates the kind-legality matrix; no policy is inferred from prose.",
+        },
         report_contract: {
           type: "object",
+          description: "Every true flag requires a NONEMPTY report array, not just field presence. Set requireBlockers=false for potentially successful work and requireDeviations=false when no deviation is expected; read-only verifiers also set requireFilesChanged=false. False never authorizes hiding actual blockers or deviations.",
           properties: {
             requireActionsPerformed: { type: "boolean" },
             requireFilesExamined: { type: "boolean" },
-            requireFilesChanged: { type: "boolean" },
+            requireFilesChanged: { type: "boolean", description: "True requires actual changed files; use false for non-mutating verification or inspection." },
             requireCommandsRun: { type: "boolean" },
             requireTestsRun: { type: "boolean" },
             requireFindings: { type: "boolean" },
@@ -973,7 +984,9 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
       + "(with its durable accepted base and candidateRevision), every Directive/Attempt/Report of the window split into "
       + "current-candidate vs historical evidence, per-report worker-role/result/mutation/session facts, qualifying fresh "
       + "verification, and existing SupervisorAssessments (current vs stale). Store-derived facts only — no repository reads, "
-      + "no worker or supervisor hidden reasoning. After a commit this reports the post-commit acceptance boundary (no open window).",
+      + "no worker or supervisor hidden reasoning. stage_completion.obligation is the complete Core-derived stage_objective "
+      + "claim: copy it unchanged into covered_obligations rather than computing or substituting hashes. After a commit this "
+      + "reports the post-commit acceptance boundary (no open window).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1014,18 +1027,28 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         },
         covered_obligations: {
           type: "array",
-          description: "Structured acceptance provenance resolving into existing Directive validationRequirements / approved plan refs / the active Stage's immutable objective (E7 §5).",
+          description: "Structured acceptance provenance over Directive requirements, approved plan refs, stage_objective or execution_run_completion. Copy stage_completion.obligation or completion_obligation verbatim, including contentHash; canonical identity fields and existing snake_case aliases are accepted.",
           items: {
             type: "object",
             properties: {
-              source: { type: "string", enum: ["directive_validation_requirement", "plan_ref", "stage_objective"] },
+              source: { type: "string", enum: ["directive_validation_requirement", "plan_ref", "stage_objective", "execution_run_completion"] },
               directive_id: { type: "string" },
               directive_revision: { type: "integer", minimum: 1 },
               index: { type: "integer", minimum: 0 },
               ref: { type: "object", properties: { kind: { type: "string" }, id: { type: "string" }, revision: { type: "integer", minimum: 1 } }, required: ["kind", "id", "revision"], additionalProperties: false },
               stage_id: { type: "string", description: "For stage_objective: the exact active Stage whose satisfaction this accepted candidate asserts." },
               objective_hash: { type: "string", description: "For stage_objective: the deterministic sha256 over the Stage's immutable semantics (from the acceptance context)." },
-              contentHash: { type: "string" },
+              stageId: { type: "string", description: "Canonical stage identity from stage_completion.obligation; stage_id remains accepted." },
+              objectiveHash: { type: "string", description: "Canonical objective identity from stage_completion.obligation; objective_hash remains accepted." },
+              execution_run_id: { type: "string", description: "For execution_run_completion: the exact execution run." },
+              final_plan_hash: { type: "string", description: "For execution_run_completion: the permanently bound FinalPlan hash." },
+              base_accepted_head_commit_id: { type: "string", description: "For execution_run_completion: the final-closure window's accepted base." },
+              completed_stage_set_hash: { type: "string", description: "For execution_run_completion: the Core-derived completed Stage-set identity." },
+              executionRunId: { type: "string", description: "Canonical completion_obligation identity; execution_run_id remains accepted." },
+              finalPlanHash: { type: "string", description: "Canonical completion_obligation identity; final_plan_hash remains accepted." },
+              baseAcceptedHeadCommitId: { type: "string", description: "Canonical completion_obligation identity; base_accepted_head_commit_id remains accepted." },
+              completedStageSetHash: { type: "string", description: "Canonical completion_obligation identity; completed_stage_set_hash remains accepted." },
+              contentHash: { type: "string", description: "Copy the exact Core-derived obligation contentHash; it is not the objectiveHash." },
             },
             required: ["source", "contentHash"],
             additionalProperties: false,
@@ -3966,7 +3989,7 @@ export function handleGetExecutionAcceptanceContext(ctx: PhasePlanToolContext, r
     next:
       context.candidate === null
         ? "No current candidate available for acceptance (post-commit acceptance boundary or no open window)."
-        : "Classify every current-candidate report and submit exactly one phase_plan.submit_supervisor_assessment.",
+        : "Classify every current-candidate report and submit phase_plan.submit_supervisor_assessment. To complete the Stage, copy stage_completion.obligation unchanged into covered_obligations.",
   };
 }
 

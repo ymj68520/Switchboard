@@ -157,13 +157,7 @@ export interface ExecutionFinalClosureContext {
     | { state: "absent" }
     | { state: "open"; windowId: string; candidateRevision: number; baseCommitId: string };
   /** E10 §22/§25 — the Core-derived obligation + verifier requirement. */
-  completionObligation: {
-    executionRunId: string;
-    finalPlanHash: string;
-    baseAcceptedHeadCommitId: string;
-    completedStageSetHash: string;
-    contentHash: string;
-  } | null;
+  completionObligation: ReturnType<typeof executionRunCompletionObligation> | null;
   completionVerificationRequirement: { requirement: string; detail: string } | null;
   verificationPolicy: ReturnType<typeof loadVerificationPolicyStateInTx>;
   currentConflicts: Array<{ conflictId: string; status: string; candidateRevision: number }>;
@@ -204,14 +198,7 @@ export function loadExecutionFinalClosureContextInTx(
   let requirement: ExecutionFinalClosureContext["completionVerificationRequirement"] = null;
   if (completable) {
     const semantics = loadExecutionCompletionSemanticsInTx(tx, executionRunId, headCommit.commitId);
-    const obligation = executionRunCompletionObligation(semantics);
-    completionObligation = {
-      executionRunId: obligation.executionRunId,
-      finalPlanHash: obligation.finalPlanHash,
-      baseAcceptedHeadCommitId: obligation.baseAcceptedHeadCommitId,
-      completedStageSetHash: obligation.completedStageSetHash,
-      contentHash: obligation.contentHash,
-    };
+    completionObligation = executionRunCompletionObligation(semantics);
     requirement = deriveExecutionCompletionValidationRequirement(semantics);
   }
 
@@ -277,13 +264,7 @@ export interface BeginFinalClosureResult {
   baseAcceptedHeadCommitId: string;
   candidateRevision: 0;
   /** E10 §56 — the Core-derived obligation + verifier requirement. */
-  completionObligation: {
-    executionRunId: string;
-    finalPlanHash: string;
-    baseAcceptedHeadCommitId: string;
-    completedStageSetHash: string;
-    contentHash: string;
-  };
+  completionObligation: ReturnType<typeof executionRunCompletionObligation>;
   completionVerificationRequirement: { requirement: string; detail: string };
 }
 
@@ -385,13 +366,7 @@ export function beginExecutionFinalClosureInTx(
     window,
     baseAcceptedHeadCommitId: headCommitId,
     candidateRevision: 0,
-    completionObligation: {
-      executionRunId: obligation.executionRunId,
-      finalPlanHash: obligation.finalPlanHash,
-      baseAcceptedHeadCommitId: obligation.baseAcceptedHeadCommitId,
-      completedStageSetHash: obligation.completedStageSetHash,
-      contentHash: obligation.contentHash,
-    },
+    completionObligation: obligation,
     completionVerificationRequirement: deriveExecutionCompletionValidationRequirement(semantics),
   };
 }
