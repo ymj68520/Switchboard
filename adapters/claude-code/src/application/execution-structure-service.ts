@@ -28,6 +28,7 @@
  */
 
 import { parseFinalPlanCanonical } from "./final-plan-canonical.js";
+import { tryApplyContinuationStructureInTx } from "./execution-continuation-service.js";
 import type { ExecutionStage } from "../core/execution-stage.js";
 import type { VerificationWindow } from "../core/verification-window.js";
 import { RuntimeError } from "../runtime/errors.js";
@@ -97,7 +98,12 @@ export function ensureExecutionStructureInTx(tx: StoreTx, executionRunId: string
   let structure = getExecutionStructureInTx(tx, executionRunId);
 
   // 1. Materialization (E3 §6): one initial ImplementationStep → one stage.
+  // P1: Check for predecessor continuation reuse before fresh decomposition.
   if (structure.stages.length === 0) {
+    const continuation = tryApplyContinuationStructureInTx(tx, executionRunId, clock, now);
+    if (continuation !== null) {
+      return continuation;
+    }
     const finalPlanRow = getFinalPlanInTx(tx, run.runId);
     if (finalPlanRow === null) {
       throw new RuntimeError("EXECUTION_STAGE_REQUIRED", `no approved FinalPlan exists for run '${executionRunId}'`, {

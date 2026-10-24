@@ -297,6 +297,7 @@ export type RuntimeErrorCode =
   | "EXECUTION_RUN_AMBIGUOUS"
   | "EXECUTION_SESSION_NOT_OWNER"
   | "WORKER_LIVENESS_UNCERTAIN"
+  | "WORKER_PROCESS_STILL_ALIVE"
   | "WORKER_LAUNCH_RETRY_NOT_ALLOWED"
   // v0.2.0 A1-II — explicit same-FinalPlan reexecution (amendment A1 §29–§33;
   // directive §48). IDEMPOTENCY_CONFLICT (Phase 6), RUN_NOT_FOUND (Phase 4),

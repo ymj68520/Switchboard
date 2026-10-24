@@ -40,6 +40,10 @@ import { getAcceptedHeadCommitIdInTx } from "../store/execution-commits.js";
 import { listRunAttemptsInTx } from "../store/execution-attempts.js";
 import { revokePreparedLaunchCredentialsForRunInTx } from "../store/worker-invocations.js";
 import { RuntimeError, type RuntimeErrorCode } from "../runtime/errors.js";
+import {
+  generateAbortManifestInTx,
+  type AbortManifest,
+} from "./workspace-reconciliation-service.js";
 
 export interface ExecutionAbortAuthorizationInput {
   /** `mcp-control:<signed toolUseId>` — the host-authorization proof. */
@@ -69,6 +73,7 @@ export interface ExecutionAbortResult {
   closedWindowId: string | null;
   /** Attempts whose prepared-unclaimed launch credentials were invalidated. */
   revokedLaunchCredentials: string[];
+  abortManifest?: AbortManifest;
 }
 
 function abortError(code: RuntimeErrorCode, message: string, detail?: Record<string, unknown>): RuntimeError {
@@ -124,12 +129,18 @@ export function createExecutionAbortService(store: PlanStore, clock: StoreClock)
             );
           }
           const replayedAbort = getExecutionAbortRecordInTx(tx, replay.executionRunId);
+          const wsRow = tx
+            .prepare("SELECT canonical_root AS canonicalRoot FROM workspaces WHERE workspace_id = ?")
+            .get(input.workspaceId) as { canonicalRoot: string } | undefined;
+          const workspaceRoot = wsRow?.canonicalRoot ?? "";
+          const abortManifest = generateAbortManifestInTx(tx, replay.executionRunId, workspaceRoot);
           return {
             executionRun: replayedRun,
             controlId: replay.controlId,
             idempotent: true,
             closedWindowId: replayedAbort?.openWindowId ?? null,
             revokedLaunchCredentials: [],
+            abortManifest,
           };
         }
 
@@ -236,12 +247,19 @@ export function createExecutionAbortService(store: PlanStore, clock: StoreClock)
           now,
         );
 
+        const wsRow = tx
+          .prepare("SELECT canonical_root AS canonicalRoot FROM workspaces WHERE workspace_id = ?")
+          .get(input.workspaceId) as { canonicalRoot: string } | undefined;
+        const workspaceRoot = wsRow?.canonicalRoot ?? "";
+        const abortManifest = generateAbortManifestInTx(tx, input.executionRunId, workspaceRoot);
+
         return {
           executionRun: aborted,
           controlId: control.controlId,
           idempotent: false,
           closedWindowId: structure.openWindow?.id ?? null,
           revokedLaunchCredentials,
+          abortManifest,
         };
       });
     },

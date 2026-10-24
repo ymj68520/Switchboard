@@ -42,6 +42,10 @@ import {
 } from "../store/execution-commits.js";
 import { getRunningAttemptInTx } from "../store/execution-attempts.js";
 import { requireCurrentSupervisorAuthorityInTx } from "../store/supervisor-bindings.js";
+import {
+  buildLayeredSupervisorContextInTx,
+  type LayeredSupervisorContext,
+} from "../context/execution-evolution-ledger.js";
 import { openNextWindowForActiveStageInTx } from "./acceptance-service.js";
 import { requireNoUnresolvedIndeterminateFenceInTx } from "./recovery-fence.js";
 import type { StoreClock } from "../store/migration-runner.js";
@@ -106,6 +110,8 @@ export interface ExecutionProgressionContext {
   /** UX-only default (lowest eligible ordinal); never authority (E7 §17). */
   defaultSuggestedStageId: string | null;
   progressionBoundary: ProgressionBoundary;
+  /** P3 — The three-layer (L0/L1/L2) Execution Evolution Ledger projection */
+  evolutionLedger?: LayeredSupervisorContext;
 }
 
 /** The explicit dependency facts of one pending Stage (E7 §15/§16). */
@@ -248,6 +254,9 @@ export function loadExecutionProgressionContextInTx(
     })),
     defaultSuggestedStageId: eligible.length === 0 ? null : (eligible[0]?.id ?? null),
     progressionBoundary,
+    evolutionLedger: buildLayeredSupervisorContextInTx(tx, executionRunId, {
+      activeStageId: activeStage?.id ?? undefined,
+    }),
   };
 }
 

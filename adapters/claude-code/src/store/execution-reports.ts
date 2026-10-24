@@ -63,6 +63,12 @@ export function getReportForAttemptInTx(tx: StoreTx, attemptId: string): Executi
   return raw === undefined ? null : mapReportRow(raw);
 }
 
+export function listRunReportsInTx(tx: StoreTx, executionRunId: string): ExecutionReport[] {
+  return (tx
+    .prepare(`SELECT ${REPORT_COLUMNS} FROM execution_reports WHERE execution_run_id = ? ORDER BY created_at`)
+    .all(executionRunId) as Record<string, unknown>[]).map(mapReportRow);
+}
+
 /**
  * Persist the immutable Report. Uniqueness (one per Attempt) is DDL-enforced;
  * the caller owns the full submission protocol (binding checks, contract

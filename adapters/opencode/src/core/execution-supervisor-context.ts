@@ -107,6 +107,11 @@ export interface ExecutionSupervisorContext {
     assessments: SupervisorContextAssessmentRef[];
     commits: SupervisorContextCommitRef[];
   };
+  /** P3: Execution Evolution Ledger preserving completed stages and cross-stage invariants beyond recency limit */
+  evolutionLedger?: {
+    completedStages: Array<{ id: string; ordinal?: number; objective?: string }>;
+    historicalInvariants: Array<{ factId: string; statement: string }>;
+  };
   /**
    * §88 — the EXACT operation contracts (name, description, mutability, and
    * the args shape) so the model never guesses argument names.
@@ -246,6 +251,18 @@ export function assembleExecutionSupervisorContext(input: AssembleExecutionSuper
         stageCompleted: commit.stageCompleted,
         satisfiedObligations: [...commit.satisfiedObligations] as string[],
       })),
+    },
+    evolutionLedger: {
+      completedStages: (input.stages ?? [])
+        .filter((s) => s.status === "completed")
+        .map((s) => ({ id: s.id, objective: s.objective })),
+      historicalInvariants: (input.reports ?? [])
+        .flatMap((r) =>
+          r.findings
+            .map((f) => (typeof f === "string" ? f : f.statement))
+            .filter((text) => text.toLowerCase().includes("invariant") || text.toLowerCase().includes("contract")),
+        )
+        .map((text, i) => ({ factId: `inv_${i}`, statement: text })),
     },
     casHints: {
       runRevision: input.runRevision,

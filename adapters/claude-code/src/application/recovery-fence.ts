@@ -80,6 +80,23 @@ export function requireNoUnresolvedIndeterminateFenceInTx(
   throw new RuntimeError(
     "ATTEMPT_RECONCILIATION_REQUIRED",
     `attempt '${unresolved[0]!.attemptId}' is indeterminate and unresolved; ordinary execution is fenced until the Attempt is reconciled (E11 §13)`,
-    { detail: { attemptIds: unresolved.map((attempt) => attempt.attemptId), windowId: openWindow.id }, recoverable: false },
+    {
+      detail: {
+        attemptIds: unresolved.map((attempt) => attempt.attemptId),
+        windowId: openWindow.id,
+        recoveryGuidance: {
+          fenced: true,
+          unresolvedAttemptId: unresolved[0]!.attemptId,
+          allowedRecoveryOperations: [
+            "get_attempt_recovery_context",
+            "issue_attempt_reconciliation",
+            "resolve_indeterminate_attempt",
+            "request_execution_replan",
+          ],
+          recommendedAction: "Call get_attempt_recovery_context to inspect recovery state, or issue_attempt_reconciliation to begin inspection (P5)",
+        },
+      },
+      recoverable: false,
+    },
   );
 }

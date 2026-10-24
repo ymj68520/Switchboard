@@ -201,6 +201,32 @@ export function requestExecutionReplanInTx(
     throw replanError("REPLAN_REQUEST_INVALID", "reason must be a non-empty statement of the normative insufficiency (E9 §5)", {});
   }
 
+  // P1 §1/§2 — replan requires a genuine normative design gap (contract/interface/
+  // decision/constraint insufficiency in the approved FinalPlan), not ordinary
+  // test failures, compiler/syntax errors, implementation difficulties, file path
+  // adjustments, or temporary environment blockers.
+  const reasonText = input.reason.trim();
+  const nonNormativePatterns = [
+    /^tests?\s*(failed|failing|failure)s?(\b|[.:!]|$)/i,
+    /^build\s*(failed|failure|error)s?(\b|[.:!]|$)/i,
+    /^compile(r)?\s*(failed|failure|error)s?(\b|[.:!]|$)/i,
+    /^flaky\s*tests?(\b|[.:!]|$)/i,
+    /^file\s*(path\s*)?(changed|missing|not\s*found)(\b|[.:!]|$)/i,
+    /^(temporary|transient)\s*(environment|network|system)\s*(issue|error|glitch)(\b|[.:!]|$)/i,
+    /^syntax\s*errors?(\b|[.:!]|$)/i,
+    /^implementation\s*(difficulty|hard|struggling)(\b|[.:!]|$)/i,
+  ];
+  if (
+    nonNormativePatterns.some((pattern) => pattern.test(reasonText))
+    && !/(contract|interface|normative|specification|architecture|decision|constraint|finalplan|invariant)/i.test(reasonText)
+  ) {
+    throw replanError(
+      "REPLAN_REQUEST_INVALID",
+      "replan requires a genuine normative design gap (contract/interface/architecture/decision/constraint insufficiency in the approved FinalPlan), not ordinary test failures, implementation difficulties, file path changes, or environment blockers (P1 §1/§2)",
+      { reason: input.reason },
+    );
+  }
+
   // E9 §9 — affected normative refs: exact, structured, reachable from the
   // bound FinalPlan; at least one anchor. "latest", unversioned ids, and
   // arbitrary strings are unrepresentable here.

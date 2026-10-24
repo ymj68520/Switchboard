@@ -353,7 +353,7 @@ async function handleWorkerCapabilityGuard(
         "no claimed worker invocation exists for this session; claim your attempt (phase_plan.worker_claim) before using repository tools",
       );
     }
-    const narrowed = narrowWorkerTool(logical, directive.capabilityEnvelope);
+    const narrowed = narrowWorkerTool(logical, directive.capabilityEnvelope, input.toolInput);
     if (!narrowed.allowed) {
       return deny(eventName, narrowed.capability === null ? "CAPABILITY_DENIED" : "CAPABILITY_DENIED", narrowed.reason);
     }

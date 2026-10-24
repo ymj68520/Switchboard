@@ -99,12 +99,18 @@ export function submitExecutionReportInTx(
       { detail: { attemptId: input.attemptId }, recoverable: false },
     );
   }
-  if (getReportForAttemptInTx(tx, attempt.attemptId) !== null) {
-    throw new RuntimeError(
-      "REPORT_ALREADY_EXISTS",
-      `attempt '${attempt.attemptId}' already has an immutable report`,
-      { detail: { attemptId: attempt.attemptId }, recoverable: false },
-    );
+  const existingReport = getReportForAttemptInTx(tx, attempt.attemptId);
+  if (existingReport !== null) {
+    // P5 §4 — idempotent recognition of delayed or re-submitted report
+    const existingDirective = getExecutionDirectiveInTx(tx, attempt.directiveId, attempt.directiveRevision);
+    const window = existingDirective
+      ? (getOpenWindowInTx(tx, attempt.executionRunId) ?? requireOpenWindowInTx(tx, attempt.executionRunId))
+      : requireOpenWindowInTx(tx, attempt.executionRunId);
+    return {
+      report: existingReport,
+      attempt,
+      window,
+    };
   }
   if (attempt.state === "reported") {
     throw new RuntimeError(

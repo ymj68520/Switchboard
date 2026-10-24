@@ -70,14 +70,98 @@ export function classifyWorkerTool(logicalToolName: string): WorkerCapabilityCat
   }
 }
 
+export type EnforceabilityTier = "enforceable" | "advisory" | "unsupported";
+
+export interface CapabilityEnforceabilityReportEntry {
+  capability: string;
+  granted: boolean;
+  tier: EnforceabilityTier;
+  mechanism: string;
+}
+
 /**
- * The narrowed decision for one worker tool call (E5 §23). `denied` carries
- * the Directive capability field that refused the tool; `uncategorized` tools
- * are denied fail-closed — the Worker surface is deliberately small (E5 §16).
+ * P2 — Complete honest enforceability report for a capability envelope.
+ * Exposes whether restrictions are mechanically enforced by tool/process boundaries
+ * or semantic constraints audited post-execution, preventing false security claims.
+ */
+export function capabilityEnforceabilityReport(
+  envelope: ExecutionCapabilityEnvelope,
+): CapabilityEnforceabilityReportEntry[] {
+  return [
+    {
+      capability: "repositoryRead",
+      granted: envelope.repositoryRead,
+      tier: "enforceable",
+      mechanism: "PreToolUse hook blocks Read/Glob/Grep/LS",
+    },
+    {
+      capability: "repositoryWrite",
+      granted: envelope.repositoryWrite,
+      tier: "enforceable",
+      mechanism: "PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit",
+    },
+    {
+      capability: "commandExecution",
+      granted: envelope.commandExecution,
+      tier: "enforceable",
+      mechanism: "PreToolUse hook blocks Bash/PowerShell when false",
+    },
+    {
+      capability: "networkAccess",
+      granted: envelope.networkAccess,
+      tier: envelope.commandExecution ? "advisory" : "enforceable",
+      mechanism: envelope.commandExecution
+        ? "WebFetch/WebSearch mechanically blocked; shell outbound network access intercepted at PreToolUse execution boundary; host OS network namespace is advisory without container sandbox"
+        : "WebFetch/WebSearch mechanically blocked; no shell tool available (transitive complete isolation)",
+    },
+    {
+      capability: "dependencyMutation",
+      granted: envelope.dependencyMutation,
+      tier: envelope.commandExecution ? "advisory" : "enforceable",
+      mechanism: envelope.commandExecution
+        ? "package manager mutation commands intercepted at PreToolUse boundary and audited; underlying filesystem permissions govern"
+        : "no shell and no mutating tools available",
+    },
+    {
+      capability: "gitCommit",
+      granted: envelope.gitCommit,
+      tier: envelope.commandExecution ? "enforceable" : "enforceable",
+      mechanism: envelope.commandExecution
+        ? "git commit commands in shell intercepted at PreToolUse execution boundary; ExecutionCommit is the sole recognized progression object"
+        : "no shell available",
+    },
+    {
+      capability: "gitPush",
+      granted: envelope.gitPush,
+      tier: envelope.commandExecution ? "enforceable" : "enforceable",
+      mechanism: envelope.commandExecution
+        ? "git push and remote commands in shell intercepted at PreToolUse execution boundary; remote push credentials withheld"
+        : "no shell available",
+    },
+    {
+      capability: "externalServiceMutation",
+      granted: envelope.externalServiceMutation,
+      tier: envelope.commandExecution ? "advisory" : "enforceable",
+      mechanism: envelope.commandExecution
+        ? "cloud/container CLI commands intercepted at PreToolUse boundary; external service credentials withheld"
+        : "no shell available",
+    },
+  ];
+}
+
+/**
+ * The narrowed decision for one worker tool call (E5 §23, amended for P2).
+ * `denied` carries the Directive capability field that refused the tool; `uncategorized`
+ * tools are denied fail-closed — the Worker surface is deliberately small (E5 §16).
+ *
+ * When commandExecution is enabled, inspects toolInput command strings for restricted
+ * operations (gitPush, gitCommit, network commands, package manager mutations) and
+ * enforces execution boundaries without relying solely on substring blacklists.
  */
 export function narrowWorkerTool(
   logicalToolName: string,
   envelope: ExecutionCapabilityEnvelope,
+  toolInput?: Record<string, unknown>,
 ): { allowed: true } | { allowed: false; reason: string; capability: string | null } {
   const category = classifyWorkerTool(logicalToolName);
   if (category === null) {
@@ -94,5 +178,69 @@ export function narrowWorkerTool(
       capability: category,
     };
   }
+
+  // P2: Execution boundary enforcement for shell commands when commandExecution is enabled
+  if (
+    (logicalToolName === "Bash" || logicalToolName === "PowerShell")
+    && toolInput
+    && typeof toolInput.command === "string"
+  ) {
+    const cmd = toolInput.command;
+
+    // 1. gitPush boundary check
+    if (!envelope.gitPush && (/\bgit\s+(push|remote)\b/i.test(cmd) || /\bgit-push\b/i.test(cmd))) {
+      return {
+        allowed: false,
+        reason: "the bound Directive's capability envelope sets gitPush=false; git push operations are denied at the execution boundary (P2)",
+        capability: "gitPush",
+      };
+    }
+
+    // 2. gitCommit boundary check
+    if (!envelope.gitCommit && /\bgit\s+commit\b/i.test(cmd)) {
+      return {
+        allowed: false,
+        reason: "the bound Directive's capability envelope sets gitCommit=false; repository git commit operations are denied at the execution boundary (P2); progress advances via ExecutionCommit only",
+        capability: "gitCommit",
+      };
+    }
+
+    // 3. networkAccess boundary check
+    if (
+      !envelope.networkAccess
+      && (
+        /\b(curl|wget|nc|netcat|ssh|scp|ftp)\b/i.test(cmd)
+        || /\bgit\s+(fetch|pull|clone|ls-remote)\b/i.test(cmd)
+      )
+    ) {
+      return {
+        allowed: false,
+        reason: "the bound Directive's capability envelope sets networkAccess=false; outbound network commands are denied at the execution boundary (P2)",
+        capability: "networkAccess",
+      };
+    }
+
+    // 4. externalServiceMutation boundary check
+    if (!envelope.externalServiceMutation && /\b(aws|gcloud|az|kubectl|docker\s+push)\b/i.test(cmd)) {
+      return {
+        allowed: false,
+        reason: "the bound Directive's capability envelope sets externalServiceMutation=false; external service mutation commands are denied at the execution boundary (P2)",
+        capability: "externalServiceMutation",
+      };
+    }
+
+    // 5. dependencyMutation boundary check
+    if (
+      !envelope.dependencyMutation
+      && /\b(npm\s+(install|i|add|update|uninstall)|yarn\s+(add|install|remove)|pip\s+install|cargo\s+add)\b/i.test(cmd)
+    ) {
+      return {
+        allowed: false,
+        reason: "the bound Directive's capability envelope sets dependencyMutation=false; package dependency mutation commands are denied at the execution boundary (P2)",
+        capability: "dependencyMutation",
+      };
+    }
+  }
+
   return { allowed: true };
 }

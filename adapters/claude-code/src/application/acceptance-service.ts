@@ -58,6 +58,7 @@ import { getFinalPlanInTx } from "../store/finalization.js";
 import {
   getActiveExecutionStageInTx,
   getOpenWindowInTx,
+  getWindowByIdInTx,
   requireActiveStageInTx,
   requireOpenWindowInTx,
   requireOpenStageWindowInTx,
@@ -80,9 +81,11 @@ import {
 } from "../store/execution-commits.js";
 import {
   insertSupervisorAssessmentInTx,
+  getSupervisorAssessmentInTx,
   insertAcceptanceEventInTx,
   listWindowAssessmentsInTx,
 } from "../store/supervisor-assessments.js";
+import { signCanonical, verifyCanonical } from "../host/signing.js";
 import { requirePlanRefsUnderFinalPlan } from "./execution-directive-service.js";
 import { parseFinalPlanCanonical } from "./final-plan-canonical.js";
 import type { StoreClock } from "../store/migration-runner.js";
@@ -430,6 +433,26 @@ export function loadExecutionAcceptanceContextInTx(tx: StoreTx, executionRunId: 
 // The acceptance gate (E6 §21) — one atomic transaction per assessment.
 // ---------------------------------------------------------------------------
 
+export function encodeAssessmentToken(secret: Buffer, payload: Record<string, unknown>): string {
+  const sig = signCanonical("phase-plan:assessment-context-v1", secret, payload);
+  return Buffer.from(JSON.stringify({ ...payload, _sig: sig }), "utf8").toString("base64url");
+}
+
+export function decodeAndVerifyAssessmentToken(secret: Buffer, token: string): Record<string, unknown> | null {
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const parsed = JSON.parse(raw);
+    const sig = parsed._sig;
+    delete parsed._sig;
+    if (typeof sig !== "string" || !verifyCanonical("phase-plan:assessment-context-v1", secret, parsed, sig)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export interface SubmitSupervisorAssessmentInput {
   executionRunId: string;
   /** Signed HostContext session — never model-supplied authority (E6 §6). */
@@ -441,11 +464,14 @@ export interface SubmitSupervisorAssessmentInput {
   /** Non-empty audit provenance (E6 §45) — never parsed by Core. */
   rationale: string;
   reportJudgments: unknown[];
-  coveredObligations: unknown[];
+  coveredObligations?: unknown[];
   /** Optional exact approved refs, validated like Directive planRefs (E6 §19). */
   planRefs?: DirectivePlanRef[];
   /** Stale-precondition fence over the Window's current candidateRevision. */
-  expectedCandidateRevision: number;
+  expectedCandidateRevision?: number;
+  assessmentToken?: string;
+  assessmentWindowId?: string;
+  completeStage?: boolean;
 }
 
 export interface SupervisorAssessmentResult {
@@ -465,6 +491,7 @@ export interface SupervisorAssessmentResult {
    * the same transaction (completion provenance + binding detach included).
    */
   runCompleted: boolean;
+  idempotent?: boolean;
 }
 
 /**
@@ -494,18 +521,50 @@ export function submitSupervisorAssessmentInTx(
   if (typeof input.rationale !== "string" || input.rationale.trim() === "") {
     throw acceptanceError("ASSESSMENT_REPORT_INVALID", "assessment rationale must be a non-empty string (E6 §45)");
   }
+
+  // P4 §8: Idempotent retry check before window requirement
+  const openWindowPre = getOpenWindowInTx(tx, input.executionRunId);
+  if (openWindowPre === null) {
+    const headCommitId = getAcceptedHeadCommitIdInTx(tx, input.executionRunId);
+    if (headCommitId !== null) {
+      const headCommit = getExecutionCommitInTx(tx, headCommitId);
+      if (headCommit !== null) {
+        const pastAssessment = getSupervisorAssessmentInTx(tx, headCommit.supervisorAssessmentId);
+        if (
+          pastAssessment !== null
+          && pastAssessment.disposition === input.disposition
+          && (input.expectedCandidateRevision === undefined || input.expectedCandidateRevision === pastAssessment.candidateRevision)
+        ) {
+          const closedWin = getWindowByIdInTx(tx, headCommit.windowId);
+          return {
+            assessment: pastAssessment,
+            commit: headCommit,
+            window: closedWin ?? ({ id: headCommit.windowId, candidateRevision: headCommit.candidateRevision } as any),
+            acceptedHeadCommitId: headCommitId,
+            stageCompleted: headCommit.stageId !== null,
+            runCompleted: headCommit.scopeKind === "final_closure",
+            idempotent: true,
+          };
+        }
+      }
+    }
+    // No idempotent replay applies — fail closed with canonical error
+    return requireOpenWindowInTx(tx, input.executionRunId) as never;
+  }
+
   // E10 §31 — the open WINDOW decides the scope: a final-closure window is
   // the acceptance surface for a run with NO active Stage (never a fake one);
   // a stage window keeps the exact E6/E7 stage authority triangle.
-  const openWindowPre = requireOpenWindowInTx(tx, input.executionRunId);
   const finalClosure = openWindowPre.scopeKind === "final_closure";
   const stage = finalClosure ? null : requireActiveStageInTx(tx, input.executionRunId);
   const window = finalClosure ? openWindowPre : requireOpenStageWindowInTx(tx, input.executionRunId);
-  if (input.expectedCandidateRevision !== window.candidateRevision) {
+
+  const expectedRevision = input.expectedCandidateRevision;
+  if (expectedRevision !== undefined && expectedRevision !== window.candidateRevision) {
     throw acceptanceError(
       "SUPERVISOR_ASSESSMENT_STALE",
-      `assessment expected candidate revision ${input.expectedCandidateRevision}; the open window is at ${window.candidateRevision}`,
-      { expected: input.expectedCandidateRevision, detected: window.candidateRevision },
+      `assessment expected candidate revision ${expectedRevision}; the open window is at ${window.candidateRevision}`,
+      { expected: expectedRevision, detected: window.candidateRevision },
     );
   }
 
@@ -604,23 +663,59 @@ export function submitSupervisorAssessmentInTx(
     }
   }
 
-  const obligations: CoveredObligation[] = input.coveredObligations.map((raw) =>
-    parseCoveredObligation(
-      typeof raw === "object" && raw !== null
-        ? normalizeSnakeRecord(raw as Record<string, unknown>, [
-            ["directive_id", "directiveId"],
-            ["directive_revision", "directiveRevision"],
-            ["stage_id", "stageId"],
-            ["objective_hash", "objectiveHash"],
-            // E10 §22 — execution_run_completion identity fields (snake boundary).
-            ["execution_run_id", "executionRunId"],
-            ["final_plan_hash", "finalPlanHash"],
-            ["base_accepted_head_commit_id", "baseAcceptedHeadCommitId"],
-            ["completed_stage_set_hash", "completedStageSetHash"],
-          ])
-        : raw,
-    ),
-  );
+  // E6 §41 — complete current-candidate coverage: the Supervisor may not hide
+  // a current Report by omitting it.
+  for (const fact of evidence.currentFacts) {
+    if (!seenReportIds.has(fact.reportId)) {
+      throw acceptanceError(
+        "ASSESSMENT_REPORT_COVERAGE_INCOMPLETE",
+        `current-candidate report '${fact.reportId}' is not covered by report_judgments; all ${evidence.currentFacts.length} current-candidate reports must be judged (E6 §41)`,
+        {
+          missingReportId: fact.reportId,
+          totalCurrentReports: evidence.currentFacts.length,
+          judgedReportCount: judgments.length,
+        },
+      );
+    }
+  }
+
+  let obligations: CoveredObligation[];
+  if (Array.isArray(input.coveredObligations) && input.coveredObligations.length > 0) {
+    obligations = input.coveredObligations.map((raw) =>
+      parseCoveredObligation(
+        typeof raw === "object" && raw !== null
+          ? normalizeSnakeRecord(raw as Record<string, unknown>, [
+              ["directive_id", "directiveId"],
+              ["directive_revision", "directiveRevision"],
+              ["stage_id", "stageId"],
+              ["objective_hash", "objectiveHash"],
+              // E10 §22 — execution_run_completion identity fields (snake boundary).
+              ["execution_run_id", "executionRunId"],
+              ["final_plan_hash", "finalPlanHash"],
+              ["base_accepted_head_commit_id", "baseAcceptedHeadCommitId"],
+              ["completed_stage_set_hash", "completedStageSetHash"],
+            ])
+          : raw,
+      ),
+    );
+  } else if (input.disposition === "accept") {
+    // P4: Core deterministically attaches the stage or final closure obligation
+    const hasStageCompletionVerification = stage !== null && evidence.directives.some((d) => directiveCarriesStageCompletionVerification(d, stage));
+    if ((input.completeStage === true || (input.completeStage === undefined && hasStageCompletionVerification)) && stage !== null) {
+      obligations = [stageObjectiveObligation(stage)];
+    } else if (finalClosure) {
+      const head = getAcceptedHeadCommitIdInTx(tx, input.executionRunId);
+      if (head === null) {
+        throw acceptanceError("WINDOW_BASE_MISMATCH", "final closure requires an accepted head");
+      }
+      const semantics = loadExecutionCompletionSemanticsInTx(tx, input.executionRunId, head);
+      obligations = [executionRunCompletionObligation(semantics)];
+    } else {
+      obligations = [];
+    }
+  } else {
+    obligations = [];
+  }
   validateCoveredObligations(tx, evidence, obligations);
 
   if (input.planRefs !== undefined && input.planRefs.length > 0) {
@@ -684,17 +779,6 @@ export function submitSupervisorAssessmentInTx(
     );
   }
 
-  // E6 §41 — complete current-candidate coverage: the Supervisor may not hide
-  // a current Report by omitting it.
-  for (const fact of evidence.currentFacts) {
-    if (!seenReportIds.has(fact.reportId)) {
-      throw acceptanceError(
-        "ASSESSMENT_REPORT_COVERAGE_INCOMPLETE",
-        `current-candidate report '${fact.reportId}' is unclassified; an accept assessment must classify every current report (E6 §41)`,
-        { reportId: fact.reportId },
-      );
-    }
-  }
   const judgmentByReportId = new Map(judgments.map((judgment) => [judgment.reportId, judgment] as const));
 
   // E6 §12 — blocking evidence prevents acceptance.

@@ -97,6 +97,8 @@ import {
   type IssueExecutionDirectiveInput,
 } from "../application/execution-directive-service.js";
 import {
+  encodeAssessmentToken,
+  decodeAndVerifyAssessmentToken,
   loadExecutionAcceptanceContextInTx,
   normalizeSnakeRecord,
   submitSupervisorAssessmentInTx,
@@ -157,6 +159,8 @@ import { createBindingService } from "../session/binding-service.js";
 import { createPlanningRunService } from "../application/planning-run-service.js";
 import { createPlanCommitEngine } from "../application/plan-commit-engine.js";
 import { createEvidenceService, type PromoteEvidenceRequest } from "../application/evidence-service.js";
+import { capabilityEnforceabilityReport } from "../runtime/worker-capabilities.js";
+import { getDetailedRecoveryGuidanceInTx } from "../application/recovery-process-coordinator.js";
 import { createEvidenceFreshnessService, type RevalidationAssessment } from "../application/evidence-freshness-service.js";
 import { listObservationSummaries } from "../application/observation-service.js";
 import { OBSERVATION_CLASSES, type ObservationClass } from "../observations/types.js";
@@ -868,6 +872,11 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
         directive_revision: { type: "integer", minimum: 1 },
         directive_hash: { type: "string", description: "The exact issued revision hash — a mismatched hash is refused." },
         worker_role: { type: "string", enum: ["executor", "verifier"] },
+        enforcement_policy: {
+          type: "string",
+          enum: ["strict", "layered"],
+          description: "Optional capability enforcement policy. 'layered' allows commandExecution with fine-grained restrictions enforced at the tool and shell execution boundary (P2).",
+        },
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
       required: ["directive_id", "directive_revision", "directive_hash", "worker_role", "_hostContext"],
@@ -1069,9 +1078,17 @@ export const PHASE_PLAN_TOOLS: readonly PhasePlanToolDefinition[] = [
           minimum: 0,
           description: "The window candidateRevision you assessed; a stale value is refused (SUPERVISOR_ASSESSMENT_STALE).",
         },
+        assessment_token: {
+          type: "string",
+          description: "P4: Opaque token issued by get_execution_acceptance_context. Automatically binds windowId and candidateRevision, relieving the model of manual version tracking.",
+        },
+        complete_stage: {
+          type: "boolean",
+          description: "P4: When true on accept disposition, Core automatically completes the active Stage using deterministic stage_objective obligation without requiring the model to transcribe SHA256 hashes.",
+        },
         _hostContext: { type: "string", description: "Signed host context injected by the PreToolUse hook (do not modify)." },
       },
-      required: ["disposition", "rationale", "expected_candidate_revision", "_hostContext"],
+      required: ["disposition", "rationale", "_hostContext"],
       additionalProperties: false,
     },
   },
@@ -3826,6 +3843,7 @@ export function handleAbortExecutionRun(ctx: PhasePlanToolContext, rawArgs: Reco
     },
     closed_window_id: result.closedWindowId,
     revoked_launch_credentials: result.revokedLaunchCredentials,
+    abort_manifest: result.abortManifest,
     next:
       "The ExecutionRun is terminal (aborted): the execution protocol stopped permanently and every execution mutation "
       + "authority is gone. No rollback was performed — the workspace may contain unaccepted changes beyond the accepted "
@@ -3903,6 +3921,7 @@ export function handleWorkerGetAssignment(ctx: PhasePlanToolContext, rawArgs: Re
     worker_role: assignment.workerRole,
     attempt: assignment.attempt,
     directive: assignment.directive,
+    capability_enforceability: capabilityEnforceabilityReport(assignment.directive.capabilityEnvelope),
     plan_context: assignment.planContext,
     execution: assignment.execution,
     next: "Treat the Directive structured fields + body as exact current authority; submit exactly one phase_plan.worker_submit_report before normal exit.",
@@ -3976,6 +3995,17 @@ export function handleGetExecutionAcceptanceContext(ctx: PhasePlanToolContext, r
   assertExactBusinessFields(rawArgs, []);
   const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_execution_acceptance_context");
   const context = ctx.store.withRead((tx) => loadExecutionAcceptanceContextInTx(tx, envelope.executionRunId));
+
+  const assessmentToken = context.candidate === null
+    ? null
+    : encodeAssessmentToken(ctx.secret, {
+        executionRunId: envelope.executionRunId,
+        windowId: context.openWindow?.id ?? "",
+        candidateRevision: context.candidate.revision,
+        stageId: context.activeStage?.id ?? null,
+        issuedAt: ctx.clock.nowIso(),
+      });
+
   return {
     status: "ok",
     execution_run: context.executionRun,
@@ -3986,19 +4016,19 @@ export function handleGetExecutionAcceptanceContext(ctx: PhasePlanToolContext, r
     boundary: context.boundary,
     stage_completion: context.stageCompletion,
     candidate: context.candidate,
+    assessment_token: assessmentToken,
     next:
       context.candidate === null
         ? "No current candidate available for acceptance (post-commit acceptance boundary or no open window)."
-        : "Classify every current-candidate report and submit phase_plan.submit_supervisor_assessment. To complete the Stage, copy stage_completion.obligation unchanged into covered_obligations.",
+        : "Classify every current-candidate report and submit phase_plan.submit_supervisor_assessment. You may supply assessment_token to automatically bind window and revision metadata.",
   };
 }
 
 /**
- * phase_plan.submit_supervisor_assessment (E6 §19/§20/§21) — the Supervisor
- * expresses semantic judgment only; run/stage/window/head are derived from
- * current authoritative state. Accept runs the Core gate in ONE transaction:
- * any failure rolls back the assessment together with the commit, the window
- * close, and the head advance.
+ * phase_plan.submit_supervisor_assessment (E6 §19/§20/§21, P4 simplified) — the Supervisor
+ * expresses semantic judgment only; run/stage/window/head and deterministic obligation hashes
+ * are derived from current authoritative state or bound assessment_token. Accept runs the Core
+ * gate in ONE transaction with optimistic concurrency and idempotent retry convergence.
  */
 export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   assertExactBusinessFields(rawArgs, [
@@ -4008,6 +4038,8 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
     "covered_obligations",
     "plan_refs",
     "expected_candidate_revision",
+    "assessment_token",
+    "complete_stage",
   ]);
   const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "submit_supervisor_assessment");
   if (
@@ -4019,9 +4051,27 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
   if (typeof rawArgs.rationale !== "string" || rawArgs.rationale.trim() === "") {
     throw inputInvalid("rationale must be a non-empty string (E6 §45)");
   }
-  if (typeof rawArgs.expected_candidate_revision !== "number" || !Number.isInteger(rawArgs.expected_candidate_revision)) {
-    throw inputInvalid("expected_candidate_revision must be an integer");
+
+  let expectedRevision = rawArgs.expected_candidate_revision as number | undefined;
+  let tokenWindowId: string | undefined;
+  if (typeof rawArgs.assessment_token === "string" && rawArgs.assessment_token.trim() !== "") {
+    const decoded = decodeAndVerifyAssessmentToken(ctx.secret, rawArgs.assessment_token as string);
+    if (!decoded) {
+      throw inputInvalid("assessment_token signature is invalid or tampered");
+    }
+    if (decoded.executionRunId !== envelope.executionRunId) {
+      throw inputInvalid("assessment_token does not match current ExecutionRun");
+    }
+    tokenWindowId = decoded.windowId as string;
+    if (expectedRevision === undefined) {
+      expectedRevision = decoded.candidateRevision as number;
+    }
   }
+
+  if (expectedRevision === undefined || !Number.isInteger(expectedRevision)) {
+    throw inputInvalid("expected_candidate_revision or valid assessment_token is required");
+  }
+
   if (rawArgs.report_judgments !== undefined && !Array.isArray(rawArgs.report_judgments)) {
     throw inputInvalid("report_judgments must be an array");
   }
@@ -4048,7 +4098,7 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
             ? { supersededByReportId: judgment.superseded_by_report_id }
             : {}),
         })),
-        coveredObligations: ((rawArgs.covered_obligations as Array<Record<string, unknown>> | undefined) ?? []).map((obligation) => ({
+        coveredObligations: rawArgs.covered_obligations === undefined ? undefined : ((rawArgs.covered_obligations as Array<Record<string, unknown>>) ?? []).map((obligation) => ({
           ...obligation,
           ...(obligation.directiveId === undefined && obligation.directive_id !== undefined
             ? { directiveId: obligation.directive_id }
@@ -4056,13 +4106,10 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
           ...(obligation.directiveRevision === undefined && obligation.directive_revision !== undefined
             ? { directiveRevision: obligation.directive_revision }
             : {}),
-          ...(obligation.stageId === undefined && obligation.stage_id !== undefined
-            ? { stageId: obligation.stage_id }
-            : {}),
+          ...(obligation.stageId === undefined && obligation.stage_id !== undefined ? { stageId: obligation.stage_id } : {}),
           ...(obligation.objectiveHash === undefined && obligation.objective_hash !== undefined
             ? { objectiveHash: obligation.objective_hash }
             : {}),
-          // E10 §22 — execution_run_completion identity fields (snake boundary).
           ...(obligation.executionRunId === undefined && obligation.execution_run_id !== undefined
             ? { executionRunId: obligation.execution_run_id }
             : {}),
@@ -4076,8 +4123,10 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
             ? { completedStageSetHash: obligation.completed_stage_set_hash }
             : {}),
         })),
-        ...(rawArgs.plan_refs === undefined ? {} : { planRefs: rawArgs.plan_refs as DirectivePlanRef[] }),
-        expectedCandidateRevision: rawArgs.expected_candidate_revision as number,
+        planRefs: (rawArgs.plan_refs as DirectivePlanRef[] | undefined) ?? [],
+        expectedCandidateRevision: expectedRevision,
+        assessmentWindowId: tokenWindowId,
+        completeStage: Boolean(rawArgs.complete_stage),
       },
       ctx.clock,
       ctx.clock.nowIso(),
@@ -4091,6 +4140,7 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
       disposition: result.assessment.disposition,
       candidate_revision: result.assessment.candidateRevision,
       window_id: result.assessment.windowId,
+      idempotent: Boolean(result.idempotent),
       next: "The assessment is durable history. Accepted state is unchanged; direct the next Directive or report an execution issue.",
     };
   }
@@ -4111,6 +4161,7 @@ export function handleSubmitSupervisorAssessment(ctx: PhasePlanToolContext, rawA
     window_closed: true,
     stage_completed: result.stageCompleted,
     run_completed: result.runCompleted,
+    idempotent: Boolean(result.idempotent),
     next: result.runCompleted
       ? `EXECUTION RUN COMPLETE (E10 §37/§42): the ExecutionCompletionGate transitioned the run to completed inside this transaction. Final ExecutionCommit ${result.commit.commitId} is the acceptedHead and the completion provenance; your supervisor binding is detached. The run can never resume.`
       : result.stageCompleted
@@ -4142,6 +4193,7 @@ export function handleGetExecutionProgressionContext(ctx: PhasePlanToolContext, 
     ineligible_stages: context.ineligibleStages,
     default_suggested_stage: context.defaultSuggestedStageId,
     progression_boundary: context.progressionBoundary,
+    evolution_ledger: context.evolutionLedger,
     next:
       context.progressionBoundary === "active_candidate"
         ? "Normal execution is in progress under the open window."
@@ -4481,7 +4533,10 @@ export function handleBeginExecutionFinalClosure(ctx: PhasePlanToolContext, rawA
 export function handleGetAttemptRecoveryContext(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
   assertExactBusinessFields(rawArgs, []);
   const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "get_attempt_recovery_context");
-  const context = ctx.store.withRead((tx) => loadAttemptRecoveryContextInTx(tx, envelope.executionRunId));
+  const { context, guidance } = ctx.store.withRead((tx) => ({
+    context: loadAttemptRecoveryContextInTx(tx, envelope.executionRunId),
+    guidance: getDetailedRecoveryGuidanceInTx(tx, envelope.executionRunId),
+  }));
   return {
     status: "ok",
     execution_run: context.executionRun,
@@ -4491,6 +4546,7 @@ export function handleGetAttemptRecoveryContext(ctx: PhasePlanToolContext, rawAr
     unresolved_indeterminate_attempt_ids: context.unresolvedIndeterminateAttemptIds,
     execution_fenced: context.executionFenced,
     capability_resolution_available: context.capabilityResolutionAvailable,
+    recovery_guidance: guidance,
     next: context.executionFenced
       ? "Ordinary execution is fenced (E11 §13): issue_attempt_reconciliation (or resolve_indeterminate_attempt with no_effect_by_capability where available), or request_execution_replan."
       : "No unresolved indeterminate work in the current window.",
@@ -4764,7 +4820,7 @@ export function handleIssueExecutionDirective(ctx: PhasePlanToolContext, rawArgs
  * Directive itself (E5 §43).
  */
 export function handleStartWorkerAttempt(ctx: PhasePlanToolContext, rawArgs: Record<string, unknown>): Record<string, unknown> {
-  assertExactBusinessFields(rawArgs, ["directive_id", "directive_revision", "directive_hash", "worker_role"]);
+  assertExactBusinessFields(rawArgs, ["directive_id", "directive_revision", "directive_hash", "worker_role", "enforcement_policy"]);
   const envelope = requireExecutionSupervisorContext(ctx, rawArgs, "start_worker_attempt");
   if (typeof rawArgs.directive_id !== "string" || rawArgs.directive_id === "") throw inputInvalid("directive_id is required");
   if (typeof rawArgs.directive_revision !== "number" || !Number.isInteger(rawArgs.directive_revision)) {
@@ -4786,6 +4842,7 @@ export function handleStartWorkerAttempt(ctx: PhasePlanToolContext, rawArgs: Rec
         directiveRevision: rawArgs.directive_revision as number,
         directiveHash: rawArgs.directive_hash as string,
         workerRole: rawArgs.worker_role as StartExecutionAttemptInput["workerRole"],
+        enforcementPolicy: rawArgs.enforcement_policy as ("strict" | "layered" | undefined),
       },
       ctx.clock,
       ctx.clock.nowIso(),

@@ -91,7 +91,11 @@ export function newLaunchToken(): string {
  */
 export function requireEnforceableCapabilityEnvelope(
   envelope: ExecutionDirective["capabilityEnvelope"],
+  options?: { enforcementPolicy?: "strict" | "layered" },
 ): void {
+  if (options?.enforcementPolicy === "layered") {
+    return;
+  }
   if (!envelope.commandExecution) {
     return;
   }
@@ -108,8 +112,8 @@ export function requireEnforceableCapabilityEnvelope(
     throw workerRuntimeError(
       "CAPABILITY_ENFORCEMENT_UNAVAILABLE",
       "the Claude adapter cannot reliably enforce restrictions of "
-        + `${unenforceable.join(", ")} while commandExecution is enabled (an open shell cannot be conservatively classified); `
-        + "issue a Directive with commandExecution=false or grant the capability",
+        + `${unenforceable.join(", ")} while commandExecution is enabled under strict policy (an open shell cannot be conservatively classified); `
+        + "issue a Directive with commandExecution=false, grant the capability, or specify enforcementPolicy='layered' (P2)",
       { detail: { unenforceable } },
     );
   }
@@ -135,7 +139,7 @@ export interface PreparedWorkerLaunch {
  */
 export function prepareWorkerLaunchInTx(
   tx: StoreTx,
-  input: { attemptId: string },
+  input: { attemptId: string; enforcementPolicy?: "strict" | "layered" },
   now: string,
 ): PreparedWorkerLaunch {
   const attempt = getExecutionAttemptInTx(tx, input.attemptId);
@@ -163,7 +167,9 @@ export function prepareWorkerLaunchInTx(
       attemptId: input.attemptId,
     });
   }
-  requireEnforceableCapabilityEnvelope(directive.capabilityEnvelope);
+  const enforcementPolicy = input.enforcementPolicy
+    ?? (directive.forbiddenActions.length > 0 ? "layered" : "strict");
+  requireEnforceableCapabilityEnvelope(directive.capabilityEnvelope, { enforcementPolicy });
   const launchToken = newLaunchToken();
   insertPreparedWorkerInvocationInTx(
     tx,
@@ -600,11 +606,15 @@ export function resolveUnreportedWorkerExitInTx(
  */
 export function startWorkerAttemptAndPrepareLaunchInTx(
   tx: StoreTx,
-  input: StartExecutionAttemptInput,
+  input: StartExecutionAttemptInput & { enforcementPolicy?: "strict" | "layered" },
   clock: StoreClock,
   now: string,
 ): WorkerAttemptLaunch {
   const { attempt } = startExecutionAttemptInTx(tx, input, clock, now);
-  const launch = prepareWorkerLaunchInTx(tx, { attemptId: attempt.attemptId }, clock.nowIso());
+  const launch = prepareWorkerLaunchInTx(
+    tx,
+    { attemptId: attempt.attemptId, enforcementPolicy: input.enforcementPolicy },
+    clock.nowIso(),
+  );
   return { attempt, launch };
 }

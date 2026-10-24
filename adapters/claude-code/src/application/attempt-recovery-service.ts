@@ -381,16 +381,10 @@ export function resolveIndeterminateAttemptInTx(
   now: string,
 ): ResolveIndeterminateAttemptResult {
   const { windowId, candidateRevision } = requireRecoveryAuthorityInTx(tx, input);
-  if (input.expectedCandidateRevision !== candidateRevision) {
-    throw recoveryError(
-      "ATTEMPT_RECONCILIATION_STALE",
-      `stale expected candidate revision ${input.expectedCandidateRevision}; the open window is at ${candidateRevision} (E11 §29)`,
-      { expected: input.expectedCandidateRevision, detected: candidateRevision },
-    );
-  }
-  // E11 §37 — an existing final resolution converges the retry: identical
-  // (resolution, report) returns the durable fact; anything else is refused
-  // without a second resolution or revision advance.
+
+  // E11 §37 / P5 — an existing final resolution converges the retry: identical
+  // (resolution, report) returns the durable fact; evaluated first so an
+  // idempotent retry converges even after candidate_changed advanced the revision.
   const existing = getReconciliationForAttemptInTx(tx, input.attemptId);
   if (existing !== null) {
     if (existing.resolution === input.resolution && existing.inspectionReportId === (input.inspectionReportId ?? null)) {
@@ -404,6 +398,14 @@ export function resolveIndeterminateAttemptInTx(
       "ATTEMPT_RECONCILIATION_ALREADY_RESOLVED",
       `attempt '${input.attemptId}' already carries reconciliation '${existing.reconciliationId}' (${existing.resolution}) (E11 §8)`,
       { attemptId: input.attemptId, resolution: existing.resolution },
+    );
+  }
+
+  if (input.expectedCandidateRevision !== candidateRevision) {
+    throw recoveryError(
+      "ATTEMPT_RECONCILIATION_STALE",
+      `stale expected candidate revision ${input.expectedCandidateRevision}; the open window is at ${candidateRevision} (E11 §29)`,
+      { expected: input.expectedCandidateRevision, detected: candidateRevision },
     );
   }
   const { attempt, originalDirective, invocation } = requireReconcilableTargetInTx(tx, input.executionRunId, windowId, input.attemptId);
