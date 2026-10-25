@@ -49,7 +49,7 @@ export function executionWorkerSystemPrompt(): string {
     "- candidateMutation is an explicit factual declaration: did YOUR work change the candidate state (changed) or not (none)?",
     "- You never claim acceptance. Acceptance is decided by the Supervisor and Core, never by you.",
     "",
-    "Answer format: your ENTIRE final message must be ONE JSON object matching the WorkerReportPayload contract given in your task message. No prose before or after it.",
+    "Answer format: your ENTIRE final message must be ONE JSON object matching the WorkerReportPayload contract given in your task message. Start your response immediately with '{' and end with '}'. Absolutely NO prose, preamble, markdown code blocks, or commentary before or after the JSON object.",
   ].join("\n");
 }
 

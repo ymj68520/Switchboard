@@ -105,7 +105,7 @@ export function renderWorkerTaskMessage(context: ExecutionWorkerContext, role: E
         ...(role === "verifier"
       ? ["Verifier rule: EVERY entry in findings MUST be an object {statement, acceptanceImpact: \"informational\" | \"blocking\"} - a plain-string finding is unclassified and blocks acceptance fail-closed."]
       : []),
-"Rules: blocked requires >=1 blocker; only blocked reports may carry blockers. No prose outside the JSON object.",
+    "Rules: blocked requires >=1 blocker; only blocked reports may carry blockers. Start your response immediately with '{' and end with '}'. No prose outside the JSON object.",
   ].join("\n");
 }
 

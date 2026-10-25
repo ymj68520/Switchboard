@@ -1,18 +1,18 @@
 {
   "attempt": {
-    "startedAt": "2026-10-01T15:38:28.098Z",
+    "startedAt": "2026-10-25T01:47:09.612Z",
     "repository": {
-      "identity": "ultra-plan-e73-1790869108098",
+      "identity": "ultra-plan-e73-1792892829612",
       "files": [
         "notes.txt",
         "check.js"
       ],
       "validation": "node check.js"
     },
-    "trustedSession": "ses_f07e1f593ffeX6b2zHvQEhmjOp"
+    "trustedSession": "ses_e8f42708bffeH5ne5lSp2NJepG"
   },
   "host": {
-    "version": "1.18.11",
+    "version": "1.19.0",
     "inventory": [
       "invalid",
       "question",
@@ -67,7 +67,7 @@
     "finalPlan": {
       "id": "FINAL-001",
       "revision": 1,
-      "hash": "b130df07bdbf69903017da0535be91baae2cd23a50204a4b9cb061c43fd9fab8"
+      "hash": "a265d7d1f89b6222deade33b895b454f928829dd742c3ef0e75208319eb739bc"
     }
   },
   "execution": {
@@ -90,12 +90,12 @@
         "stages": [
           {
             "id": "STAGE-001",
-            "title": "Implement E73_LIVE_OK line in notes.txt",
+            "title": "Append E73_LIVE_OK to notes.txt",
             "status": "completed"
           },
           {
             "id": "STAGE-002",
-            "title": "Final closure: FinalPlan FINAL-001 satisfaction",
+            "title": "Final Closure",
             "status": "completed"
           }
         ],
@@ -103,7 +103,7 @@
           {
             "workerRole": "verifier",
             "result": "completed",
-            "directive": "DIR-003@1"
+            "directive": "DIR-015@1"
           },
           {
             "workerRole": "executor",
@@ -119,7 +119,7 @@
     "terminalLifecycle": "completed",
     "acceptedHead": "EC-002",
     "binding": {
-      "ownerSessionID": "ses_f07e1f593ffeX6b2zHvQEhmjOp",
+      "ownerSessionID": "ses_e8f42708bffeH5ne5lSp2NJepG",
       "generation": 1,
       "state": "attached"
     },
@@ -128,13 +128,13 @@
       {
         "id": "STAGE-001",
         "status": "completed",
-        "title": "Implement E73_LIVE_OK line in notes.txt"
+        "title": "Append E73_LIVE_OK to notes.txt"
       },
       {
         "id": "STAGE-002",
         "kind": "final_closure",
         "status": "completed",
-        "title": "Final closure: FinalPlan FINAL-001 satisfaction"
+        "title": "Final Closure"
       }
     ],
     "windows": [
@@ -163,6 +163,54 @@
       {
         "ref": "DIR-003@1",
         "kind": "verification"
+      },
+      {
+        "ref": "DIR-004@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-005@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-006@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-007@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-008@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-009@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-010@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-011@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-012@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-013@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-014@1",
+        "kind": "verification"
+      },
+      {
+        "ref": "DIR-015@1",
+        "kind": "verification"
       }
     ],
     "attempts": [
@@ -183,6 +231,78 @@
         "directive": "DIR-003@1",
         "role": "verifier",
         "state": "reported"
+      },
+      {
+        "id": "ATT-004",
+        "directive": "DIR-004@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-005",
+        "directive": "DIR-005@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-006",
+        "directive": "DIR-006@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-007",
+        "directive": "DIR-007@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-008",
+        "directive": "DIR-008@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-009",
+        "directive": "DIR-009@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-010",
+        "directive": "DIR-010@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-011",
+        "directive": "DIR-011@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-012",
+        "directive": "DIR-012@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-013",
+        "directive": "DIR-013@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-014",
+        "directive": "DIR-014@1",
+        "role": "verifier",
+        "state": "reported"
+      },
+      {
+        "id": "ATT-015",
+        "directive": "DIR-015@1",
+        "role": "verifier",
+        "state": "reported"
       }
     ],
     "reports": [
@@ -200,6 +320,78 @@
       },
       {
         "id": "RPT-003",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-004",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-005",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-006",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-007",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-008",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-009",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-010",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-011",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-012",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-013",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-014",
+        "role": "verifier",
+        "result": "completed",
+        "candidateMutation": "none"
+      },
+      {
+        "id": "RPT-015",
         "role": "verifier",
         "result": "completed",
         "candidateMutation": "none"
@@ -241,30 +433,42 @@
       "finalCommitID": "EC-002",
       "finalAssessmentID": "SA-002",
       "acceptedHead": "EC-002",
-      "completedAt": "2026-10-01T15:46:26.978Z",
+      "completedAt": "2026-10-25T01:54:51.287Z",
       "finalCandidateRevision": 0,
       "finalVerificationReportRefs": [
-        "RPT-003"
+        "RPT-003",
+        "RPT-004",
+        "RPT-005",
+        "RPT-006",
+        "RPT-007",
+        "RPT-008",
+        "RPT-009",
+        "RPT-010",
+        "RPT-011",
+        "RPT-012",
+        "RPT-013",
+        "RPT-014",
+        "RPT-015"
       ],
-      "hash": "df33e086a526eb1568e26c3104d80a88d1dcd21c748c02df54fe4c2f511333f2"
+      "hash": "42944aacbafe3f02935f893e8ddd4d931b7d290fdf33867f68eb3e310bac205a"
     },
     "legacyDispatchCount": 0,
     "counts": {
-      "supervisorTurns": 12,
+      "supervisorTurns": 24,
       "supervisorFailures": 0,
-      "workerInvocations": 3,
+      "workerInvocations": 15,
       "workerFailures": 0
     },
     "durationsMs": {
-      "total": 478980
+      "total": 461883
     },
     "planningRunID": "PLAN-001",
     "handoffProtocol": "supervised_v0_2"
   },
   "isolation": {
-    "supervisorModel": "sensenova/deepseek-v4-flash",
-    "workerModel": "sensenova/deepseek-v4-flash",
-    "verifierModel": "sensenova/deepseek-v4-flash",
+    "supervisorModel": "antigravity/claude-sonnet-4-6",
+    "workerModel": "antigravity/claude-sonnet-4-6",
+    "verifierModel": "antigravity/claude-sonnet-4-6",
     "budgets": {
       "maxSupervisorTurnsPerPump": 40,
       "maxWorkerDispatchesPerPump": 40,
@@ -352,7 +556,7 @@
     {
       "name": "E5 SupervisorBinding owner = trusted session, generation 1",
       "ok": true,
-      "detail": "owner=ses_f07e1f593ffeX6b2zHvQEhmjOp gen=1"
+      "detail": "owner=ses_e8f42708bffeH5ne5lSp2NJepG gen=1"
     },
     {
       "name": "ordinary Stage acceptance + final_closure Stage exist (§6)",
@@ -362,7 +566,7 @@
     {
       "name": "fresh final Verifier report in accepted history (§6)",
       "ok": true,
-      "detail": "reports=3 verifier=2"
+      "detail": "reports=15 verifier=14"
     },
     {
       "name": "final SupervisorAssessment + final ExecutionCommit (§6)",
@@ -397,7 +601,7 @@
     {
       "name": "E7 every Supervisor turn denied all host tools mechanically",
       "ok": true,
-      "detail": "17/20 recorded all-deny maps"
+      "detail": "25/40 recorded all-deny maps"
     },
     {
       "name": "E9 worker control-plane absent; repo tools per capability",

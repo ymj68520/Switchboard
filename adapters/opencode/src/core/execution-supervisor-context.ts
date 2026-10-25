@@ -304,7 +304,7 @@ export function assembleExecutionSupervisorContext(input: AssembleExecutionSuper
         { kind: "implementation_step", order: "1-based order number" },
       ],
       capabilityEnvelope_fields: ["repositoryRead", "repositoryWrite", "commandExecution", "networkAccess", "dependencyMutation", "gitCommit", "gitPush", "externalServiceMutation"],
-      note: "The envelope may only NARROW the trusted ceiling in your context; verification Directives are non_mutating and must declare verificationCoverage.obligationRefs for the stage's obligations.",
+      note: "The envelope may only NARROW the trusted ceiling in your context; verification Directives are non_mutating and must declare verificationCoverage.obligationRefs for the stage's obligations. Workers only mutate working-tree files; Core creates Git commits upon acceptance, so Directives must never instruct Workers to commit or run git.",
       worked_example: {
         tool: "execution_issue_directive",
         args: {

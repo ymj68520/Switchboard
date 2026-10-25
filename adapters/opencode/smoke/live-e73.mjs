@@ -43,9 +43,10 @@ const REPO = path.join(TMP, "repo");
 const MARKER = "E73_LIVE_OK";
 const GOAL = "Append a line containing E73_LIVE_OK to notes.txt so node check.js passes. Do not modify check.js.";
 const OWNER_SESSION_TITLE = "E73 trusted owner session";
-const SUPERVISOR_MODEL = "sensenova/deepseek-v4-flash";
-const WORKER_MODEL = "sensenova/deepseek-v4-flash";
-const VERIFIER_MODEL = "sensenova/deepseek-v4-flash";
+const DEFAULT_MODEL = process.env.OPENCODE_MODEL ?? "antigravity/claude-sonnet-4-6";
+const SUPERVISOR_MODEL = process.env.SUPERVISOR_MODEL ?? DEFAULT_MODEL;
+const WORKER_MODEL = process.env.WORKER_MODEL ?? DEFAULT_MODEL;
+const VERIFIER_MODEL = process.env.VERIFIER_MODEL ?? DEFAULT_MODEL;
 const TURN_TIMEOUT_MS = 420_000;
 
 const startedAt = Date.now();
@@ -90,14 +91,22 @@ writeFileSync(
       // strict-JSON control payloads and the turns truncate mid-object
       // (observed live). The limit raises the OUTPUT budget only — the
       // provider options (auth/baseURL) still come from the global config.
-      provider: {
-        sensenova: {
-          models: {
-            "deepseek-v4-flash": { name: "deepseek-v4-flash", limit: { context: 131072, output: 16384 } },
-            "glm-5.2": { name: "glm-5.2", limit: { context: 131072, output: 16384 } },
+      provider: WORKER_MODEL.startsWith("antigravity/")
+        ? {
+            antigravity: {
+              models: {
+                "claude-sonnet-4-6": { name: "claude-sonnet-4-6", limit: { context: 1000000, output: 128000 } },
+              },
+            },
+          }
+        : {
+            sensenova: {
+              models: {
+                "deepseek-v4-flash": { name: "deepseek-v4-flash", limit: { context: 131072, output: 16384 } },
+                "glm-5.2": { name: "glm-5.2", limit: { context: 131072, output: 16384 } },
+              },
+            },
           },
-        },
-      },
       // The REAL built plugin is installed into the host (Phase 8 §3
       // "real installed plugin"): its config hook runs inside the host with
       // its own ULTRA_PLAN_DATA_DIR (below), so the load-proof is real while
@@ -209,7 +218,11 @@ function liveClient() {
       const assistants = (Array.isArray(msgs) ? msgs : []).filter((m) => m.info?.role === "assistant");
       if (assistants.length > beforeCount) {
         const last = assistants.at(-1);
-        if (last.info?.time?.completed !== undefined) return { info: last.info, parts: last.parts ?? [] };
+        if (last.info?.time?.completed !== undefined) {
+          if (last.info?.finish === "tool-calls") continue;
+          const allParts = assistants.slice(beforeCount).flatMap((m) => m.parts ?? []);
+          return { info: last.info, parts: allParts };
+        }
       }
     }
     return undefined;
