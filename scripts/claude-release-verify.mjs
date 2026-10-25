@@ -60,7 +60,8 @@ function fail(message) {
 const versionRun = await run([bundle, "--version"]);
 const banner = versionRun.stdout.trim().split("\n");
 if (banner[0] !== `phase-plan ${manifest.version}`) fail(`banner mismatch: ${banner[0]}`);
-if (banner[1] !== "schema support 13") fail(`schema line mismatch: ${banner[1]}`);
+const expectedSchema = manifest.version.startsWith("0.2") ? "schema support 26" : "schema support 13";
+if (banner[1] !== expectedSchema) fail(`schema line mismatch: ${banner[1]} (expected ${expectedSchema})`);
 console.log(`[✓] --version: ${banner.join(" | ")}`);
 
 // 2. doctor on a fresh plugin-data root (fresh-install semantics, §43).
@@ -103,7 +104,8 @@ const init = messages.find((m) => m.id === 1);
 const tools = messages.find((m) => m.id === 2);
 if (!init || !tools) fail("MCP handshake incomplete");
 if (init.result.serverInfo.version !== manifest.version) fail(`serverInfo ${init.result.serverInfo.version} != manifest ${manifest.version}`);
-if (tools.result.tools.length !== 18) fail(`tools/list returned ${tools.result.tools.length}, expected 18`);
+const expectedTools = manifest.version.startsWith("0.2") ? 40 : 18;
+if (tools.result.tools.length !== expectedTools) fail(`tools/list returned ${tools.result.tools.length}, expected ${expectedTools}`);
 console.log(`[✓] mcp: serverInfo v${init.result.serverInfo.version}, ${tools.result.tools.length} tools`);
 
 console.log("VERIFY_OK");
