@@ -22,7 +22,6 @@ function pluginDataRootOf(store: { path: string }): string {
   return path.dirname(path.dirname(store.path));
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 function executionFingerprint(store: any, runId: string): string {
   return JSON.stringify(
     store.withRead((tx: any) => ({

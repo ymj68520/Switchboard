@@ -14,10 +14,7 @@
 
 import { RuntimeError } from "../runtime/errors.js";
 import type { StoreTx } from "../store/transaction.js";
-import type { StoreClock } from "../store/migration-runner.js";
-import { getExecutionAttemptInTx } from "../store/execution-attempts.js";
 import { getExecutionDirectiveInTx } from "../store/execution-directives.js";
-import { getWorkerInvocationInTx } from "../store/worker-invocations.js";
 import { getOpenWindowInTx } from "../store/execution-structure.js";
 import {
   listUnresolvedIndeterminateInTx,
@@ -150,9 +147,9 @@ export function ensureSubprocessTerminated(
       return { terminated: false, pid: processId };
     }
     return { terminated: false, pid: processId };
-  } catch (err: any) {
+  } catch (err: unknown) {
     // ESRCH means process does not exist (already dead)
-    if (err?.code === "ESRCH") {
+    if ((err as { code?: string })?.code === "ESRCH") {
       return { terminated: true, pid: processId };
     }
     return { terminated: false, pid: processId };
@@ -170,7 +167,7 @@ export function terminateAndMarkIndeterminateInTx(
     overrideProcessAliveCheck?: boolean;
   },
   now: string,
-): { attempt: any; invocation: any } {
+): ReturnType<typeof resolveUnreportedWorkerExitInTx> {
   const record = activeProcessRegistry.get(input.attemptId);
   if (record?.processId && !input.overrideProcessAliveCheck) {
     const check = ensureSubprocessTerminated(record.processId, false);

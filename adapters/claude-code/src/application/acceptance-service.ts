@@ -539,7 +539,7 @@ export function submitSupervisorAssessmentInTx(
           return {
             assessment: pastAssessment,
             commit: headCommit,
-            window: closedWin ?? ({ id: headCommit.windowId, candidateRevision: headCommit.candidateRevision } as any),
+            window: closedWin ?? ({ id: headCommit.windowId, candidateRevision: headCommit.candidateRevision } as unknown as VerificationWindow),
             acceptedHeadCommitId: headCommitId,
             stageCompleted: headCommit.stageId !== null,
             runCompleted: headCommit.scopeKind === "final_closure",

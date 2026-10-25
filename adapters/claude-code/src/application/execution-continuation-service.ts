@@ -20,7 +20,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { RuntimeError } from "../runtime/errors.js";
 import type { StoreTx } from "../store/transaction.js";
 import type { StoreClock } from "../store/migration-runner.js";
 import {
@@ -30,7 +29,6 @@ import {
 } from "../store/successor-baselines.js";
 import {
   getExecutionRunBySourcePlanningRunInTx,
-  getExecutionRunInTx,
 } from "../store/execution-runs.js";
 import {
   getExecutionStructureInTx,
@@ -49,7 +47,6 @@ import { getExecutionReportInTx } from "../store/execution-reports.js";
 import { getFinalPlanInTx } from "../store/finalization.js";
 import { parseFinalPlanCanonical } from "./final-plan-canonical.js";
 import { activateExecutionStageInTx } from "../store/execution-structure.js";
-import type { ExecutionStage } from "../core/execution-stage.js";
 
 export type StageReuseDisposition = "reusable" | "needs_reverification" | "must_reimplement";
 

@@ -15,10 +15,9 @@ import { createHash } from "node:crypto";
 
 import type { StoreTx } from "../store/transaction.js";
 import { getExecutionRunInTx } from "../store/execution-runs.js";
-import { listExecutionStagesInTx, getOpenWindowInTx } from "../store/execution-structure.js";
+import { listExecutionStagesInTx } from "../store/execution-structure.js";
 import { listRunCommitsInTx, getAcceptedHeadCommitIdInTx } from "../store/execution-commits.js";
 import { listRunReportsInTx } from "../store/execution-reports.js";
-import { getExecutionAbortRecordInTx } from "../store/execution-aborts.js";
 
 export interface PhysicalWorkspaceBaseline {
   capturedAt: string;
@@ -186,7 +185,6 @@ export function generateAbortManifestInTx(
   const acceptedFiles = Array.from(acceptedFilesSet);
 
   // 2. Identify unaccepted candidate files (files changed in current window after latest commit)
-  const openWindow = getOpenWindowInTx(tx, executionRunId);
   const unacceptedFilesSet = new Set<string>();
   for (const rep of reports) {
     // If report is not in any commit, its changes are unaccepted
@@ -204,9 +202,9 @@ export function generateAbortManifestInTx(
   // 3. User pre-existing files (from execution baseline if recorded, or derived from git status)
   let userPreExistingFiles: string[] = [];
   try {
-    const baseline = run?.executionStartBaseline as any;
+    const baseline = run?.executionStartBaseline as { physicalBaseline?: PhysicalWorkspaceBaseline } | null | undefined;
     if (baseline?.physicalBaseline) {
-      const p = baseline.physicalBaseline as PhysicalWorkspaceBaseline;
+      const p = baseline.physicalBaseline;
       userPreExistingFiles = [...p.userModifiedFiles, ...p.userUntrackedFiles];
     } else if (workspaceRoot !== "") {
       const currentPhysical = capturePhysicalWorkspaceBaseline(workspaceRoot);
@@ -269,7 +267,6 @@ export function executeExplicitCleanup(
 ): CleanupResult {
   const retainedFiles: string[] = [];
   const deletedFiles: string[] = [];
-  let exportedDiffPath: string | null = null;
 
   if (mode === "keep_all") {
     return {
@@ -292,7 +289,6 @@ export function executeExplicitCleanup(
       }
     }
     fs.writeFileSync(patchPath, patchContent);
-    exportedDiffPath = patchPath;
 
     return {
       mode,
